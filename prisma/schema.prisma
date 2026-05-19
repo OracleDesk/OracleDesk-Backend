@@ -71,9 +71,13 @@ enum SubscriptionType {
 }
 
 enum SubscriptionStatus {
+  PENDING_PAYMENT
   ACTIVE
   EXPIRED
   CANCELLED
+  FAILED
+  REVOKED
+  LIMIT_REACHED
 }
 
 enum AgentType {
@@ -316,4 +320,39 @@ model BlockIndex {
 
   @@unique([chainId])
   @@map("block_index")
+}
+
+// Event emitted for every payment transaction related to subscriptions and copy trading
+model PaymentEvent {
+  id            String   @id @default(uuid())
+  userId        String
+  txHash        String   @unique
+  type          String   // DAILY_PASS | PER_TRACE | REFUND
+  amount        Float
+  currency      String   @default("USDC")
+  status        String   // PENDING | CONFIRMED | FAILED
+  traceId       String?
+  metadata      Json?
+  createdAt     DateTime @default(now())
+  confirmedAt   DateTime?
+
+  @@index([userId])
+  @@index([txHash])
+}
+
+// Nanopayment subscription for trace access
+model SpendingAllowance {
+  id           String   @id @default(uuid())
+  userId       String   @unique
+  dailyLimit   Float
+  perTraceLimit Float
+  spentToday   Float    @default(0)
+  currency     String   @default("USDC")
+  lastResetAt  DateTime @default(now())
+  isActive     Boolean  @default(true)
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([userId])
 }
