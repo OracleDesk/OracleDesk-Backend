@@ -1,0 +1,54 @@
+import type { Response } from 'express';
+import type { ApiResponse, ApiError, PaginationMeta } from '../types';
+
+/**
+ * Send a successful 2xx response
+ */
+export function sendSuccess<T>(
+  res: Response,
+  data: T,
+  statusCode = 200,
+  meta?: Record<string, unknown>,
+): void {
+  const body: ApiResponse<T> = { ok: true, data, error: null, meta };
+  res.status(statusCode).json(body);
+}
+
+/**
+ * Send an error response
+ */
+export function sendError(
+  res: Response,
+  statusCode: number,
+  code: string,
+  message: string,
+  details?: Record<string, unknown>,
+): void {
+  const error: ApiError = { code, message, details };
+  const body: ApiResponse<null> = { ok: false, data: null, error };
+  res.status(statusCode).json(body);
+}
+
+/**
+ * Build a pagination meta object
+ */
+export function buildPaginationMeta(
+  page: number,
+  limit: number,
+  total: number,
+): PaginationMeta {
+  return { page, limit, total, totalPages: Math.ceil(total / limit) };
+}
+
+/**
+ * Parse pagination query params with safe defaults
+ */
+export function parsePagination(query: Record<string, unknown>): {
+  page: number;
+  limit: number;
+  skip: number;
+} {
+  const page = Math.max(1, parseInt(String(query.page ?? '1'), 10));
+  const limit = Math.min(100, Math.max(1, parseInt(String(query.limit ?? '20'), 10)));
+  return { page, limit, skip: (page - 1) * limit };
+}

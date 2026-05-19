@@ -1,0 +1,184 @@
+import type { 
+  Market, Trade, Position, ReasoningTrace, 
+  AgentType, TradeDirection, MarketCategory,
+  SettlementCurrency 
+} from '@prisma/client';
+
+// ─── Re-export Prisma types ───
+export type { Market, Trade, Position, ReasoningTrace };
+
+// ─── Signal types (from ingestion) ───
+export interface RawSignal {
+  source: string;
+  title: string;
+  content: string;
+  publishedAt: string;
+  relevanceScore: number;
+  category: string;
+}
+
+export interface WeightedSignal {
+  source: string;
+  weight: number;
+  signal: string;
+  rawValue?: number;
+}
+
+export interface AggregatedSignals {
+  news: RawSignal[];
+  fed: RawSignal[];
+  macro: RawSignal[];
+  aggregatedAt: Date;
+  signalCount: number;
+}
+
+// ─── Market generation types ───
+export interface MarketProposal {
+  market_question: string;
+  initial_yes_probability: number;
+  resolution_oracle: string;
+  expiry_timestamp: number;
+  settlement_currency: SettlementCurrency;
+  minimum_liquidity_usdc: number;
+  category: MarketCategory;
+  confidence_interval: ConfidenceInterval;
+  reasoning: string;
+}
+
+// ─── Probability types ───
+export interface ConfidenceInterval {
+  lower: number;
+  upper: number;
+}
+
+export interface ProbabilityEstimate {
+  probability: number;
+  confidenceInterval: ConfidenceInterval;
+  sources: WeightedSignal[];
+  computedAt: Date;
+}
+
+// ─── Trade types ───
+export interface KellyResult {
+  fraction: number;        // f* = (bp - q) / b
+  halfKelly: number;       // 0.5 * f*
+  betSize: number;         // halfKelly * bankroll
+  edge: number;            // p_agent - p_market
+  odds: number;            // b (net odds)
+}
+
+export interface TradePayload {
+  marketId: string;
+  direction: TradeDirection;
+  amount: number;
+  price: number;
+  kellyFraction: number;
+  edgeDetected: number;
+  builderCode: string;
+  traceId?: string;
+}
+
+export interface CopyTradePayload {
+  marketId: string;
+  traceId: string;
+  direction: TradeDirection;
+  amount: number;
+  userWallet: string;
+}
+
+// ─── Reasoning trace types ───
+export interface TraceInput {
+  marketId: string;
+  agentType: AgentType;
+  decisionType: string;
+  sourcesUsed: WeightedSignal[];
+  probabilityEstimate: number;
+  marketProbability: number;
+  edge: number;
+  confidenceInterval: ConfidenceInterval;
+  betFraction?: number;
+  betSizeUsdc?: number;
+  hedgeConditions?: string[];
+  agentWallet?: string;
+}
+
+export interface TraceVerification {
+  traceId: string;
+  ipfsCid: string;
+  storedHash: string;
+  computedHash: string;
+  verified: boolean;
+  verifiedAt: Date;
+}
+
+// ─── Portfolio types ───
+export interface PortfolioSummary {
+  totalUsdc: number;
+  deployedCapital: number;
+  availableCapital: number;
+  openPositions: number;
+  totalPnl: number;
+  dailyPnl: number;
+  builderFeesEarned: number;
+}
+
+// ─── Correlation types ───
+export interface CorrelationPair {
+  marketIdA: string;
+  marketIdB: string;
+  correlationScore: number;   // -1 to +1
+  relationship: 'POSITIVE' | 'NEGATIVE' | 'NONE';
+}
+
+export interface CorrelationCheckResult {
+  hasCorrelatedPositions: boolean;
+  correlatedPairs: CorrelationPair[];
+  adjustedPositionSize: number;
+  totalCorrelatedExposure: number;
+}
+
+// ─── Hedge types ───
+export interface HedgeRecommendation {
+  originalMarketId: string;
+  hedgeMarketId: string;
+  hedgeDirection: TradeDirection;
+  hedgeSize: number;
+  rationale: string;
+}
+
+// ─── Event indexer types ───
+export interface ChainEvent {
+  eventName: string;
+  blockNumber: bigint;
+  txHash: string;
+  args: Record<string, unknown>;
+  logIndex: number;
+}
+
+// ─── API response types ───
+export interface ApiResponse<T = unknown> {
+  ok: boolean;
+  data: T | null;
+  error: ApiError | null;
+  meta?: Record<string, unknown>;
+}
+
+export interface ApiError {
+  code: string;
+  message: string;
+  details?: Record<string, unknown>;
+}
+
+export interface PaginationMeta {
+  page: number;
+  limit: number;
+  total: number;
+  totalPages: number;
+}
+
+// ─── Subscription types ───
+export interface SubscriptionAccess {
+  hasAccess: boolean;
+  accessType: 'FREE_PREVIEW' | 'PER_TRACE' | 'DAILY_PASS' | 'NO_ACCESS';
+  expiresAt?: Date;
+}
