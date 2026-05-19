@@ -10,6 +10,7 @@ import type {
 	WeightedSignal,
 	ConfidenceInterval,
 } from "../types";
+import type { Market } from "@prisma/client";
 import { AppError } from "../middlewares/error.middleware";
 import dayjs from "dayjs";
 
@@ -261,7 +262,7 @@ export function generateExpiryDate(category: string): Date {
  */
 export async function createMarketFromProposal(
 	proposal: MarketProposal,
-): Promise<typeof prisma extends { market: infer T } ? T : never> {
+): Promise<Market> {
 	const market = await prisma.market.create({
 		data: {
 			question: proposal.market_question,
@@ -287,7 +288,7 @@ export async function createMarketFromProposal(
 		{ marketId: market.id, question: market.question },
 		"Market created",
 	);
-	return market as any;
+	return market;
 }
 
 /**
