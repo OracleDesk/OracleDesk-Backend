@@ -86,6 +86,13 @@ export interface CopyTradePayload {
   userWallet: string;
 }
 
+export interface KellyInput {
+  agentProbability: number;
+  marketProbability: number;
+  bankroll: number;
+  netOdds: number;
+}
+
 // ─── Reasoning trace types ───
 export interface TraceInput {
   marketId: string;

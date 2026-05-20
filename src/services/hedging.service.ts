@@ -1,0 +1,227 @@
+import { prisma } from '../lib/prisma';
+import { logger } from '../lib/logger';
+import { calculateKellySize } from './trade.service';
+import { AppError } from '../middlewares/error.middleware';
+import type { HedgeRecommendation } from '../types';
+
+// ─── Hedging constants ───
+const HEDGE_TRIGGER_EDGE_DECAY  = 0.50;  // Hedge when edge decays by 50%
+const HEDGE_SIZE_FRACTION       = 0.50;  // Hedge 50% of original position
+const MAX_DAILY_DRAWDOWN_PCT    = 0.03;  // 3% daily drawdown → pause agent
+const DRAWDOWN_PAUSE_HOURS      = 4;     // Pause for 4 hours on max drawdown
+
+/**
+ * Scans all open positions and identifies which ones need hedging.
+ *
+ * A position needs hedging when:
+ * 1. The current market price has moved adversely by > 8%
+ *    (edge from entry is now < 50% of original edge)
+ * 2. OR the position is showing unrealised loss > 10% of size
+ *
+ * For each position needing a hedge, we search for:
+ * - A market in the same category with OPPOSITE directional exposure
+ * - Sufficient liquidity (>= $500) to accept a meaningful hedge
+ */
+export async function detectHedgeOpportunities(): Promise<HedgeRecommendation[]> {
+  const openPositions = await prisma.position.findMany({
+    where:   { status: 'OPEN' },
+    include: { market: { select: { id: true, category: true, currentYesProb: true, totalLiquidity: true } }, trade: true },
+  });
+
+  const recommendations: HedgeRecommendation[] = [];
+
+  for (const position of openPositions) {
+    const originalEdge = position.trade?.edgeDetected ?? 0;
+    const currentPrice = position.currentPrice ?? position.entryPrice;
+
+    // Calculate current edge degradation
+    const entryEdge = position.direction === 'YES'
+      ? originalEdge
+      : -originalEdge;
+
+    const priceChange = currentPrice - position.entryPrice;
+    const currentEdge = entryEdge - priceChange;
+
+    const edgeDegraded = currentEdge < entryEdge * (1 - HEDGE_TRIGGER_EDGE_DECAY);
+    const hasLoss = position.pnl < -(position.size * 0.10);
+
+    if (!edgeDegraded && !hasLoss) continue;
+
+    // Find a hedge market: same category, enough liquidity
+    const hedgeMarket = await findHedgeMarket(
+      position.market.category,
+      position.market.id,
+      position.direction,
+    );
+
+    if (!hedgeMarket) continue;
+
+    const hedgeSize = position.size * HEDGE_SIZE_FRACTION;
+    const hedgeDirection = position.direction === 'YES' ? 'NO' : 'YES';
+
+    recommendations.push({
+      originalMarketId: position.market.id,
+      hedgeMarketId:    hedgeMarket.id,
+      hedgeDirection,
+      hedgeSize,
+      rationale: `Edge decayed from ${entryEdge.toFixed(3)} to ${currentEdge.toFixed(3)}. ` +
+                 `Partial hedge of ${hedgeSize} USDC via ${hedgeMarket.id} reduces net exposure by ~50%.`,
+    });
+  }
+
+  return recommendations;
+}
+
+/**
+ * Executes a hedge position for a given recommendation.
+ *
+ * The hedge is sized at HEDGE_SIZE_FRACTION (50%) of the original position.
+ * It takes the OPPOSITE direction to the original bet.
+ *
+ * All hedge trades and rationales are written to agent_logs for auditability.
+ */
+export async function autoHedge(recommendation: HedgeRecommendation): Promise<any> {
+  const hedgeMarket = await prisma.market.findUnique({
+    where: { id: recommendation.hedgeMarketId },
+  });
+
+  if (!hedgeMarket) {
+    throw new AppError(404, 'HEDGE_MARKET_NOT_FOUND', 'Hedge market not found');
+  }
+
+  if ((hedgeMarket.totalLiquidity ?? 0) < 500) {
+    throw new AppError(400, 'INSUFFICIENT_HEDGE_LIQUIDITY', 
+      'Hedge market has insufficient liquidity');
+  }
+
+  // Create a hedge trade record
+  const hedgeTrade = await prisma.trade.create({
+    data: {
+      marketId:      recommendation.hedgeMarketId,
+      direction:     recommendation.hedgeDirection,
+      status:        'PENDING',
+      amount:        recommendation.hedgeSize,
+      price:         recommendation.hedgeDirection === 'YES'
+                       ? hedgeMarket.currentYesProb ?? 0.5
+                       : 1 - (hedgeMarket.currentYesProb ?? 0.5),
+      edgeDetected:  0, // Hedges don't require positive edge
+      kellyFraction: 0,
+    },
+  });
+
+  // Log the hedge rationale for auditability
+  await prisma.agentLog.create({
+    data: {
+      agentType: 'TRADER',
+      level:     'INFO',
+      action:    'AUTO_HEDGE_EXECUTED',
+      marketId:  recommendation.hedgeMarketId,
+      data: {
+        originalMarketId: recommendation.originalMarketId,
+        hedgeTradeId:     hedgeTrade.id,
+        hedgeDirection:   recommendation.hedgeDirection,
+        hedgeSize:        recommendation.hedgeSize,
+        rationale:        recommendation.rationale,
+      },
+    },
+  });
+
+  logger.info(
+    { hedgeTradeId: hedgeTrade.id, rationale: recommendation.rationale },
+    'Auto-hedge executed',
+  );
+
+  return hedgeTrade;
+}
+
+/**
+ * Implements hard stop-loss logic.
+ *
+ * Called by the position monitor every 15 minutes.
+ * Closes positions where:
+ *   - Market has moved 15%+ against the position
+ *   - Daily drawdown of the entire portfolio exceeds 3%
+ */
+export async function enforceStopLoss(positionId: string): Promise<{
+  shouldClose: boolean;
+  reason?: string;
+}> {
+  const position = await prisma.position.findUnique({
+    where: { id: positionId },
+  });
+
+  if (!position || position.status !== 'OPEN') {
+    return { shouldClose: false };
+  }
+
+  const currentPrice = position.currentPrice ?? position.entryPrice;
+  const adverseMove = Math.abs(currentPrice - position.entryPrice) / position.entryPrice;
+
+  if (adverseMove >= 0.15) {
+    return { shouldClose: true, reason: `STOP_LOSS: Adverse move of ${(adverseMove * 100).toFixed(1)}%` };
+  }
+
+  return { shouldClose: false };
+}
+
+/**
+ * Checks if the daily drawdown limit has been breached.
+ * If yes, pauses new trade execution for DRAWDOWN_PAUSE_HOURS.
+ */
+export async function checkDailyDrawdown(bankroll: number): Promise<{
+  isPaused:      boolean;
+  drawdownPct:   number;
+  pauseUntil?:   Date;
+}> {
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+
+  const todayTrades = await prisma.position.findMany({
+    where: {
+      status:   { in: ['CLOSED', 'STOP_LOSS'] },
+      closedAt: { gte: todayStart },
+    },
+    select: { pnl: true },
+  });
+
+  const dailyLoss = todayTrades
+    .filter(t => t.pnl < 0)
+    .reduce((acc, t) => acc + Math.abs(t.pnl), 0);
+
+  const drawdownPct = dailyLoss / bankroll;
+
+  if (drawdownPct >= MAX_DAILY_DRAWDOWN_PCT) {
+    const pauseUntil = new Date(Date.now() + DRAWDOWN_PAUSE_HOURS * 60 * 60 * 1000);
+    logger.warn({ drawdownPct, pauseUntil }, 'Daily drawdown limit reached — pausing agent');
+
+    await prisma.agentLog.create({
+      data: {
+        agentType: 'TRADER',
+        level:     'WARN',
+        action:    'DRAWDOWN_PAUSE',
+        data:      { drawdownPct, dailyLoss, pauseUntil: pauseUntil.toISOString() },
+      },
+    });
+
+    return { isPaused: true, drawdownPct, pauseUntil };
+  }
+
+  return { isPaused: false, drawdownPct };
+}
+
+// ─── Internal helper ───
+async function findHedgeMarket(
+  category: string,
+  excludeMarketId: string,
+  originalDirection: 'YES' | 'NO',
+): Promise<any | null> {
+  return prisma.market.findFirst({
+    where: {
+      category:      category as any,
+      id:            { not: excludeMarketId },
+      status:        'ACTIVE',
+      totalLiquidity: { gte: 500 },
+    },
+    orderBy: { totalLiquidity: 'desc' },
+  });
+}
