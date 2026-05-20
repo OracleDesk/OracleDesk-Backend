@@ -49,7 +49,7 @@ export async function listMarkets(req: Request, res: Response): Promise<void> {
  * and linked reasoning traces.
  */
 export async function getMarket(req: Request, res: Response): Promise<void> {
-  const { id } = req.params;
+  const id = String(req.params.id);
 
   const market = await prisma.market.findUnique({
     where: { id },

@@ -1,28 +1,17 @@
-import {
-  createPublicClient,
-  http,
-  parseAbi,
-  type Log,
-} from 'viem';
+import { createPublicClient, http } from 'viem';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { config } from '../config';
-
-// ─── ABIs for the events we index ───
-const MARKET_FACTORY_ABI = parseAbi([
-  'event MarketCreated(bytes32 indexed marketId, address market, string question, uint256 expiry)',
-]);
-
-const REASONING_REGISTRY_ABI = parseAbi([
-  'event ReasoningPublished(bytes32 indexed marketId, address agent, string ipfsCid, bytes32 sha256Hash, uint256 blockTimestamp)',
-]);
-
-const POSITION_ABI = parseAbi([
-  'event PositionOpened(bytes32 indexed marketId, address trader, bool isYes, uint256 amount, uint256 price)',
-]);
+import {
+  CONTRACT_ADDRESSES,
+  MARKET_FACTORY_ABI,
+  MULTISIG_ORACLE_ABI,
+  POSITION_LEDGER_ABI,
+  REASONING_REGISTRY_ABI,
+} from '../config/contracts';
 
 const arcChain = {
-  id:   config.ARC_CHAIN_ID,
+  id: config.ARC_CHAIN_ID,
   name: 'Arc Testnet',
   network: 'arc-testnet',
   nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
@@ -30,218 +19,348 @@ const arcChain = {
 } as const;
 
 const publicClient = createPublicClient({
-  chain:     arcChain as any,
+  chain: arcChain as any,
   transport: http(config.ARC_RPC_URL),
 });
 
-/**
- * Starts the real-time event listener for all three event types.
- *
- * Returns unwatch functions so the caller can cleanly stop the listener.
- * Each event type has its own handler that is idempotent — safe to re-run.
- */
 export function startEventListener(): () => void {
-  if (isZeroAddress(config.MARKET_FACTORY_ADDRESS)) {
-    logger.warn('Contracts not deployed — event indexer running in simulation mode');
+  if (isZeroAddress(CONTRACT_ADDRESSES.marketFactory)) {
+    logger.warn('MarketFactory address not configured; event indexer disabled');
     return () => {};
   }
 
-  const unwatchers: Array<() => void> = [];
-
-  // ── MarketCreated ──
-  const unwatchMarket = publicClient.watchContractEvent({
-    address:      config.MARKET_FACTORY_ADDRESS as `0x${string}`,
-    abi:          MARKET_FACTORY_ABI,
-    eventName:    'MarketCreated',
-    onLogs:       (logs) => logs.forEach(log => handleMarketCreated(log as any).catch(logError)),
-    onError:      (err) => logger.error({ err }, 'MarketCreated watcher error'),
-  });
-  unwatchers.push(unwatchMarket);
-
-  // ── ReasoningPublished ──
-  const unwatchReasoning = publicClient.watchContractEvent({
-    address:      config.REASONING_REGISTRY_ADDRESS as `0x${string}`,
-    abi:          REASONING_REGISTRY_ABI,
-    eventName:    'ReasoningPublished',
-    onLogs:       (logs) => logs.forEach(log => handleReasoningPublished(log as any).catch(logError)),
-    onError:      (err) => logger.error({ err }, 'ReasoningPublished watcher error'),
-  });
-  unwatchers.push(unwatchReasoning);
-
-  // ── PositionOpened ──
-  const unwatchPosition = publicClient.watchContractEvent({
-    address:      config.MARKET_FACTORY_ADDRESS as `0x${string}`,
-    abi:          POSITION_ABI,
-    eventName:    'PositionOpened',
-    onLogs:       (logs) => logs.forEach(log => handlePositionOpened(log as any).catch(logError)),
-    onError:      (err) => logger.error({ err }, 'PositionOpened watcher error'),
-  });
-  unwatchers.push(unwatchPosition);
+  const unwatchers = [
+    publicClient.watchContractEvent({
+      address: CONTRACT_ADDRESSES.marketFactory as `0x${string}`,
+      abi: MARKET_FACTORY_ABI,
+      eventName: 'MarketDeployed',
+      onLogs: (logs) => logs.forEach(log => handleMarketDeployed(log as any).catch(logError)),
+      onError: (err) => logger.error({ err }, 'MarketDeployed watcher error'),
+    }),
+    publicClient.watchContractEvent({
+      address: CONTRACT_ADDRESSES.reasoningRegistry as `0x${string}`,
+      abi: REASONING_REGISTRY_ABI,
+      eventName: 'ReasoningPublished',
+      onLogs: (logs) => logs.forEach(log => handleRegistryReasoningPublished(log as any).catch(logError)),
+      onError: (err) => logger.error({ err }, 'ReasoningRegistry watcher error'),
+    }),
+    publicClient.watchContractEvent({
+      address: CONTRACT_ADDRESSES.positionLedger as `0x${string}`,
+      abi: POSITION_LEDGER_ABI,
+      eventName: 'PositionOpened',
+      onLogs: (logs) => logs.forEach(log => handlePositionOpened(log as any).catch(logError)),
+      onError: (err) => logger.error({ err }, 'PositionOpened watcher error'),
+    }),
+    publicClient.watchContractEvent({
+      address: CONTRACT_ADDRESSES.multiSigOracle as `0x${string}`,
+      abi: MULTISIG_ORACLE_ABI,
+      eventName: 'MarketResolved',
+      onLogs: (logs) => logs.forEach(log => handleMarketResolved(log as any).catch(logError)),
+      onError: (err) => logger.error({ err }, 'MarketResolved watcher error'),
+    }),
+  ];
 
   logger.info('Blockchain event indexer started');
-  return () => unwatchers.forEach(u => u());
+  return () => unwatchers.forEach(unwatch => unwatch());
 }
 
-/**
- * Backfills events from a given block number to the current head.
- *
- * Used on startup to catch events missed during downtime.
- * Processes in 500-block batches to avoid RPC request size limits.
- * Updates BlockIndex after each batch.
- */
 export async function backfillEvents(fromBlock?: bigint): Promise<void> {
-  if (isZeroAddress(config.MARKET_FACTORY_ADDRESS)) {
-    logger.warn('Contracts not deployed — skipping backfill');
+  if (isZeroAddress(CONTRACT_ADDRESSES.marketFactory)) {
+    logger.warn('MarketFactory address not configured; skipping backfill');
     return;
   }
 
-  // Get last processed block from DB (resume after downtime)
   const blockIndex = await prisma.blockIndex.findUnique({
     where: { chainId: config.ARC_CHAIN_ID },
   });
 
-  const startBlock = fromBlock ?? blockIndex?.lastBlockNumber ?? BigInt(0);
+  const startBlock = fromBlock ?? ((blockIndex?.lastBlockNumber ?? BigInt(0)) + BigInt(1));
   const currentBlock = await publicClient.getBlockNumber();
 
-  if (startBlock >= currentBlock) {
-    logger.info({ startBlock, currentBlock }, 'Backfill: already up to date');
+  if (startBlock > currentBlock) {
+    logger.info({ startBlock, currentBlock }, 'Backfill already up to date');
     return;
   }
 
-  const BATCH_SIZE = BigInt(500);
-  logger.info({ startBlock, currentBlock }, 'Starting backfill');
+  const batchSize = BigInt(500);
+  logger.info({ startBlock, currentBlock }, 'Starting event backfill');
 
-  for (let block = startBlock; block < currentBlock; block += BATCH_SIZE) {
-    const toBlock = block + BATCH_SIZE < currentBlock ? block + BATCH_SIZE : currentBlock;
+  for (let block = startBlock; block <= currentBlock; block += batchSize) {
+    const toBlock = block + batchSize - BigInt(1) < currentBlock
+      ? block + batchSize - BigInt(1)
+      : currentBlock;
 
     try {
-      const [marketLogs, reasoningLogs, positionLogs] = await Promise.all([
-        publicClient.getLogs({
-          address:   config.MARKET_FACTORY_ADDRESS as `0x${string}`,
-          event:     MARKET_FACTORY_ABI[0],
+      const [marketLogs, reasoningLogs, positionLogs, resolutionLogs] = await Promise.all([
+        publicClient.getContractEvents({
+          address: CONTRACT_ADDRESSES.marketFactory as `0x${string}`,
+          abi: MARKET_FACTORY_ABI,
+          eventName: 'MarketDeployed',
           fromBlock: block,
           toBlock,
         }),
-        publicClient.getLogs({
-          address:   config.REASONING_REGISTRY_ADDRESS as `0x${string}`,
-          event:     REASONING_REGISTRY_ABI[0],
+        publicClient.getContractEvents({
+          address: CONTRACT_ADDRESSES.reasoningRegistry as `0x${string}`,
+          abi: REASONING_REGISTRY_ABI,
+          eventName: 'ReasoningPublished',
           fromBlock: block,
           toBlock,
         }),
-        publicClient.getLogs({
-          address:   config.MARKET_FACTORY_ADDRESS as `0x${string}`,
-          event:     POSITION_ABI[0],
+        publicClient.getContractEvents({
+          address: CONTRACT_ADDRESSES.positionLedger as `0x${string}`,
+          abi: POSITION_LEDGER_ABI,
+          eventName: 'PositionOpened',
+          fromBlock: block,
+          toBlock,
+        }),
+        publicClient.getContractEvents({
+          address: CONTRACT_ADDRESSES.multiSigOracle as `0x${string}`,
+          abi: MULTISIG_ORACLE_ABI,
+          eventName: 'MarketResolved',
           fromBlock: block,
           toBlock,
         }),
       ]);
 
-      for (const log of marketLogs)    await handleMarketCreated(log as any).catch(logError);
-      for (const log of reasoningLogs) await handleReasoningPublished(log as any).catch(logError);
-      for (const log of positionLogs)  await handlePositionOpened(log as any).catch(logError);
+      for (const log of marketLogs) await handleMarketDeployed(log as any).catch(logError);
+      for (const log of reasoningLogs) await handleRegistryReasoningPublished(log as any).catch(logError);
+      for (const log of positionLogs) await handlePositionOpened(log as any).catch(logError);
+      for (const log of resolutionLogs) await handleMarketResolved(log as any).catch(logError);
 
-      // Persist progress after each batch
       await prisma.blockIndex.upsert({
-        where:  { chainId: config.ARC_CHAIN_ID },
+        where: { chainId: config.ARC_CHAIN_ID },
         create: { chainId: config.ARC_CHAIN_ID, lastBlockNumber: toBlock },
         update: { lastBlockNumber: toBlock },
       });
-
-      logger.debug({ processed: toBlock.toString() }, 'Backfill batch complete');
     } catch (err) {
       logger.error({ err, fromBlock: block, toBlock }, 'Backfill batch failed');
     }
   }
 
-  logger.info('Backfill complete');
+  logger.info('Event backfill complete');
 }
 
-// ─── Event Handlers ───
-
-/**
- * Handles MarketCreated events.
- * Idempotent: checks onChainAddress before upserting.
- */
-async function handleMarketCreated(log: any): Promise<void> {
-  const { marketId, market, question, expiry } = log.args ?? {};
+async function handleMarketDeployed(log: any): Promise<void> {
+  const { market, question, oracle, expiryTimestamp, initialYesPrice, liquiditySeed, reasoningCid } = log.args ?? {};
   const txHash = log.transactionHash;
 
-  if (!marketId || !txHash) return;
+  if (!market || !txHash) return;
 
-  // Idempotency check
-  const existing = await prisma.market.findFirst({ where: { txHash } });
+  const existing = await prisma.market.findFirst({
+    where: { OR: [{ onChainAddress: String(market) }, { txHash: String(txHash) }] },
+  });
   if (existing) return;
 
-  // Try to match to a pending market by question similarity
   const pendingMarket = await prisma.market.findFirst({
-    where: { status: 'PENDING', question: { contains: String(question ?? '').slice(0, 50) } },
-  });
-
-  if (pendingMarket) {
-    await prisma.market.update({
-      where: { id: pendingMarket.id },
-      data:  { status: 'ACTIVE', onChainAddress: market, txHash },
-    });
-  }
-
-  logger.info({ marketId: marketId.toString(), txHash }, 'MarketCreated event indexed');
-}
-
-/**
- * Handles ReasoningPublished events.
- * Updates the trace with on-chain tx hash and marks verified.
- */
-async function handleReasoningPublished(log: any): Promise<void> {
-  const { ipfsCid, sha256Hash } = log.args ?? {};
-  const txHash = log.transactionHash;
-
-  if (!ipfsCid || !txHash) return;
-
-  const trace = await prisma.reasoningTrace.findFirst({ where: { ipfsCid: String(ipfsCid) } });
-  if (!trace) return;
-
-  // Idempotency: already indexed
-  if (trace.onChainTxHash === txHash) return;
-
-  await prisma.reasoningTrace.update({
-    where: { id: trace.id },
-    data:  { onChainTxHash: txHash, verified: true },
-  });
-
-  logger.info({ traceId: trace.id, txHash }, 'ReasoningPublished event indexed');
-}
-
-/**
- * Handles PositionOpened events.
- * Reconciles chain state with DB — updates txHash on existing trade.
- */
-async function handlePositionOpened(log: any): Promise<void> {
-  const { marketId, amount, price, isYes } = log.args ?? {};
-  const txHash = log.transactionHash;
-
-  if (!txHash) return;
-
-  // Find the matching unconfirmed trade
-  const trade = await prisma.trade.findFirst({
     where: {
-      txHash: null,
       status: 'PENDING',
-      direction: isYes ? 'YES' : 'NO',
+      OR: [
+        { question: { equals: String(question ?? '') } },
+        ...(reasoningCid ? [{ reasoningTraces: { some: { ipfsCid: String(reasoningCid) } } }] : []),
+      ],
     },
     orderBy: { createdAt: 'desc' },
   });
 
-  if (trade) {
-    await prisma.trade.update({
-      where: { id: trade.id },
-      data:  { txHash, status: 'EXECUTED', executedAt: new Date() },
+  const initialProbability = Number(initialYesPrice ?? 5000) / 10_000;
+  const liquidityUsdc = Number(liquiditySeed ?? 0) / 1_000_000;
+
+  if (pendingMarket) {
+    await prisma.market.update({
+      where: { id: pendingMarket.id },
+      data: {
+        status: 'ACTIVE',
+        onChainAddress: String(market),
+        txHash: String(txHash),
+        resolutionOracle: String(oracle ?? pendingMarket.resolutionOracle ?? ''),
+        totalLiquidity: liquidityUsdc || pendingMarket.totalLiquidity,
+      },
+    });
+  } else {
+    await prisma.market.create({
+      data: {
+        question: String(question ?? `On-chain market ${market}`),
+        category: 'MACRO',
+        status: 'ACTIVE',
+        initialYesProb: clampProbability(initialProbability),
+        currentYesProb: clampProbability(initialProbability),
+        confidenceInterval: {
+          lower: Math.max(0.01, clampProbability(initialProbability) - 0.1),
+          upper: Math.min(0.99, clampProbability(initialProbability) + 0.1),
+        } as any,
+        expiryTimestamp: new Date(Number(expiryTimestamp ?? 0) * 1000 || Date.now()),
+        resolutionOracle: String(oracle ?? ''),
+        minimumLiquidity: liquidityUsdc || 100,
+        totalLiquidity: liquidityUsdc,
+        onChainAddress: String(market),
+        txHash: String(txHash),
+      },
     });
   }
 
-  logger.info({ txHash }, 'PositionOpened event indexed');
+  await prisma.agentLog.create({
+    data: {
+      agentType: 'MARKET_MAKER',
+      level: 'INFO',
+      action: 'MARKET_DEPLOYED_INDEXED',
+      data: { market, question, oracle, expiryTimestamp: String(expiryTimestamp ?? ''), txHash },
+    },
+  });
+}
+
+async function handleRegistryReasoningPublished(log: any): Promise<void> {
+  const { traceId, agentWallet, ipfsCid, sha256Hash, traceType, relatedId, blockTimestamp } = log.args ?? {};
+  const txHash = log.transactionHash;
+
+  if (!ipfsCid || !txHash) return;
+
+  const trace = await prisma.reasoningTrace.findFirst({
+    where: {
+      OR: [
+        { ipfsCid: String(ipfsCid) },
+        { sha256Hash: normalizeBytes32Hash(sha256Hash) },
+      ],
+    },
+  });
+
+  if (trace && trace.onChainTxHash !== String(txHash)) {
+    await prisma.reasoningTrace.update({
+      where: { id: trace.id },
+      data: {
+        onChainTxHash: String(txHash),
+        verified: true,
+        agentWallet: String(agentWallet ?? trace.agentWallet ?? ''),
+      },
+    });
+  }
+
+  await prisma.agentLog.create({
+    data: {
+      agentType: trace?.agentType ?? 'TRADER',
+      level: 'INFO',
+      action: 'REASONING_PUBLISHED_INDEXED',
+      marketId: trace?.marketId,
+      data: {
+        traceId: String(traceId ?? ''),
+        ipfsCid: String(ipfsCid),
+        sha256Hash: normalizeBytes32Hash(sha256Hash),
+        traceType: String(traceType ?? ''),
+        relatedId: String(relatedId ?? ''),
+        blockTimestamp: String(blockTimestamp ?? ''),
+        txHash,
+      },
+    },
+  });
+}
+
+async function handlePositionOpened(log: any): Promise<void> {
+  const { positionId, conditionId, tokenId, side, usdcSpent, entryPriceBps, edgeBps, reasoningCid, sha256Hash, polygonTxHash } = log.args ?? {};
+  const txHash = String(log.transactionHash ?? polygonTxHash ?? '');
+  if (!positionId || !txHash) return;
+
+  const trace = await prisma.reasoningTrace.findFirst({
+    where: {
+      OR: [
+        ...(reasoningCid ? [{ ipfsCid: String(reasoningCid) }] : []),
+        { sha256Hash: normalizeBytes32Hash(sha256Hash) },
+      ],
+    },
+    include: { market: true },
+  });
+
+  if (!trace) {
+    logger.warn({ positionId: String(positionId), txHash }, 'PositionOpened had no matching reasoning trace');
+    return;
+  }
+
+  const existingTrade = await prisma.trade.findFirst({ where: { txHash } });
+  if (existingTrade) return;
+
+  const direction = Number(side ?? 0) === 0 ? 'YES' : 'NO';
+  const amount = Number(usdcSpent ?? 0) / 1_000_000;
+  const price = Number(entryPriceBps ?? 0) / 10_000;
+  const edge = Number(edgeBps ?? 0) / 10_000;
+
+  const trade = await prisma.trade.create({
+    data: {
+      marketId: trace.marketId,
+      direction,
+      status: 'EXECUTED',
+      amount,
+      price: clampProbability(price || trace.market.currentYesProb || trace.market.initialYesProb),
+      edgeDetected: edge,
+      kellyFraction: trace.betFraction ?? 0,
+      txHash,
+      executedAt: new Date(),
+    },
+  });
+
+  await prisma.position.create({
+    data: {
+      marketId: trace.marketId,
+      tradeId: trade.id,
+      direction,
+      status: 'OPEN',
+      entryPrice: trade.price,
+      currentPrice: trade.price,
+      size: amount,
+      pnl: 0,
+    },
+  });
+
+  await prisma.agentLog.create({
+    data: {
+      agentType: 'TRADER',
+      level: 'INFO',
+      action: 'POSITION_OPENED_INDEXED',
+      marketId: trace.marketId,
+      data: {
+        positionId: String(positionId),
+        conditionId: String(conditionId ?? ''),
+        tokenId: String(tokenId ?? ''),
+        reasoningCid: String(reasoningCid ?? ''),
+        txHash,
+      },
+    },
+  });
+}
+
+async function handleMarketResolved(log: any): Promise<void> {
+  const { market, yesWon } = log.args ?? {};
+  const txHash = log.transactionHash;
+  if (!market) return;
+
+  const existing = await prisma.market.findFirst({
+    where: { onChainAddress: { equals: String(market), mode: 'insensitive' } },
+  });
+  if (!existing || existing.status === 'RESOLVED') return;
+
+  await prisma.market.update({
+    where: { id: existing.id },
+    data: {
+      status: 'RESOLVED',
+      resolvedOutcome: Boolean(yesWon),
+      resolvedAt: new Date(),
+    },
+  });
+
+  await prisma.agentLog.create({
+    data: {
+      agentType: 'MARKET_MAKER',
+      level: 'INFO',
+      action: 'MARKET_RESOLVED_INDEXED',
+      marketId: existing.id,
+      data: { market: String(market), yesWon: Boolean(yesWon), txHash } as any,
+    },
+  });
 }
 
 const isZeroAddress = (addr: string) =>
-  addr === '0x0000000000000000000000000000000000000000' || !addr;
+  !addr || addr === '0x0000000000000000000000000000000000000000';
+
+const clampProbability = (value: number) => Math.min(0.99, Math.max(0.01, value));
+
+const normalizeBytes32Hash = (value: unknown) =>
+  String(value ?? '').replace(/^0x/, '').toLowerCase();
 
 const logError = (err: unknown) => logger.error({ err }, 'Event handler error');

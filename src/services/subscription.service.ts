@@ -4,6 +4,7 @@ import { config } from '../config';
 import { AppError } from '../middlewares/error.middleware';
 import type { SubscriptionAccess } from '../types';
 import dayjs from 'dayjs';
+import { findCircleTransactionByHash } from './circle.service';
 
 const PER_TRACE_PRICE_USDC = 0.005;  // $0.005 per trace
 const DAILY_PASS_PRICE_USDC = 0.50;  // $0.50 daily pass
@@ -92,21 +93,52 @@ export async function recordPayment(params: {
     throw new AppError(402, 'PAYMENT_UNVERIFIED', 'Could not verify payment on-chain');
   }
 
+  await enforceSpendingAllowance(userId, amount, type);
+
   const expiresAt = type === 'DAILY_PASS'
     ? dayjs().add(24, 'hour').toDate()
     : null;
 
-  const subscription = await prisma.subscription.create({
-    data: {
-      userId,
-      traceId:   traceId ?? null,
-      type,
-      status:    'ACTIVE',
-      amountPaid: amount,
-      currency:  'USDC',
-      txHash,
-      expiresAt,
-    },
+  const subscription = await prisma.$transaction(async (tx) => {
+    const created = await tx.subscription.create({
+      data: {
+        userId,
+        traceId:   traceId ?? null,
+        type,
+        status:    'ACTIVE',
+        amountPaid: amount,
+        currency:  'USDC',
+        txHash,
+        expiresAt,
+      },
+    });
+
+    await tx.paymentEvent.upsert({
+      where: { txHash },
+      create: {
+        userId,
+        traceId: traceId ?? null,
+        txHash,
+        type,
+        amount,
+        currency: 'USDC',
+        status: 'CONFIRMED',
+        confirmedAt: new Date(),
+        metadata: { subscriptionId: created.id } as any,
+      },
+      update: {
+        status: 'CONFIRMED',
+        confirmedAt: new Date(),
+        metadata: { subscriptionId: created.id } as any,
+      },
+    });
+
+    await tx.spendingAllowance.updateMany({
+      where: { userId, isActive: true },
+      data: { spentToday: { increment: amount } },
+    });
+
+    return created;
   });
 
   logger.info({ subscriptionId: subscription.id, type, userId }, 'Subscription created');
@@ -180,6 +212,73 @@ export async function expireStaleSubscriptions(): Promise<number> {
   return count;
 }
 
+export async function upsertSpendingAllowance(params: {
+  userId: string;
+  dailyLimit: number;
+  perTraceLimit: number;
+  currency?: string;
+}): Promise<any> {
+  const { userId, dailyLimit, perTraceLimit, currency = 'USDC' } = params;
+
+  if (dailyLimit <= 0 || perTraceLimit <= 0 || perTraceLimit > dailyLimit) {
+    throw new AppError(400, 'INVALID_ALLOWANCE', 'perTraceLimit and dailyLimit must be positive, and perTraceLimit cannot exceed dailyLimit');
+  }
+
+  return prisma.spendingAllowance.upsert({
+    where: { userId },
+    create: { userId, dailyLimit, perTraceLimit, currency },
+    update: { dailyLimit, perTraceLimit, currency, isActive: true },
+  });
+}
+
+export async function getSpendingAllowance(userId: string): Promise<any> {
+  return prisma.spendingAllowance.findUnique({ where: { userId } });
+}
+
+async function enforceSpendingAllowance(
+  userId: string,
+  amount: number,
+  type: 'PER_TRACE' | 'DAILY_PASS',
+): Promise<void> {
+  const allowance = await prisma.spendingAllowance.findUnique({ where: { userId } });
+  if (!allowance?.isActive) return;
+
+  const resetNeeded = dayjs(allowance.lastResetAt).isBefore(dayjs().startOf('day'));
+  const effectiveSpentToday = resetNeeded ? 0 : allowance.spentToday;
+
+  if (resetNeeded) {
+    await prisma.spendingAllowance.update({
+      where: { userId },
+      data: { spentToday: 0, lastResetAt: new Date() },
+    });
+  }
+
+  if (type === 'PER_TRACE' && amount > allowance.perTraceLimit) {
+    throw new AppError(402, 'ALLOWANCE_PER_TRACE_LIMIT', 'Payment exceeds per-trace spending approval');
+  }
+
+  if (effectiveSpentToday + amount > allowance.dailyLimit) {
+    await prisma.subscription.create({
+      data: {
+        userId,
+        type,
+        status: 'LIMIT_REACHED',
+        amountPaid: amount,
+        currency: allowance.currency,
+      },
+    });
+    throw new AppError(402, 'ALLOWANCE_DAILY_LIMIT', 'Payment exceeds daily spending approval');
+  }
+}
+
+export async function listPaymentEvents(userId: string): Promise<any[]> {
+  return prisma.paymentEvent.findMany({
+    where: { userId },
+    orderBy: { createdAt: 'desc' },
+    take: 100,
+  });
+}
+
 /**
  * Verifies that a USDC payment transaction occurred on-chain.
  * For testnet: always returns true (Circle testnet transactions).
@@ -189,13 +288,18 @@ async function verifyPaymentTransaction(
   txHash: string,
   expectedAmount: number,
 ): Promise<boolean> {
-  if (config.NODE_ENV !== 'production') {
-    // Testnet: trust all payments
-    logger.debug({ txHash }, 'Testnet: skipping payment verification');
-    return true;
+  const transaction = await findCircleTransactionByHash(txHash);
+  if (!transaction) {
+    if (config.NODE_ENV !== 'production' && !config.CIRCLE_STRICT_PAYMENT_VERIFICATION) {
+      logger.debug({ txHash }, 'Development mode: Circle transaction not found; accepting payment for local testing');
+      return true;
+    }
+    return false;
   }
 
-  // Production: verify USDC transfer event on Arc
-  // TODO: use viem to verify Transfer(from, to, amount) event
-  return true;
+  const state = String(transaction.state ?? transaction.status ?? '').toUpperCase();
+  const successful = ['COMPLETE', 'CONFIRMED', 'FINALIZED', 'SUCCESS', 'COMPLETED'].includes(state);
+  const paidAmount = Number(transaction.amounts?.[0] ?? transaction.amount ?? transaction.amountInUSD ?? 0);
+
+  return successful && paidAmount + 1e-9 >= expectedAmount;
 }

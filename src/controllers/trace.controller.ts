@@ -2,7 +2,13 @@ import type { Request, Response } from 'express';
 import { prisma } from '../lib/prisma';
 import { sendSuccess, sendError, parsePagination, buildPaginationMeta } from '../utils/response.util';
 import { verifyCID } from '../services/ipfs.service';
-import { getTracWithAccessControl, recordPayment } from '../services/subscription.service';
+import {
+  getTracWithAccessControl,
+  getSpendingAllowance,
+  listPaymentEvents,
+  recordPayment,
+  upsertSpendingAllowance,
+} from '../services/subscription.service';
 
 /**
  * GET /traces
@@ -52,7 +58,7 @@ export async function listTraces(req: Request, res: Response): Promise<void> {
  * - Subscribed: full trace
  */
 export async function getTrace(req: Request, res: Response): Promise<void> {
-  const { id } = req.params;
+  const id = String(req.params.id);
   const userId = req.user?.userId;
 
   const trace = await getTracWithAccessControl(id, userId);
@@ -91,7 +97,7 @@ export async function unlockTrace(req: Request, res: Response): Promise<void> {
     return;
   }
 
-  const { id: traceId } = req.params;
+  const traceId = String(req.params.id);
   const { txHash, amount, type } = req.body as {
     txHash: string;
     amount: number;
@@ -114,4 +120,51 @@ export async function unlockTrace(req: Request, res: Response): Promise<void> {
   // Return the full trace now that it's unlocked
   const trace = await getTracWithAccessControl(traceId, req.user.userId);
   sendSuccess(res, { subscription, trace }, 201);
+}
+
+export async function setSpendingAllowance(req: Request, res: Response): Promise<void> {
+  if (!req.user) {
+    sendError(res, 401, 'UNAUTHORIZED', 'Authentication required');
+    return;
+  }
+
+  const { dailyLimit, perTraceLimit, currency } = req.body as {
+    dailyLimit?: number;
+    perTraceLimit?: number;
+    currency?: string;
+  };
+
+  if (typeof dailyLimit !== 'number' || typeof perTraceLimit !== 'number') {
+    sendError(res, 400, 'MISSING_ALLOWANCE_FIELDS', 'dailyLimit and perTraceLimit are required numbers');
+    return;
+  }
+
+  const allowance = await upsertSpendingAllowance({
+    userId: req.user.userId,
+    dailyLimit,
+    perTraceLimit,
+    currency,
+  });
+
+  sendSuccess(res, allowance, 200);
+}
+
+export async function getMySpendingAllowance(req: Request, res: Response): Promise<void> {
+  if (!req.user) {
+    sendError(res, 401, 'UNAUTHORIZED', 'Authentication required');
+    return;
+  }
+
+  const allowance = await getSpendingAllowance(req.user.userId);
+  sendSuccess(res, allowance);
+}
+
+export async function getMyPaymentEvents(req: Request, res: Response): Promise<void> {
+  if (!req.user) {
+    sendError(res, 401, 'UNAUTHORIZED', 'Authentication required');
+    return;
+  }
+
+  const payments = await listPaymentEvents(req.user.userId);
+  sendSuccess(res, payments);
 }

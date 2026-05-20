@@ -1,23 +1,8 @@
-import { createPublicClient, http, parseAbi, type Address } from 'viem';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
-import { config } from '../config';
 import { AppError } from '../middlewares/error.middleware';
 import type { KellyResult, TradePayload, KellyInput } from '../types';
-
-// ─── Arc chain config ───
-const arcChain = {
-  id:   config.ARC_CHAIN_ID,
-  name: 'Arc Testnet',
-  network: 'arc-testnet',
-  nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
-  rpcUrls: { default: { http: [config.ARC_RPC_URL] } },
-};
-
-const publicClient = createPublicClient({
-  chain:     arcChain as any,
-  transport: http(config.ARC_RPC_URL),
-});
+import { submitFundBet } from './chain.service';
 
 // ─── Risk constants ───
 const MAX_SINGLE_POSITION_PCT  = 0.025;  // 2.5% of bankroll per position
@@ -271,20 +256,10 @@ export async function closePosition(
  * Returns the transaction hash.
  */
 async function submitTradeTransaction(payload: TradePayload): Promise<string> {
-  if (
-    config.MARKET_FACTORY_ADDRESS === '0x0000000000000000000000000000000000000000'
-  ) {
-    // Testnet simulation mode — contracts not deployed yet
-    logger.warn('Market factory address not set — simulating trade execution');
-    return `0xSIMULATED_${Date.now().toString(16)}`;
-  }
-
-  // In production: use viem walletClient to sign and submit
-  // const walletClient = createWalletClient({ ... })
-  // const hash = await walletClient.writeContract({ ... })
-  // For now, return a placeholder — real implementation after contracts deployed
-  const simulatedHash = `0x${Buffer.from(`trade-${payload.marketId}-${Date.now()}`).toString('hex').slice(0, 64)}`;
-  return simulatedHash;
+  return submitFundBet({
+    marketId: payload.marketId,
+    amountUsdc: payload.amount,
+  });
 }
 
 async function logAgentAction(
@@ -296,7 +271,7 @@ async function logAgentAction(
 ): Promise<void> {
   try {
     await prisma.agentLog.create({
-      data: { agentType, level, action, marketId: marketId ?? undefined, data },
+      data: { agentType, level, action, marketId: marketId ?? undefined, data: data as any },
     });
   } catch {}
 }

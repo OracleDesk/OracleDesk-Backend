@@ -71,7 +71,7 @@ export async function generateReasoningTrace(input: TraceInput) {
       probabilityEstimate: input.probabilityEstimate,
       marketProbability:   input.marketProbability,
       edge,
-      confidenceInterval:  ci,
+      confidenceInterval:  ci as any,
       betFraction:         input.betFraction,
       betSizeUsdc:         input.betSizeUsdc,
       hedgeConditions:     hedgeConditions.conditions as any,

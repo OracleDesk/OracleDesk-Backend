@@ -5,22 +5,12 @@
 
 generator client {
   provider = "prisma-client-js"
-  // output   = "prisma-client-js"
 }
 
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
-
-// generator client {
-//   provider = "prisma-client-js"
-// }
-
-// datasource db {
-//   provider = "postgresql"
-//   url      = env("DATABASE_URL")
-// }
 
 // ─────────────────────────── ENUMS ───────────────────────────
 
@@ -104,6 +94,8 @@ model User {
 
   subscriptions Subscription[]
   copyTrades    CopyTrade[]
+  paymentEvents PaymentEvent[]
+  spendingAllowance SpendingAllowance?
 
   @@index([walletAddress])
   @@map("users")
@@ -121,6 +113,8 @@ model Market {
   confidenceInterval Json               // { lower: Float, upper: Float }
   expiryTimestamp    DateTime
   resolutionOracle   String?
+  resolvedOutcome    Boolean?
+  resolvedAt         DateTime?
   minimumLiquidity   Float              @default(100)
   totalLiquidity     Float              @default(0)
   onChainAddress     String?            @unique
@@ -138,6 +132,7 @@ model Market {
   @@index([category])
   @@index([expiryTimestamp])
   @@index([settlementCurrency])
+  @@index([resolvedAt])
   @@map("markets")
 }
 
@@ -336,11 +331,14 @@ model PaymentEvent {
   createdAt     DateTime @default(now())
   confirmedAt   DateTime?
 
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
   @@index([userId])
   @@index([txHash])
+  @@map("payment_events")
 }
 
-// Nanopayment subscription for trace access
+// User-defined spending approvals for nanopayment trace access
 model SpendingAllowance {
   id           String   @id @default(uuid())
   userId       String   @unique
@@ -354,5 +352,8 @@ model SpendingAllowance {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
   @@index([userId])
+  @@map("spending_allowances")
 }

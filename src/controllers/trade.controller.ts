@@ -121,7 +121,7 @@ export async function confirmCopyTrade(req: Request, res: Response): Promise<voi
     return;
   }
 
-  const { id } = req.params;
+  const id = String(req.params.id);
   const { txHash } = req.body as { txHash?: string };
 
   if (!txHash) {

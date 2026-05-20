@@ -6,7 +6,7 @@ import { z } from 'zod';
 export const createMarketSchema = z.object({
   body: z.object({
     question: z.string().min(10, 'Question must be at least 10 characters'),
-    category: z.enum(['FED', 'ECB', 'ELECTION', 'GEOPOLITICAL', 'CRYPTO', 'MACRO', "SPORTS", "ENTERTAINMENT", "POLITICS"]),
+    category: z.enum(['FED', 'ECB', 'ELECTION', 'GEOPOLITICAL', 'CRYPTO', 'MACRO']),
     settlementCurrency: z.enum(['USDC', 'EURC']).default('USDC'),
     expiryTimestamp: z.number().int().positive(),
     resolutionOracle: z.string().optional(),
@@ -17,7 +17,7 @@ export const createMarketSchema = z.object({
 export const listMarketsSchema = z.object({
   query: z.object({
     status: z.enum(['PENDING', 'ACTIVE', 'RESOLVING', 'RESOLVED', 'CANCELLED']).optional(),
-    category: z.enum(['FED', 'ECB', 'ELECTION', 'GEOPOLITICAL', 'CRYPTO', 'MACRO', "SPORTS", "ENTERTAINMENT", "POLITICS"]).optional(),
+    category: z.enum(['FED', 'ECB', 'ELECTION', 'GEOPOLITICAL', 'CRYPTO', 'MACRO']).optional(),
     currency: z.enum(['USDC', 'EURC']).optional(),
     page: z.string().optional(),
     limit: z.string().optional(),

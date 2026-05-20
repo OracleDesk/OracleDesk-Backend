@@ -271,7 +271,7 @@ export async function createMarketFromProposal(
 			settlementCurrency: proposal.settlement_currency,
 			initialYesProb: proposal.initial_yes_probability,
 			currentYesProb: proposal.initial_yes_probability,
-			confidenceInterval: proposal.confidence_interval,
+			confidenceInterval: proposal.confidence_interval as any,
 			expiryTimestamp: new Date(proposal.expiry_timestamp * 1000),
 			resolutionOracle: proposal.resolution_oracle,
 			minimumLiquidity: proposal.minimum_liquidity_usdc,
@@ -324,7 +324,7 @@ async function logAgentAction(
 ): Promise<void> {
 	try {
 		await prisma.agentLog.create({
-			data: { agentType, level, action, marketId: marketId ?? undefined, data },
+			data: { agentType, level, action, marketId: marketId ?? undefined, data: data as any },
 		});
 	} catch (err) {
 		logger.error({ err }, "Failed to write agent log");
