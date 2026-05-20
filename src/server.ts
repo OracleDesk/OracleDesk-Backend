@@ -19,11 +19,15 @@ async function bootstrap(): Promise<void> {
   }
 
   // 2. Backfill blockchain events missed during downtime
-  try {
-    await backfillEvents();
-  } catch (err) {
-    logger.warn({ err }, 'Backfill failed — continuing without backfill');
-  }
+  // try {
+  //   await backfillEvents();
+  // } catch (err) {
+  //   logger.warn({ err }, 'Backfill failed — continuing without backfill');
+  // }
+  
+   backfillEvents().catch((err) => {
+    logger.warn({ err }, 'Backfill failed');
+  });
 
   // 3. Start real-time event listener
   stopEventListener = startEventListener();

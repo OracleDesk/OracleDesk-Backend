@@ -3,10 +3,16 @@
 
 import { z } from 'zod';
 
+// All nine categories — kept in sync with prisma MarketCategory enum
+const MARKET_CATEGORIES = [
+  'FED', 'ECB', 'ELECTION', 'GEOPOLITICAL',
+  'CRYPTO', 'MACRO', 'SPORTS', 'ENTERTAINMENT', 'POLITICS',
+] as const;
+
 export const createMarketSchema = z.object({
   body: z.object({
     question: z.string().min(10, 'Question must be at least 10 characters'),
-    category: z.enum(['FED', 'ECB', 'ELECTION', 'GEOPOLITICAL', 'CRYPTO', 'MACRO']),
+    category: z.enum(MARKET_CATEGORIES),
     settlementCurrency: z.enum(['USDC', 'EURC']).default('USDC'),
     expiryTimestamp: z.number().int().positive(),
     resolutionOracle: z.string().optional(),
@@ -17,7 +23,7 @@ export const createMarketSchema = z.object({
 export const listMarketsSchema = z.object({
   query: z.object({
     status: z.enum(['PENDING', 'ACTIVE', 'RESOLVING', 'RESOLVED', 'CANCELLED']).optional(),
-    category: z.enum(['FED', 'ECB', 'ELECTION', 'GEOPOLITICAL', 'CRYPTO', 'MACRO']).optional(),
+    category: z.enum(MARKET_CATEGORIES).optional(),
     currency: z.enum(['USDC', 'EURC']).optional(),
     page: z.string().optional(),
     limit: z.string().optional(),
@@ -25,3 +31,4 @@ export const listMarketsSchema = z.object({
 });
 
 export type CreateMarketInput = z.infer<typeof createMarketSchema>['body'];
+export type MarketCategoryValue = typeof MARKET_CATEGORIES[number];

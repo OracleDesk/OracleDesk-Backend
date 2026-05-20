@@ -7,6 +7,15 @@ import type {
 // ─── Re-export Prisma types ───
 export type { Market, Trade, Position, ReasoningTrace };
 
+// ─── Enum types ───
+export enum JobStatus {
+  RUNNING = 'RUNNING',
+  COMPLETED = 'COMPLETED',
+  FAILED = 'FAILED',
+  UNKNOWN = 'UNKNOWN',
+}
+
+
 // ─── Signal types (from ingestion) ───
 export interface RawSignal {
   source: string;
@@ -17,7 +26,7 @@ export interface RawSignal {
   category: string;
 }
 
-export interface WeightedSignal {
+export interface WeightedSignal extends Record<string, unknown> {
   source: string;
   weight: number;
   signal: string;
@@ -46,7 +55,7 @@ export interface MarketProposal {
 }
 
 // ─── Probability types ───
-export interface ConfidenceInterval {
+export interface ConfidenceInterval extends Record<string, number> {
   lower: number;
   upper: number;
 }
@@ -188,4 +197,15 @@ export interface SubscriptionAccess {
   hasAccess: boolean;
   accessType: 'FREE_PREVIEW' | 'PER_TRACE' | 'DAILY_PASS' | 'NO_ACCESS';
   expiresAt?: Date;
+}
+
+// ─── Jod types ───
+export interface JobRecord {
+  status: JobStatus;
+  startedAt: Date;
+  completedAt?: Date;
+  marketId?: string;
+  question?: string;
+  category?: MarketCategory;
+  error?: string;
 }

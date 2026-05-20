@@ -9,4 +9,5 @@ router.get('/', market_controller_1.listMarkets);
 router.get('/:id', market_controller_1.getMarket);
 // Protected — requires JWT
 router.post('/generate', auth_middleware_1.requireAuth, market_controller_1.triggerMarketGeneration);
+router.get('/generation-status/:jobId', auth_middleware_1.requireAuth, market_controller_1.getMarketGenerationStatus);
 exports.default = router;

@@ -22,12 +22,14 @@ async function bootstrap() {
         process.exit(1);
     }
     // 2. Backfill blockchain events missed during downtime
-    try {
-        await (0, indexer_service_1.backfillEvents)();
-    }
-    catch (err) {
-        logger_1.logger.warn({ err }, 'Backfill failed — continuing without backfill');
-    }
+    // try {
+    //   await backfillEvents();
+    // } catch (err) {
+    //   logger.warn({ err }, 'Backfill failed — continuing without backfill');
+    // }
+    (0, indexer_service_1.backfillEvents)().catch((err) => {
+        logger_1.logger.warn({ err }, 'Backfill failed');
+    });
     // 3. Start real-time event listener
     stopEventListener = (0, indexer_service_1.startEventListener)();
     // 4. Start cron jobs
