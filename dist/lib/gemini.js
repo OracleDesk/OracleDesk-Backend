@@ -9,7 +9,7 @@ const logger_1 = require("./logger");
 // ─── Singleton client ─────────────────────────────────────────────────────────
 const genAI = new generative_ai_1.GoogleGenerativeAI(config_1.config.GEMINI_API_KEY);
 // Best model for structured reasoning and JSON output
-exports.GEMINI_MODEL = 'gemini-1.5-flash';
+exports.GEMINI_MODEL = 'models/gemini-1.5-flash';
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 /**
  * callGemini — general text completion.
