@@ -25,31 +25,39 @@ function startEventListener() {
     }
     const unwatchers = [
         publicClient.watchContractEvent({
+            poll: true,
+            pollingInterval: 4000,
             address: contracts_1.CONTRACT_ADDRESSES.marketFactory,
             abi: contracts_1.MARKET_FACTORY_ABI,
             eventName: 'MarketDeployed',
-            onLogs: (logs) => logs.forEach(log => handleMarketDeployed(log).catch(logError)),
+            onLogs: (logs) => logs.forEach((log) => handleMarketDeployed(log).catch(logError)),
             onError: (err) => logger_1.logger.error({ err }, 'MarketDeployed watcher error'),
         }),
         publicClient.watchContractEvent({
+            poll: true,
+            pollingInterval: 4000,
             address: contracts_1.CONTRACT_ADDRESSES.reasoningRegistry,
             abi: contracts_1.REASONING_REGISTRY_ABI,
             eventName: 'ReasoningPublished',
-            onLogs: (logs) => logs.forEach(log => handleRegistryReasoningPublished(log).catch(logError)),
+            onLogs: (logs) => logs.forEach((log) => handleRegistryReasoningPublished(log).catch(logError)),
             onError: (err) => logger_1.logger.error({ err }, 'ReasoningRegistry watcher error'),
         }),
         publicClient.watchContractEvent({
+            poll: true,
+            pollingInterval: 4000,
             address: contracts_1.CONTRACT_ADDRESSES.positionLedger,
             abi: contracts_1.POSITION_LEDGER_ABI,
             eventName: 'PositionOpened',
-            onLogs: (logs) => logs.forEach(log => handlePositionOpened(log).catch(logError)),
+            onLogs: (logs) => logs.forEach((log) => handlePositionOpened(log).catch(logError)),
             onError: (err) => logger_1.logger.error({ err }, 'PositionOpened watcher error'),
         }),
         publicClient.watchContractEvent({
+            poll: true,
+            pollingInterval: 4000,
             address: contracts_1.CONTRACT_ADDRESSES.multiSigOracle,
             abi: contracts_1.MULTISIG_ORACLE_ABI,
             eventName: 'MarketResolved',
-            onLogs: (logs) => logs.forEach(log => handleMarketResolved(log).catch(logError)),
+            onLogs: (logs) => logs.forEach((log) => handleMarketResolved(log).catch(logError)),
             onError: (err) => logger_1.logger.error({ err }, 'MarketResolved watcher error'),
         }),
     ];

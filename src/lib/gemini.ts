@@ -6,7 +6,7 @@ import { logger } from './logger';
 const genAI = new GoogleGenerativeAI(config.GEMINI_API_KEY);
 
 // Best model for structured reasoning and JSON output
-export const GEMINI_MODEL = 'gemini-1.5-flash';
+export const GEMINI_MODEL = 'models/gemini-1.5-flash';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
