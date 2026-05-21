@@ -29,6 +29,9 @@ enum MarketCategory {
   GEOPOLITICAL
   CRYPTO
   MACRO
+  SPORTS
+  ENTERTAINMENT
+  POLITICS
 }
 
 enum SettlementCurrency {
@@ -122,6 +125,8 @@ model Market {
   createdAt          DateTime           @default(now())
   updatedAt          DateTime           @updatedAt
 
+  generationJob MarketGenerationJob? @relation("MarketGenerationJobMarket")
+
   trades         Trade[]
   positions      Position[]
   reasoningTraces ReasoningTrace[]
@@ -134,6 +139,22 @@ model Market {
   @@index([settlementCurrency])
   @@index([resolvedAt])
   @@map("markets")
+}
+
+// Background job for market generation process, tracking status and errors
+model MarketGenerationJob {
+  id          String   @id @default(cuid())
+  status      String   @default("PROCESSING")
+  marketId    String?  @unique
+  traceId     String?
+  error       String?
+  startedAt   DateTime @default(now())
+  completedAt DateTime?
+
+  market Market? @relation("MarketGenerationJobMarket", fields: [marketId], references: [id])
+
+  @@index([status])
+  @@map("market_generation_jobs")
 }
 
 /// Individual trade executed by the Trader Agent

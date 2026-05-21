@@ -17,7 +17,7 @@ router.get('/',             listTraces);
 router.get('/access/allowance', requireAuth, getMySpendingAllowance);
 router.put('/access/allowance', requireAuth, setSpendingAllowance);
 router.get('/payments', requireAuth, getMyPaymentEvents);
-router.get('/:id',          getTrace);   // Returns preview if unauthenticated
+router.get('/:id', getTrace);   // Returns preview if unauthenticated
 
 // Protected
 router.post('/verify',       requireAuth, verifyTrace);

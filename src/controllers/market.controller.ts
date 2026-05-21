@@ -1,46 +1,104 @@
 import type { Request, Response } from 'express';
 import { prisma } from '../lib/prisma';
+import { v4 as uuidv4 } from 'uuid';
+import type { JobRecord } from '../types';
+import { JobStatus } from '../types';
 import { sendSuccess, sendError, parsePagination, buildPaginationMeta } from '../utils/response.util';
 import { runMarketMakerCycle } from '../agents/market-maker.agent';
 import { listMarketsSchema } from '../validators/market.validator';
+import {
+  MarketCategory,
+  MarketStatus,
+  SettlementCurrency,
+  Prisma,
+} from '@prisma/client';
 import { AppError } from '../middlewares/error.middleware';
+
+
+const jobTracker: Map<string, JobRecord> = new Map();
 
 /**
  * GET /markets
  * Returns a paginated list of prediction markets.
  * Query params: status, category, currency, page, limit
  */
-export async function listMarkets(req: Request, res: Response): Promise<void> {
-  const parsed = listMarketsSchema.safeParse({ query: req.query });
+export async function listMarkets(
+  req: Request,
+  res: Response,
+): Promise<void> {
+  const parsed = listMarketsSchema.safeParse({
+    query: req.query,
+  });
+
   if (!parsed.success) {
-    sendError(res, 400, 'VALIDATION_ERROR', 'Invalid query parameters',
-      parsed.error.flatten().fieldErrors as any);
+    sendError(
+      res,
+      400,
+      'VALIDATION_ERROR',
+      'Invalid query parameters',
+      parsed.error.flatten().fieldErrors as any,
+    );
+
     return;
   }
 
-  const { status, category, currency, page: p, limit: l } = parsed.data.query;
-  const { page, limit, skip } = parsePagination({ page: p, limit: l });
+  const {
+    status,
+    category,
+    currency,
+    page: p,
+    limit: l,
+  } = parsed.data.query;
 
-  const where = {
-    ...(status   ? { status }                                   : {}),
-    ...(category ? { category }                                 : {}),
-    ...(currency ? { settlementCurrency: currency as any }      : {}),
-  };
+  const { page, limit, skip } = parsePagination({
+    page: p,
+    limit: l,
+  });
+
+  const where: Prisma.MarketWhereInput = {
+  ...(status
+    ? { status: status as MarketStatus }
+    : {}),
+
+  ...(category
+    ? { category: category as MarketCategory }
+    : {}),
+
+  ...(currency
+    ? {
+        settlementCurrency:
+          currency as SettlementCurrency,
+      }
+    : {}),
+};
 
   const [markets, total] = await Promise.all([
     prisma.market.findMany({
       where,
       skip,
       take: limit,
-      orderBy: { createdAt: 'desc' },
+      orderBy: {
+        createdAt: 'desc',
+      },
       include: {
-        _count: { select: { trades: true, reasoningTraces: true } },
+        _count: {
+          select: {
+            trades: true,
+            reasoningTraces: true,
+          },
+        },
       },
     }),
+
     prisma.market.count({ where }),
   ]);
 
-  sendSuccess(res, markets, 200, buildPaginationMeta(page, limit, total) as any);
+  sendSuccess(
+    res,
+    markets,
+    200,
+    buildPaginationMeta(page, limit, total) as any,
+  );
 }
 
 /**
@@ -48,15 +106,23 @@ export async function listMarkets(req: Request, res: Response): Promise<void> {
  * Returns full detail for a single market including confidence interval
  * and linked reasoning traces.
  */
-export async function getMarket(req: Request, res: Response): Promise<void> {
+export async function getMarket(
+  req: Request,
+  res: Response,
+): Promise<void> {
   const id = String(req.params.id);
 
   const market = await prisma.market.findUnique({
     where: { id },
+
     include: {
       reasoningTraces: {
-        orderBy: { createdAt: 'desc' },
+        orderBy: {
+          createdAt: 'desc',
+        },
+
         take: 5,
+
         select: {
           id: true,
           agentType: true,
@@ -66,12 +132,24 @@ export async function getMarket(req: Request, res: Response): Promise<void> {
           createdAt: true,
         },
       },
-      _count: { select: { trades: true, positions: true } },
+
+      _count: {
+        select: {
+          trades: true,
+          positions: true,
+        },
+      },
     },
   });
 
   if (!market) {
-    sendError(res, 404, 'MARKET_NOT_FOUND', `Market ${id} not found`);
+    sendError(
+      res,
+      404,
+      'MARKET_NOT_FOUND',
+      `Market ${id} not found`,
+    );
+
     return;
   }
 
@@ -84,11 +162,191 @@ export async function getMarket(req: Request, res: Response): Promise<void> {
  * Used for hackathon demos and testing.
  * Requires auth.
  */
-export async function triggerMarketGeneration(req: Request, res: Response): Promise<void> {
-  // Fire-and-forget — return immediately, cycle runs in background
-  runMarketMakerCycle().catch(err =>
-    console.error('Manual market generation error:', err)
-  );
+export async function triggerMarketGeneration(
+  req: Request,
+  res: Response,
+): Promise<void> {
+  const jobId = uuidv4();
 
-  sendSuccess(res, { message: 'Market Maker cycle triggered' }, 202);
+  // ── Register RUNNING job ─────────────────────────────────────
+
+  jobTracker.set(jobId, {
+    status: JobStatus.RUNNING,
+    startedAt: new Date(),
+  });
+
+  // ── Persist audit log ────────────────────────────────────────
+
+  prisma.agentLog
+    .create({
+      data: {
+        agentType: 'MARKET_MAKER',
+        level: 'INFO',
+        action: 'GENERATION_JOB_STARTED',
+
+        data: {
+          jobId,
+        },
+      },
+    })
+    .catch(() => {
+      // Non-blocking
+    });
+
+  // ── Run generation in background ─────────────────────────────
+
+  runMarketMakerCycle()
+    .then((result: any) => {
+      const existingJob = jobTracker.get(jobId);
+
+      if (!existingJob) {
+        return;
+      }
+
+      jobTracker.set(jobId, {
+        status: JobStatus.COMPLETED,
+        startedAt: existingJob.startedAt,
+        completedAt: new Date(),
+
+        marketId: result?.marketId,
+        question: result?.question,
+        category: result?.category,
+      });
+    })
+    .catch((err: Error) => {
+      const existingJob = jobTracker.get(jobId);
+
+      if (!existingJob) {
+        return;
+      }
+
+      jobTracker.set(jobId, {
+        status: JobStatus.FAILED,
+        startedAt: existingJob.startedAt,
+        completedAt: new Date(),
+        error: err.message,
+      });
+    });
+
+  sendSuccess(
+    res,
+    {
+      jobId,
+
+      message:
+        'Market Maker cycle started. Gemini is analysing live signals.',
+
+      statusUrl: `/api/v1/markets/generation-status/${jobId}`,
+
+      hint:
+        'Poll statusUrl every 5 seconds until status is COMPLETED or FAILED.',
+    },
+    202,
+  );
+}
+
+/**
+ * GET /api/v1/markets/generation-status/:jobId
+ *
+ * Poll background job status.
+ */
+export async function getMarketGenerationStatus(
+  req: Request,
+  res: Response,
+): Promise<void> {
+  const { jobId } = req.params;
+
+  if (!jobId || typeof jobId !== 'string') {
+    sendError(
+      res,
+      400,
+      'INVALID_JOB_ID',
+      'jobId must be a non-empty string',
+    );
+
+    return;
+  }
+
+  // ── Check memory tracker ─────────────────────────────────────
+
+  const job = jobTracker.get(jobId);
+
+  if (job) {
+    const elapsedMs = job.completedAt
+      ? job.completedAt.getTime() - job.startedAt.getTime()
+      : Date.now() - job.startedAt.getTime();
+
+    sendSuccess(res, {
+      jobId,
+
+      status: job.status,
+
+      startedAt: job.startedAt,
+
+      completedAt: job.completedAt ?? null,
+
+      elapsedMs,
+
+      ...(job.marketId
+        ? {
+            marketId: job.marketId,
+            question: job.question,
+            category: job.category,
+            marketUrl: `/api/v1/markets/${job.marketId}`,
+          }
+        : {}),
+
+      ...(job.error
+        ? {
+            error: job.error,
+          }
+        : {}),
+    });
+
+    return;
+  }
+
+  // ── Check persisted DB logs ──────────────────────────────────
+
+  const dbLog = await prisma.agentLog.findFirst({
+    where: {
+      action: 'GENERATION_JOB_STARTED',
+
+      data: {
+        path: ['jobId'],
+        equals: jobId,
+      },
+    },
+
+    orderBy: {
+      createdAt: 'desc',
+    },
+  });
+
+  if (!dbLog) {
+    sendError(
+      res,
+      404,
+      'JOB_NOT_FOUND',
+      `No generation job found with id: ${jobId}`,
+    );
+
+    return;
+  }
+
+  // ── Job existed before restart ───────────────────────────────
+
+  sendSuccess(res, {
+    jobId,
+
+    status: JobStatus.UNKNOWN,
+
+    startedAt: dbLog.createdAt,
+
+    message:
+      'Server restarted after this job started. Check recent markets.',
+
+    hint:
+      'Filter GET /api/v1/markets by recent createdAt timestamps.',
+  });
 }

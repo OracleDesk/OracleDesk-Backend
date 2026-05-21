@@ -8,7 +8,7 @@ const envSchema = z.object({
   PORT:                       z.string().default('8000').transform(Number),
   NODE_ENV:                   z.enum(['development', 'production', 'test']).default('development'),
 
-  ANTHROPIC_API_KEY:          z.string().min(1, 'ANTHROPIC_API_KEY is required'),
+  GEMINI_API_KEY:             z.string().min(1, 'GEMINI_API_KEY is required'),
 
   PINATA_API_KEY:             z.string().min(1, 'PINATA_API_KEY is required'),
   PINATA_SECRET_API_KEY:      z.string().min(1, 'PINATA_SECRET_API_KEY is required'),
