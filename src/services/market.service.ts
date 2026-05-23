@@ -184,7 +184,7 @@ export function validateMarketQuestion(rawLlmOutput: string): MarketProposal {
   const { initial_yes_probability: p, confidence_interval: ci } = result.data;
   if (ci.lower >= ci.upper || p < ci.lower || p > ci.upper) {
     throw new AppError(422, 'INVALID_CONFIDENCE_INTERVAL',
-      'Probability must be within the confidence interval bounds', { p, ci });
+      'Probability must be within confidence interval bounds', { p, ci });
   }
 
   return result.data as MarketProposal;
