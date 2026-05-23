@@ -18,7 +18,20 @@ const app = express();
 app.use(helmet());
 app.use(hpp());
 app.use(cors({
-  origin:      config.NODE_ENV === 'production' ? 'https://oracledesk.app' : '*',
+  origin: (origin, callback) => {
+    const allowedOrigins = [
+      'https://oracledesk.app',
+    ];
+    
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.indexOf(origin) !== -1 || config.NODE_ENV !== 'production') {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   credentials: true,
 }));
 

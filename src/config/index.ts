@@ -36,6 +36,8 @@ const envSchema = z.object({
   JWT_SECRET:                 z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
   AGENT_PRIVATE_KEY:          z.string().default(''),
   AGENT_WALLET_ADDRESS:       z.string().default(''),
+  POLYGON_PRIVATE_KEY:        z.string().default(''),
+  POLYGON_EXECUTION_WALLET:   z.string().default(''),
   CHAIN_EXECUTION_MODE:       z.enum(['mock', 'wallet', 'circle']).default('mock'),
 
   NEWSAPI_KEY:                z.string().default(''),

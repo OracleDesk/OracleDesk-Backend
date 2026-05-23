@@ -85,6 +85,8 @@ export interface TradePayload {
   edgeDetected: number;
   builderCode: string;
   traceId?: string;
+  polymarketTokenId?: string;
+  polymarketConditionId?: string;
 }
 
 export interface CopyTradePayload {

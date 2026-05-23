@@ -2,7 +2,8 @@ import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { AppError } from '../middlewares/error.middleware';
 import type { KellyResult, TradePayload, KellyInput } from '../types';
-import { submitFundBet } from './chain.service';
+import { submitFundBet, buyArcMarketShares, publishReasoningToRegistry, openPositionOnLedger } from './chain.service';
+import { submitPolymarketOrder } from './polymarket.service';
 
 // ─── Risk constants ───
 const MAX_SINGLE_POSITION_PCT  = 0.025;  // 2.5% of bankroll per position
@@ -84,6 +85,15 @@ export async function executeTrade(payload: TradePayload): Promise<{
       `Edge ${payload.edgeDetected} below minimum ${MIN_EDGE_THRESHOLD}`);
   }
 
+  // Fetch market to check platform
+  const market = await prisma.market.findUnique({
+    where: { id: payload.marketId },
+  });
+
+  if (!market) {
+    throw new AppError(404, 'MARKET_NOT_FOUND', 'Market not found');
+  }
+
   // Check existing exposure for this market
   const existingPosition = await prisma.position.findFirst({
     where: { marketId: payload.marketId, status: 'OPEN' },
@@ -108,7 +118,7 @@ export async function executeTrade(payload: TradePayload): Promise<{
   // ── Step 3: Attempt on-chain execution ──
   let txHash: string | null = null;
   try {
-    txHash = await submitTradeTransaction(payload);
+    txHash = await submitTradeTransaction(payload, market);
   } catch (err) {
     // Mark as FAILED — no position created
     await prisma.trade.update({
@@ -148,6 +158,23 @@ export async function executeTrade(payload: TradePayload): Promise<{
       },
     }),
   ]);
+
+  // ── Step 5: Publish reasoning to Registry (non-blocking) ──
+  if (payload.traceId) {
+    prisma.reasoningTrace.findUnique({ where: { id: payload.traceId } })
+      .then(async (trace) => {
+        if (trace?.ipfsCid && trace?.sha256Hash) {
+          await publishReasoningToRegistry({
+            ipfsCid: trace.ipfsCid,
+            sha256Hash: trace.sha256Hash,
+            traceType: 'trade',
+            relatedId: position.id,
+          });
+          logger.info({ traceId: trace.id, positionId: position.id }, 'Trade reasoning published on-chain');
+        }
+      })
+      .catch(err => logger.warn({ err }, 'Failed to publish trade reasoning on-chain'));
+  }
 
   await logAgentAction('TRADER', 'INFO', 'TRADE_EXECUTED', payload.marketId, {
     tradeId: updatedTrade.id,
@@ -255,12 +282,74 @@ export async function closePosition(
  * Currently constructs the transaction parameters for the prediction market contract.
  * Returns the transaction hash.
  */
-async function submitTradeTransaction(payload: TradePayload): Promise<string> {
+async function submitTradeTransaction(payload: TradePayload, market: any): Promise<string> {
+  // 1. If it has an on-chain address on Arc, trade directly on Arc
+  if (market.onChainAddress && market.onChainAddress.startsWith('0x') && !payload.polymarketConditionId) {
+    logger.info({ marketId: market.id, address: market.onChainAddress }, 'Executing trade on Arc PredictionMarket');
+    return buyArcMarketShares({
+      marketAddress: market.onChainAddress,
+      buyYes: payload.direction === 'YES',
+      amountUsdc: payload.amount,
+    });
+  }
+
+  // 2. If it's a Polymarket trade (has conditionId/tokenId)
+  if (payload.polymarketConditionId && payload.polymarketTokenId) {
+    logger.info({ marketId: market.id, conditionId: payload.polymarketConditionId }, 'Executing Polymarket trade flow');
+    
+    // Step A: Bridge funds via CCTP (Arc -> Polygon)
+    const arcTxHash = await submitFundBet({
+      marketId: payload.marketId,
+      amountUsdc: payload.amount,
+    });
+    logger.info({ arcTxHash }, 'Funding transaction submitted on Arc');
+
+    // Step B: Wait for CCTP (Hackathon version: simple sleep)
+    // In production, we'd use a worker and poll the Circle API for finality.
+    logger.info('Waiting 20s for CCTP finality...');
+    await sleep(20000);
+
+    // Step C: Sign and submit order on Polygon
+    const polyOrderId = await submitPolymarketOrder({
+      tokenId: payload.polymarketTokenId,
+      usdcAmount: payload.amount,
+      price: payload.price,
+      side: payload.direction === 'YES' ? 'BUY' : 'SELL',
+    });
+    logger.info({ polyOrderId }, 'Polymarket order submitted to CLOB');
+
+    // Step D: Log position on Arc PositionLedger
+    // This provides the tamper-evident proof of the execution.
+    if (payload.traceId) {
+      const trace = await prisma.reasoningTrace.findUnique({ where: { id: payload.traceId } });
+      if (trace) {
+        await openPositionOnLedger({
+          conditionId: payload.polymarketConditionId,
+          tokenId: payload.polymarketTokenId,
+          side: payload.direction,
+          usdcSpent: payload.amount,
+          entryPriceBps: Math.round(payload.price * 10000),
+          edgeBps: Math.round(payload.edgeDetected * 10000),
+          reasoningCid: trace.ipfsCid || '',
+          sha256Hash: trace.sha256Hash || '',
+          polygonTxHash: polyOrderId,
+        });
+        logger.info('Position logged on Arc PositionLedger');
+      }
+    }
+
+    return polyOrderId;
+  }
+
+  // 3. Fallback: bridge funds to Polygon
+  logger.info({ marketId: market.id }, 'Bridging funds to Polygon (fallback)');
   return submitFundBet({
     marketId: payload.marketId,
     amountUsdc: payload.amount,
   });
 }
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function logAgentAction(
   agentType: 'MARKET_MAKER' | 'TRADER',
