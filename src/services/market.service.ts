@@ -2,46 +2,37 @@
 
 import { z } from "zod";
 import { prisma } from "../lib/prisma";
-// import { callClaude } from "../lib/anthropic";
-import { callGeminiJSON } from '../lib/gemini';  
+import { callGeminiJSON } from '../lib/gemini';
 import { logger } from "../lib/logger";
 import type {
-	MarketProposal,
-	AggregatedSignals,
-	WeightedSignal,
-	ConfidenceInterval,
+  MarketProposal,
+  AggregatedSignals,
+  WeightedSignal,
+  ConfidenceInterval,
 } from "../types";
-import { Prisma, MarketCategory } from '@prisma/client'; // Make sure MarketCategory is imported
+import { Prisma, MarketCategory } from '@prisma/client';
 import type { Market } from "@prisma/client";
 import { AppError } from "../middlewares/error.middleware";
 import dayjs from "dayjs";
 
-// ─── Zod schema for Claude's JSON output ───
+// ─── Zod schema for Gemini's JSON output ─────────────────────────────────────
 const marketProposalSchema = z.object({
-	market_question: z.string().min(10),
-	initial_yes_probability: z.number().min(0.01).max(0.99),
-	resolution_oracle: z.string().min(1),
-	expiry_timestamp: z.number().int().positive(),
-	settlement_currency: z.enum(["USDC", "EURC"]),
-	minimum_liquidity_usdc: z.number().positive(),
-	category: z.enum([
-		"FED",
-		"ECB",
-		"ELECTION",
-		"GEOPOLITICAL",
-		"CRYPTO",
-		"MACRO",
-		"SPORTS",
-		"ENTERTAINMENT",
-		"POLITICS",
-	]),
-	confidence_interval: z.object({ lower: z.number(), upper: z.number() }),
-	reasoning: z.string().min(1),
+  market_question:         z.string().min(10),
+  initial_yes_probability: z.number().min(0.01).max(0.99),
+  resolution_oracle:       z.string().min(1),
+  expiry_timestamp:        z.number().int().positive(),
+  settlement_currency:     z.enum(["USDC", "EURC"]),
+  minimum_liquidity_usdc:  z.number().positive(),
+  category: z.enum([
+    "FED", "ECB", "ELECTION", "GEOPOLITICAL",
+    "CRYPTO", "MACRO", "SPORTS", "ENTERTAINMENT", "POLITICS",
+  ]),
+  confidence_interval: z.object({ lower: z.number(), upper: z.number() }),
+  reasoning:           z.string().min(1),
 });
 
-// ─── Source credibility weights ───
+// ─── Source credibility weights ───────────────────────────────────────────────
 const SOURCE_WEIGHTS: Record<string, number> = {
-  // Macro / Economic
   FRED:                 0.9,
   BLS:                  0.9,
   ECB:                  0.9,
@@ -52,17 +43,14 @@ const SOURCE_WEIGHTS: Record<string, number> = {
   ANALYST:              0.5,
   REDDIT:               0.3,
   TWITTER:              0.3,
-  // Sports
   SPORTRADAR:           0.9,
   ESPN:                 0.8,
   BBC_SPORT:            0.8,
   SPORTS_REFERENCE:     0.85,
-  // Entertainment
   ENTERTAINMENT_WEEKLY: 0.6,
   BILLBOARD:            0.75,
   BOX_OFFICE_MOJO:      0.80,
   ROTTEN_TOMATOES:      0.70,
-  // Politics
   POLITICAL_WIRE:       0.80,
   REALCLEARPOLITICS:    0.75,
   POLITICO:             0.80,
@@ -73,8 +61,9 @@ const SOURCE_WEIGHTS: Record<string, number> = {
  * Generates a validated binary prediction market proposal from signal data.
  *
  * Calls Gemini with `callGeminiJSON` which forces clean JSON output via
- * `responseMimeType: 'application/json'`. The output is validated against
- * a Zod schema. Any LLM failure is logged with full context for debugging.
+ * `responseMimeType: 'application/json'`. The circuit breaker in gemini.ts
+ * fast-fails this call if the daily quota is already known to be exhausted,
+ * so the cycle aborts cleanly instead of retrying 3 times against a wall.
  */
 export async function generateMarketQuestion(
   signals: AggregatedSignals,
@@ -163,14 +152,13 @@ Pick the category and currency that best fits the event.
 }
 
 /**
- * Validates and parses Gemini's JSON output.
+ * Validates and parses Gemini's JSON output against the Zod schema.
  *
- * Even though we use `responseMimeType: 'application/json'`, we still
- * validate with Zod to catch semantic errors (wrong field types, out-of-range
- * probabilities, etc.) that JSON validity alone won't catch.
+ * Even with `responseMimeType: 'application/json'`, we validate with Zod to
+ * catch semantic errors (wrong field types, out-of-range probabilities) that
+ * JSON validity alone won't catch.
  */
 export function validateMarketQuestion(rawLlmOutput: string): MarketProposal {
-  // Safety strip (callGeminiJSON already strips, this is belt-and-suspenders)
   const cleaned = rawLlmOutput
     .replace(/```json\n?/gi, '')
     .replace(/```\n?/g, '')
@@ -193,7 +181,6 @@ export function validateMarketQuestion(rawLlmOutput: string): MarketProposal {
     });
   }
 
-  // Sanity: probability must sit inside confidence interval
   const { initial_yes_probability: p, confidence_interval: ci } = result.data;
   if (ci.lower >= ci.upper || p < ci.lower || p > ci.upper) {
     throw new AppError(422, 'INVALID_CONFIDENCE_INTERVAL',
@@ -205,10 +192,6 @@ export function validateMarketQuestion(rawLlmOutput: string): MarketProposal {
 
 /**
  * Computes a weighted probability estimate from a list of signals.
- *
- * Each signal source has a credibility weight (0.0–1.0). The final
- * probability is the weighted mean. The confidence interval is
- * ±1.96 × std_dev (95% CI).
  */
 export function calculateProbability(
   signals: WeightedSignal[],
@@ -232,8 +215,8 @@ export function calculateProbability(
 
   const probability = Math.min(0.99, Math.max(0.01, weightedSum / totalWeight));
 
-  const values  = signals.map(s => s.rawValue ?? baseMarketPrice);
-  const mean    = values.reduce((a, b) => a + b, 0) / values.length;
+  const values   = signals.map(s => s.rawValue ?? baseMarketPrice);
+  const mean     = values.reduce((a, b) => a + b, 0) / values.length;
   const variance = values.reduce((acc, v) => acc + Math.pow(v - mean, 2), 0) / values.length;
   const stdDev   = Math.sqrt(variance);
 
@@ -247,7 +230,6 @@ export function calculateProbability(
 
 /**
  * Derives a sensible expiry date from the market category.
- * Each category has a characteristic event horizon.
  */
 export function generateExpiryDate(category: string): Date {
   const base = dayjs();
@@ -258,92 +240,87 @@ export function generateExpiryDate(category: string): Date {
     case 'GEOPOLITICAL':  return base.add(14, 'day').toDate();
     case 'CRYPTO':        return base.add(7,  'day').toDate();
     case 'MACRO':         return base.add(21, 'day').toDate();
-    case 'SPORTS':        return base.add(14, 'day').toDate(); // Next game/match window
-    case 'ENTERTAINMENT': return base.add(30, 'day').toDate(); // Award shows, release windows
-    case 'POLITICS':      return base.add(30, 'day').toDate(); // Legislative / appointment events
+    case 'SPORTS':        return base.add(14, 'day').toDate();
+    case 'ENTERTAINMENT': return base.add(30, 'day').toDate();
+    case 'POLITICS':      return base.add(30, 'day').toDate();
     default:              return base.add(21, 'day').toDate();
   }
 }
 
 /**
  * Persists a validated MarketProposal to the database.
- * Also writes a creation log to agent_logs.
  */
 export async function createMarketFromProposal(
-    proposal: MarketProposal,
+  proposal: MarketProposal,
 ): Promise<Market> {
-    const upperCategory = String(proposal.category).toUpperCase();
-    
-    // Fall back to MACRO because it is guaranteed to exist on both old and new schemas
-    const finalCategory = Object.values(MarketCategory).includes(upperCategory as MarketCategory)
-        ? (upperCategory as MarketCategory)
-        : MarketCategory.MACRO; 
+  const upperCategory = String(proposal.category).toUpperCase();
+  const finalCategory = Object.values(MarketCategory).includes(upperCategory as MarketCategory)
+    ? (upperCategory as MarketCategory)
+    : MarketCategory.MACRO;
 
-    const market = await prisma.market.create({
-        data: {
-            question: proposal.market_question,
-            category: finalCategory, 
-            status: "PENDING",
-            settlementCurrency: proposal.settlement_currency,
-            initialYesProb: proposal.initial_yes_probability,
-            currentYesProb: proposal.initial_yes_probability,
-            confidenceInterval: proposal.confidence_interval as any,
-            expiryTimestamp: new Date(proposal.expiry_timestamp * 1000),
-            resolutionOracle: proposal.resolution_oracle,
-            minimumLiquidity: proposal.minimum_liquidity_usdc,
-        },
-    });
+  const market = await prisma.market.create({
+    data: {
+      question:           proposal.market_question,
+      category:           finalCategory,
+      status:             "PENDING",
+      settlementCurrency: proposal.settlement_currency,
+      initialYesProb:     proposal.initial_yes_probability,
+      currentYesProb:     proposal.initial_yes_probability,
+      confidenceInterval: proposal.confidence_interval as any,
+      expiryTimestamp:    new Date(proposal.expiry_timestamp * 1000),
+      resolutionOracle:   proposal.resolution_oracle,
+      minimumLiquidity:   proposal.minimum_liquidity_usdc,
+    },
+  });
 
-    await logAgentAction("MARKET_MAKER", "INFO", "MARKET_CREATED", market.id, {
-        question: market.question,
-        probability: market.initialYesProb,
-        oracle: market.resolutionOracle,
-        category:    market.category,
-    });
+  await logAgentAction("MARKET_MAKER", "INFO", "MARKET_CREATED", market.id, {
+    question:    market.question,
+    probability: market.initialYesProb,
+    oracle:      market.resolutionOracle,
+    category:    market.category,
+  });
 
-    logger.info(
-        { marketId: market.id, question: market.question, category: market.category, },
-        "Market created",
-    );
-    return market;
+  logger.info(
+    { marketId: market.id, question: market.question, category: market.category },
+    "Market created",
+  );
+  return market;
 }
 
 /**
  * Check if a similar market already exists to avoid duplicates.
- * Uses a simple word-overlap heuristic.
  */
 export async function isDuplicateMarket(question: string): Promise<boolean> {
-	const activeMarkets = await prisma.market.findMany({
-		where: { status: { in: ["PENDING", "ACTIVE"] } },
-		select: { question: true },
-	});
+  const activeMarkets = await prisma.market.findMany({
+    where:  { status: { in: ["PENDING", "ACTIVE"] } },
+    select: { question: true },
+  });
 
-	const questionWords = new Set(question.toLowerCase().split(/\s+/));
+  const questionWords = new Set(question.toLowerCase().split(/\s+/));
 
-	for (const m of activeMarkets) {
-		const existingWords = m.question.toLowerCase().split(/\s+/);
-		const overlap = existingWords.filter((w) => questionWords.has(w)).length;
-		const similarity =
-			overlap / Math.max(questionWords.size, existingWords.length);
-		if (similarity > 0.7) return true;
-	}
+  for (const m of activeMarkets) {
+    const existingWords = m.question.toLowerCase().split(/\s+/);
+    const overlap    = existingWords.filter((w) => questionWords.has(w)).length;
+    const similarity = overlap / Math.max(questionWords.size, existingWords.length);
+    if (similarity > 0.7) return true;
+  }
 
-	return false;
+  return false;
 }
 
-// ─── Internal helper ───
+// ─── Internal helper ──────────────────────────────────────────────────────────
 async function logAgentAction(
-	agentType: "MARKET_MAKER" | "TRADER",
-	level: "INFO" | "WARN" | "ERROR" | "DEBUG",
-	action: string,
-	marketId: string | null,
-	data?: Record<string, unknown>,
+  agentType: "MARKET_MAKER" | "TRADER",
+  level:     "INFO" | "WARN" | "ERROR" | "DEBUG",
+  action:    string,
+  marketId:  string | null,
+  data?:     Record<string, unknown>,
 ): Promise<void> {
-	try {
-		await prisma.agentLog.create({
-			data: { agentType, level, action, marketId: marketId ?? undefined, data: data as any },
-		});
-	} catch (err) {
-		logger.error({ err }, "Failed to write agent log");
-	}
+  try {
+    await prisma.agentLog.create({
+      data: { agentType, level, action, marketId: marketId ?? undefined, data: data as any },
+    });
+  } catch (err) {
+    logger.error({ err }, "Failed to write agent log");
+  }
 }
