@@ -17,12 +17,9 @@ const MIN_CALL_INTERVAL_MS = 4_000;
 
 async function waitForCallSlot(): Promise<void> {
   const elapsed = Date.now() - _lastCallAt;
-
   if (_lastCallAt > 0 && elapsed < MIN_CALL_INTERVAL_MS) {
     const wait = MIN_CALL_INTERVAL_MS - elapsed;
-
     logger.debug({ waitMs: wait }, 'Gemini call guard: throttling request');
-    
     await new Promise(r => setTimeout(r, wait));
   }
   _lastCallAt = Date.now();

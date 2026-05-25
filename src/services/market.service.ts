@@ -2,7 +2,7 @@
 
 import { z } from "zod";
 import { prisma } from "../lib/prisma";
-import { callGeminiJSON } from '../lib/gemini';
+import { callLLMJSON } from '../lib/llm';
 import { logger } from "../lib/logger";
 import type {
   MarketProposal,
@@ -60,10 +60,10 @@ const SOURCE_WEIGHTS: Record<string, number> = {
 /**
  * Generates a validated binary prediction market proposal from signal data.
  *
- * Calls Gemini with `callGeminiJSON` which forces clean JSON output via
- * `responseMimeType: 'application/json'`. The circuit breaker in gemini.ts
- * fast-fails this call if the daily quota is already known to be exhausted,
- * so the cycle aborts cleanly instead of retrying 3 times against a wall.
+ * Calls callLLMJSON (Claude → Gemini fallback) which forces clean JSON output.
+ * If ANTHROPIC_API_KEY is set, Claude handles the call. Otherwise it falls
+ * back to Gemini. The circuit breaker in gemini.ts fast-fails Gemini calls
+ * when the daily quota is exhausted so the cycle aborts cleanly.
  */
 export async function generateMarketQuestion(
   signals: AggregatedSignals,
@@ -139,13 +139,13 @@ Pick the category and currency that best fits the event.
 
   let rawResponse: string;
   try {
-    rawResponse = await callGeminiJSON(systemPrompt, userPrompt, 4096);
+    rawResponse = await callLLMJSON(systemPrompt, userPrompt, 4096);
   } catch (err) {
-    await logAgentAction('MARKET_MAKER', 'ERROR', 'GENERATE_QUESTION_GEMINI_FAIL', null, {
+    await logAgentAction('MARKET_MAKER', 'ERROR', 'GENERATE_QUESTION_LLM_FAIL', null, {
       error:       String(err),
       signalCount: signals.signalCount,
     });
-    throw new AppError(500, 'LLM_CALL_FAILED', 'Gemini API call failed during market generation');
+    throw new AppError(500, 'LLM_CALL_FAILED', 'LLM API call failed during market generation');
   }
 
   return validateMarketQuestion(rawResponse);
@@ -184,7 +184,7 @@ export function validateMarketQuestion(rawLlmOutput: string): MarketProposal {
   const { initial_yes_probability: p, confidence_interval: ci } = result.data;
   if (ci.lower >= ci.upper || p < ci.lower || p > ci.upper) {
     throw new AppError(422, 'INVALID_CONFIDENCE_INTERVAL',
-      'Probability must be within confidence interval bounds', { p, ci });
+      'Probability must be within the confidence interval bounds', { p, ci });
   }
 
   return result.data as MarketProposal;

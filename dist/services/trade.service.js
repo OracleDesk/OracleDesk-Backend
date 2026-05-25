@@ -8,6 +8,7 @@ const prisma_1 = require("../lib/prisma");
 const logger_1 = require("../lib/logger");
 const error_middleware_1 = require("../middlewares/error.middleware");
 const chain_service_1 = require("./chain.service");
+const polymarket_service_1 = require("./polymarket.service");
 // ─── Risk constants ───
 const MAX_SINGLE_POSITION_PCT = 0.025; // 2.5% of bankroll per position
 const MAX_CORRELATED_EXPOSURE = 0.05; // 5% total correlated exposure
@@ -76,6 +77,13 @@ async function executeTrade(payload) {
     if (Math.abs(payload.edgeDetected) < MIN_EDGE_THRESHOLD) {
         throw new error_middleware_1.AppError(400, 'INSUFFICIENT_EDGE', `Edge ${payload.edgeDetected} below minimum ${MIN_EDGE_THRESHOLD}`);
     }
+    // Fetch market to check platform
+    const market = await prisma_1.prisma.market.findUnique({
+        where: { id: payload.marketId },
+    });
+    if (!market) {
+        throw new error_middleware_1.AppError(404, 'MARKET_NOT_FOUND', 'Market not found');
+    }
     // Check existing exposure for this market
     const existingPosition = await prisma_1.prisma.position.findFirst({
         where: { marketId: payload.marketId, status: 'OPEN' },
@@ -98,7 +106,7 @@ async function executeTrade(payload) {
     // ── Step 3: Attempt on-chain execution ──
     let txHash = null;
     try {
-        txHash = await submitTradeTransaction(payload);
+        txHash = await submitTradeTransaction(payload, market);
     }
     catch (err) {
         // Mark as FAILED — no position created
@@ -136,6 +144,22 @@ async function executeTrade(payload) {
             },
         }),
     ]);
+    // ── Step 5: Publish reasoning to Registry (non-blocking) ──
+    if (payload.traceId) {
+        prisma_1.prisma.reasoningTrace.findUnique({ where: { id: payload.traceId } })
+            .then(async (trace) => {
+            if (trace?.ipfsCid && trace?.sha256Hash) {
+                await (0, chain_service_1.publishReasoningToRegistry)({
+                    ipfsCid: trace.ipfsCid,
+                    sha256Hash: trace.sha256Hash,
+                    traceType: 'trade',
+                    relatedId: position.id,
+                });
+                logger_1.logger.info({ traceId: trace.id, positionId: position.id }, 'Trade reasoning published on-chain');
+            }
+        })
+            .catch(err => logger_1.logger.warn({ err }, 'Failed to publish trade reasoning on-chain'));
+    }
     await logAgentAction('TRADER', 'INFO', 'TRADE_EXECUTED', payload.marketId, {
         tradeId: updatedTrade.id,
         txHash,
@@ -220,12 +244,66 @@ async function closePosition(positionId, closePrice, closeReason) {
  * Currently constructs the transaction parameters for the prediction market contract.
  * Returns the transaction hash.
  */
-async function submitTradeTransaction(payload) {
+async function submitTradeTransaction(payload, market) {
+    // 1. If it has an on-chain address on Arc, trade directly on Arc
+    if (market.onChainAddress && market.onChainAddress.startsWith('0x') && !payload.polymarketConditionId) {
+        logger_1.logger.info({ marketId: market.id, address: market.onChainAddress }, 'Executing trade on Arc PredictionMarket');
+        return (0, chain_service_1.buyArcMarketShares)({
+            marketAddress: market.onChainAddress,
+            buyYes: payload.direction === 'YES',
+            amountUsdc: payload.amount,
+        });
+    }
+    // 2. If it's a Polymarket trade (has conditionId/tokenId)
+    if (payload.polymarketConditionId && payload.polymarketTokenId) {
+        logger_1.logger.info({ marketId: market.id, conditionId: payload.polymarketConditionId }, 'Executing Polymarket trade flow');
+        // Step A: Bridge funds via CCTP (Arc -> Polygon)
+        const arcTxHash = await (0, chain_service_1.submitFundBet)({
+            marketId: payload.marketId,
+            amountUsdc: payload.amount,
+        });
+        logger_1.logger.info({ arcTxHash }, 'Funding transaction submitted on Arc');
+        // Step B: Wait for CCTP (Hackathon version: simple sleep)
+        // In production, we'd use a worker and poll the Circle API for finality.
+        logger_1.logger.info('Waiting 20s for CCTP finality...');
+        await sleep(20000);
+        // Step C: Sign and submit order on Polygon
+        const polyOrderId = await (0, polymarket_service_1.submitPolymarketOrder)({
+            tokenId: payload.polymarketTokenId,
+            usdcAmount: payload.amount,
+            price: payload.price,
+            side: payload.direction === 'YES' ? 'BUY' : 'SELL',
+        });
+        logger_1.logger.info({ polyOrderId }, 'Polymarket order submitted to CLOB');
+        // Step D: Log position on Arc PositionLedger
+        // This provides the tamper-evident proof of the execution.
+        if (payload.traceId) {
+            const trace = await prisma_1.prisma.reasoningTrace.findUnique({ where: { id: payload.traceId } });
+            if (trace) {
+                await (0, chain_service_1.openPositionOnLedger)({
+                    conditionId: payload.polymarketConditionId,
+                    tokenId: payload.polymarketTokenId,
+                    side: payload.direction,
+                    usdcSpent: payload.amount,
+                    entryPriceBps: Math.round(payload.price * 10000),
+                    edgeBps: Math.round(payload.edgeDetected * 10000),
+                    reasoningCid: trace.ipfsCid || '',
+                    sha256Hash: trace.sha256Hash || '',
+                    polygonTxHash: polyOrderId,
+                });
+                logger_1.logger.info('Position logged on Arc PositionLedger');
+            }
+        }
+        return polyOrderId;
+    }
+    // 3. Fallback: bridge funds to Polygon
+    logger_1.logger.info({ marketId: market.id }, 'Bridging funds to Polygon (fallback)');
     return (0, chain_service_1.submitFundBet)({
         marketId: payload.marketId,
         amountUsdc: payload.amount,
     });
 }
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 async function logAgentAction(agentType, level, action, marketId, data) {
     try {
         await prisma_1.prisma.agentLog.create({

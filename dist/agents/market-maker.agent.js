@@ -5,6 +5,7 @@ const ingestion_service_1 = require("../services/ingestion.service");
 const market_service_1 = require("../services/market.service");
 const reasoning_service_1 = require("../services/reasoning.service");
 const ipfs_service_1 = require("../services/ipfs.service");
+const chain_service_1 = require("../services/chain.service");
 const prisma_1 = require("../lib/prisma");
 const logger_1 = require("../lib/logger");
 /**
@@ -43,7 +44,7 @@ async function runMarketMakerCycle() {
         }
         // Step 4: Persist market to DB
         const market = await (0, market_service_1.createMarketFromProposal)(proposal);
-        logger_1.logger.info({ marketId: market.id, category: market.category }, 'Market Maker Agent: market created');
+        logger_1.logger.info({ marketId: market.id, category: market.category }, 'Market Maker Agent: market created in DB');
         // Step 5: Generate reasoning trace for this creation decision
         const { trace, tracePayload } = await (0, reasoning_service_1.generateReasoningTrace)({
             marketId: market.id,
@@ -60,8 +61,37 @@ async function runMarketMakerCycle() {
             edge: proposal.initial_yes_probability - 0.5,
             confidenceInterval: proposal.confidence_interval,
         });
-        // Step 6: Pin trace to IPFS (non-blocking — don't fail the cycle if this errors)
-        (0, ipfs_service_1.uploadTraceToIPFS)(tracePayload, trace.id).catch(err => logger_1.logger.warn({ err, traceId: trace.id }, 'Market Maker Agent: IPFS pin failed'));
+        // Step 6: Pin trace to IPFS (CRITICAL for deployment)
+        let ipfsResult;
+        try {
+            ipfsResult = await (0, ipfs_service_1.uploadTraceToIPFS)(tracePayload, trace.id);
+        }
+        catch (err) {
+            logger_1.logger.error({ err, traceId: trace.id }, 'Market Maker Agent: IPFS pin failed — cannot deploy');
+            return null;
+        }
+        // Step 7: Deploy to Arc via MarketFactory
+        try {
+            const txHash = await (0, chain_service_1.deployMarket)({
+                question: market.question,
+                expiryTimestamp: Math.floor(market.expiryTimestamp.getTime() / 1000),
+                initialYesPriceBps: Math.round(market.initialYesProb * 10000),
+                liquiditySeedUsdc: market.minimumLiquidity,
+                reasoningCid: ipfsResult.cid,
+                sha256Hash: ipfsResult.sha256Hash,
+                confidenceIntervalBps: 800, // ±8% default confidence
+            });
+            logger_1.logger.info({ marketId: market.id, txHash }, 'Market Maker Agent: market deployment submitted to Arc');
+            // Update market with txHash (indexer will set ACTIVE and onChainAddress later)
+            await prisma_1.prisma.market.update({
+                where: { id: market.id },
+                data: { txHash },
+            });
+        }
+        catch (err) {
+            logger_1.logger.error({ err, marketId: market.id }, 'Market Maker Agent: Arc deployment failed');
+            // We keep it PENDING in DB, could be retried later
+        }
         logger_1.logger.info({ marketId: market.id, traceId: trace.id }, 'Market Maker Agent: cycle complete');
         // ← Return the created market details for the job tracker
         return {

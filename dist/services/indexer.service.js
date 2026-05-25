@@ -18,6 +18,43 @@ const publicClient = (0, viem_1.createPublicClient)({
     chain: arcChain,
     transport: (0, viem_1.http)(config_1.config.ARC_RPC_URL),
 });
+// ─── Block-index write debounce ───────────────────────────────────────────────
+// Problem: the backfill loop processes ~87,000 batches (43M blocks ÷ 500) and
+// calls prisma.blockIndex.upsert() after EVERY batch — that's 87K slow DB writes
+// flooding the logs and hammering the connection pool.
+//
+// Fix: only write to block_index every WRITE_EVERY_N_BATCHES batches during
+// backfill, and always write at the very end. The live watcher uses a time-based
+// debounce so it doesn't write more than once per WATCHER_DEBOUNCE_MS.
+//
+// This reduces ~87K writes to ~175 writes during backfill, with zero data loss
+// (we always persist the final block before the function returns).
+const WRITE_EVERY_N_BATCHES = 500; // write once per 500 batches (~250K blocks)
+const WATCHER_DEBOUNCE_MS = 30000; // live watcher: max 1 write per 30 seconds
+let _watcherWriteTimer = null;
+let _pendingWatcherBlock = null;
+async function persistBlockIndex(blockNumber) {
+    await prisma_1.prisma.blockIndex.upsert({
+        where: { chainId: config_1.config.ARC_CHAIN_ID },
+        create: { chainId: config_1.config.ARC_CHAIN_ID, lastBlockNumber: blockNumber },
+        update: { lastBlockNumber: blockNumber },
+    });
+}
+// Debounced write for the live event watcher — collapses rapid successive
+// updates into a single write every 30 seconds.
+function scheduleDebouncedBlockWrite(blockNumber) {
+    _pendingWatcherBlock = blockNumber;
+    if (_watcherWriteTimer)
+        return; // already scheduled
+    _watcherWriteTimer = setTimeout(async () => {
+        _watcherWriteTimer = null;
+        if (_pendingWatcherBlock !== null) {
+            await persistBlockIndex(_pendingWatcherBlock).catch(err => logger_1.logger.error({ err }, 'Failed to persist debounced block index'));
+            _pendingWatcherBlock = null;
+        }
+    }, WATCHER_DEBOUNCE_MS);
+}
+// ─── Live event watcher ───────────────────────────────────────────────────────
 function startEventListener() {
     if (isZeroAddress(contracts_1.CONTRACT_ADDRESSES.marketFactory)) {
         logger_1.logger.warn('MarketFactory address not configured; event indexer disabled');
@@ -30,7 +67,11 @@ function startEventListener() {
             address: contracts_1.CONTRACT_ADDRESSES.marketFactory,
             abi: contracts_1.MARKET_FACTORY_ABI,
             eventName: 'MarketDeployed',
-            onLogs: (logs) => logs.forEach((log) => handleMarketDeployed(log).catch(logError)),
+            onLogs: (logs) => {
+                logs.forEach((log) => handleMarketDeployed(log).catch(logError));
+                if (logs.length)
+                    scheduleDebouncedBlockWrite(logs[logs.length - 1].blockNumber);
+            },
             onError: (err) => logger_1.logger.error({ err }, 'MarketDeployed watcher error'),
         }),
         publicClient.watchContractEvent({
@@ -39,7 +80,11 @@ function startEventListener() {
             address: contracts_1.CONTRACT_ADDRESSES.reasoningRegistry,
             abi: contracts_1.REASONING_REGISTRY_ABI,
             eventName: 'ReasoningPublished',
-            onLogs: (logs) => logs.forEach((log) => handleRegistryReasoningPublished(log).catch(logError)),
+            onLogs: (logs) => {
+                logs.forEach((log) => handleRegistryReasoningPublished(log).catch(logError));
+                if (logs.length)
+                    scheduleDebouncedBlockWrite(logs[logs.length - 1].blockNumber);
+            },
             onError: (err) => logger_1.logger.error({ err }, 'ReasoningRegistry watcher error'),
         }),
         publicClient.watchContractEvent({
@@ -48,7 +93,11 @@ function startEventListener() {
             address: contracts_1.CONTRACT_ADDRESSES.positionLedger,
             abi: contracts_1.POSITION_LEDGER_ABI,
             eventName: 'PositionOpened',
-            onLogs: (logs) => logs.forEach((log) => handlePositionOpened(log).catch(logError)),
+            onLogs: (logs) => {
+                logs.forEach((log) => handlePositionOpened(log).catch(logError));
+                if (logs.length)
+                    scheduleDebouncedBlockWrite(logs[logs.length - 1].blockNumber);
+            },
             onError: (err) => logger_1.logger.error({ err }, 'PositionOpened watcher error'),
         }),
         publicClient.watchContractEvent({
@@ -57,13 +106,22 @@ function startEventListener() {
             address: contracts_1.CONTRACT_ADDRESSES.multiSigOracle,
             abi: contracts_1.MULTISIG_ORACLE_ABI,
             eventName: 'MarketResolved',
-            onLogs: (logs) => logs.forEach((log) => handleMarketResolved(log).catch(logError)),
+            onLogs: (logs) => {
+                logs.forEach((log) => handleMarketResolved(log).catch(logError));
+                if (logs.length)
+                    scheduleDebouncedBlockWrite(logs[logs.length - 1].blockNumber);
+            },
             onError: (err) => logger_1.logger.error({ err }, 'MarketResolved watcher error'),
         }),
     ];
     logger_1.logger.info('Blockchain event indexer started');
-    return () => unwatchers.forEach(unwatch => unwatch());
+    return () => {
+        if (_watcherWriteTimer)
+            clearTimeout(_watcherWriteTimer);
+        unwatchers.forEach(unwatch => unwatch());
+    };
 }
+// ─── Backfill ─────────────────────────────────────────────────────────────────
 async function backfillEvents(fromBlock) {
     if (isZeroAddress(contracts_1.CONTRACT_ADDRESSES.marketFactory)) {
         logger_1.logger.warn('MarketFactory address not configured; skipping backfill');
@@ -79,7 +137,10 @@ async function backfillEvents(fromBlock) {
         return;
     }
     const batchSize = BigInt(500);
-    logger_1.logger.info({ startBlock, currentBlock }, 'Starting event backfill');
+    const totalBlocks = currentBlock - startBlock;
+    const totalBatches = Number(totalBlocks / batchSize) + 1;
+    logger_1.logger.info({ startBlock, currentBlock, totalBatches }, 'Starting event backfill');
+    let batchCount = 0;
     for (let block = startBlock; block <= currentBlock; block += batchSize) {
         const toBlock = block + batchSize - BigInt(1) < currentBlock
             ? block + batchSize - BigInt(1)
@@ -123,11 +184,14 @@ async function backfillEvents(fromBlock) {
                 await handlePositionOpened(log).catch(logError);
             for (const log of resolutionLogs)
                 await handleMarketResolved(log).catch(logError);
-            await prisma_1.prisma.blockIndex.upsert({
-                where: { chainId: config_1.config.ARC_CHAIN_ID },
-                create: { chainId: config_1.config.ARC_CHAIN_ID, lastBlockNumber: toBlock },
-                update: { lastBlockNumber: toBlock },
-            });
+            batchCount++;
+            // Only write block_index every N batches (not every batch).
+            // Always write on the final batch to ensure we never lose progress.
+            const isFinalBatch = toBlock >= currentBlock;
+            if (batchCount % WRITE_EVERY_N_BATCHES === 0 || isFinalBatch) {
+                await persistBlockIndex(toBlock);
+                logger_1.logger.debug({ batchCount, totalBatches, toBlock: toBlock.toString() }, 'Block index checkpoint saved');
+            }
         }
         catch (err) {
             logger_1.logger.error({ err, fromBlock: block, toBlock }, 'Backfill batch failed');
@@ -135,6 +199,7 @@ async function backfillEvents(fromBlock) {
     }
     logger_1.logger.info('Event backfill complete');
 }
+// ─── Event handlers (unchanged) ──────────────────────────────────────────────
 async function handleMarketDeployed(log) {
     const { market, question, oracle, expiryTimestamp, initialYesPrice, liquiditySeed, reasoningCid } = log.args ?? {};
     const txHash = log.transactionHash;
@@ -334,6 +399,7 @@ async function handleMarketResolved(log) {
         },
     });
 }
+// ─── Utilities ────────────────────────────────────────────────────────────────
 const isZeroAddress = (addr) => !addr || addr === '0x0000000000000000000000000000000000000000';
 const clampProbability = (value) => Math.min(0.99, Math.max(0.01, value));
 const normalizeBytes32Hash = (value) => String(value ?? '').replace(/^0x/, '').toLowerCase();

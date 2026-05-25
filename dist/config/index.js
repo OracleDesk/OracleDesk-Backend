@@ -11,7 +11,14 @@ const envSchema = zod_1.z.object({
     DATABASE_URL: zod_1.z.string().min(1, 'DATABASE_URL is required'),
     PORT: zod_1.z.string().default('8000').transform(Number),
     NODE_ENV: zod_1.z.enum(['development', 'production', 'test']).default('development'),
+    // ── LLM providers ──────────────────────────────────────────────────────────
+    // ANTHROPIC_API_KEY is optional but strongly recommended:
+    //   - Routes market generation through Claude (generous quota, no RPM issues)
+    //   - Gemini remains available as automatic fallback
+    //   - Without this key, all LLM calls go to Gemini (subject to free-tier limits)
+    ANTHROPIC_API_KEY: zod_1.z.string().default(''),
     GEMINI_API_KEY: zod_1.z.string().min(1, 'GEMINI_API_KEY is required'),
+    POLYGON_PRIVATE_KEY: zod_1.z.string().default(''), // required for Polymarket execution, but not for other features
     PINATA_API_KEY: zod_1.z.string().min(1, 'PINATA_API_KEY is required'),
     PINATA_SECRET_API_KEY: zod_1.z.string().min(1, 'PINATA_SECRET_API_KEY is required'),
     ARC_RPC_URL: zod_1.z.string().min(1).default('https://rpc.arc.fun'),

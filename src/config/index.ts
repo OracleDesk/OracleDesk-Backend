@@ -8,7 +8,16 @@ const envSchema = z.object({
   PORT:                       z.string().default('8000').transform(Number),
   NODE_ENV:                   z.enum(['development', 'production', 'test']).default('development'),
 
+  // ── LLM providers ──────────────────────────────────────────────────────────
+  // ANTHROPIC_API_KEY is optional but strongly recommended:
+  //   - Routes market generation through Claude (generous quota, no RPM issues)
+  //   - Gemini remains available as automatic fallback
+  //   - Without this key, all LLM calls go to Gemini (subject to free-tier limits)
+  ANTHROPIC_API_KEY:          z.string().default(''),
+
   GEMINI_API_KEY:             z.string().min(1, 'GEMINI_API_KEY is required'),
+
+  POLYGON_PRIVATE_KEY:       z.string().default(''), // required for Polymarket execution, but not for other features
 
   PINATA_API_KEY:             z.string().min(1, 'PINATA_API_KEY is required'),
   PINATA_SECRET_API_KEY:      z.string().min(1, 'PINATA_SECRET_API_KEY is required'),
@@ -36,8 +45,6 @@ const envSchema = z.object({
   JWT_SECRET:                 z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
   AGENT_PRIVATE_KEY:          z.string().default(''),
   AGENT_WALLET_ADDRESS:       z.string().default(''),
-  POLYGON_PRIVATE_KEY:        z.string().default(''),
-  POLYGON_EXECUTION_WALLET:   z.string().default(''),
   CHAIN_EXECUTION_MODE:       z.enum(['mock', 'wallet', 'circle']).default('mock'),
 
   NEWSAPI_KEY:                z.string().default(''),
