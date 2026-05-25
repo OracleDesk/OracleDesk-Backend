@@ -109,6 +109,14 @@ export async function unlockTrace(req: Request, res: Response): Promise<void> {
     return;
   }
 
+  // Ensure the user record exists — a valid JWT may pre-date DB seeding
+  // or come from a Postman test before /auth/connect was called.
+  await prisma.user.upsert({
+    where:  { walletAddress: req.user.walletAddress },
+    create: { id: req.user.userId, walletAddress: req.user.walletAddress },
+    update: {},
+  });
+
   const subscription = await recordPayment({
     userId:  req.user.userId,
     traceId: type === 'PER_TRACE' ? traceId : undefined,
@@ -138,6 +146,13 @@ export async function setSpendingAllowance(req: Request, res: Response): Promise
     sendError(res, 400, 'MISSING_ALLOWANCE_FIELDS', 'dailyLimit and perTraceLimit are required numbers');
     return;
   }
+
+  // Ensure the user record exists before creating the FK-linked spending allowance
+  await prisma.user.upsert({
+    where:  { walletAddress: req.user.walletAddress },
+    create: { id: req.user.userId, walletAddress: req.user.walletAddress },
+    update: {},
+  });
 
   const allowance = await upsertSpendingAllowance({
     userId: req.user.userId,

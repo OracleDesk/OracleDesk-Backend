@@ -5,7 +5,7 @@ import { config } from '../config';
 import type { RawSignal, AggregatedSignals } from '../types';
 import dayjs from 'dayjs';
 
-const CACHE_TTL_MINUTES = 15;
+const CACHE_TTL_MINUTES = 20; // Slightly longer than the 15-min cron interval to prevent expiry-at-fire races
 
 // ─── Cache helpers ────────────────────────────────────────────────────────────
 
@@ -19,6 +19,12 @@ async function getCachedSignals(source: string): Promise<RawSignal[] | null> {
 }
 
 async function cacheSignals(source: string, signals: RawSignal[]): Promise<void> {
+  // Delete all expired rows for this source before inserting the fresh one
+  // to prevent unbounded DB growth over time.
+  await prisma.signalCache.deleteMany({
+    where: { source, expiresAt: { lte: new Date() } },
+  }).catch(() => {});  // non-fatal — just a cleanup step
+
   await prisma.signalCache.create({
     data: {
       source,

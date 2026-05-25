@@ -8,6 +8,8 @@ const ipfs_service_1 = require("../services/ipfs.service");
 const chain_service_1 = require("../services/chain.service");
 const prisma_1 = require("../lib/prisma");
 const logger_1 = require("../lib/logger");
+const config_1 = require("../config");
+const viem_1 = require("viem");
 /**
  * Market Maker Agent — main execution loop.
  *
@@ -82,11 +84,26 @@ async function runMarketMakerCycle() {
                 confidenceIntervalBps: 800, // ±8% default confidence
             });
             logger_1.logger.info({ marketId: market.id, txHash }, 'Market Maker Agent: market deployment submitted to Arc');
-            // Update market with txHash (indexer will set ACTIVE and onChainAddress later)
+            // Derive a deterministic mock on-chain address in non-production environments.
+            // In production the blockchain indexer watches for the real MarketCreated event
+            // and sets onChainAddress once the tx is mined.  In dev/mock mode no real event
+            // ever fires, so we simulate it here so the market is immediately resolvable.
+            const isMockMode = config_1.config.CHAIN_EXECUTION_MODE === 'mock' || config_1.config.NODE_ENV !== 'production';
+            const mockOnChainAddress = isMockMode
+                ? `0x${(0, viem_1.keccak256)((0, viem_1.toBytes)(`onchain:${market.id}`)).slice(26)}` // last 20 bytes → valid address length
+                : null;
             await prisma_1.prisma.market.update({
                 where: { id: market.id },
-                data: { txHash },
+                data: {
+                    txHash,
+                    ...(mockOnChainAddress
+                        ? { onChainAddress: mockOnChainAddress, status: 'ACTIVE' }
+                        : {}),
+                },
             });
+            if (mockOnChainAddress) {
+                logger_1.logger.info({ marketId: market.id, onChainAddress: mockOnChainAddress }, 'Market Maker Agent: mock on-chain address assigned (dev mode)');
+            }
         }
         catch (err) {
             logger_1.logger.error({ err, marketId: market.id }, 'Market Maker Agent: Arc deployment failed');

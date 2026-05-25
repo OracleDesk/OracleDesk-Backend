@@ -17,6 +17,17 @@ import { AppError } from '../middlewares/error.middleware';
 
 const jobTracker: Map<string, JobRecord> = new Map();
 
+// Prune completed/failed jobs older than 1 hour to prevent unbounded Map growth
+const JOB_RETENTION_MS = 60 * 60 * 1000;
+function pruneJobTracker(): void {
+  const cutoff = Date.now() - JOB_RETENTION_MS;
+  for (const [id, job] of jobTracker) {
+    if (job.completedAt && job.completedAt.getTime() < cutoff) {
+      jobTracker.delete(id);
+    }
+  }
+}
+
 /**
  * GET /markets
  * Returns a paginated list of prediction markets.
@@ -168,6 +179,9 @@ export async function triggerMarketGeneration(
 ): Promise<void> {
   const jobId = uuidv4();
 
+  // Prune old jobs to keep memory bounded
+  pruneJobTracker();
+
   // ── Register RUNNING job ─────────────────────────────────────
 
   jobTracker.set(jobId, {
@@ -234,7 +248,7 @@ export async function triggerMarketGeneration(
       jobId,
 
       message:
-        'Market Maker cycle started. Gemini is analysing live signals.',
+        'Market Maker cycle started. AI agent is analysing live signals.',
 
       statusUrl: `/api/v1/markets/generation-status/${jobId}`,
 

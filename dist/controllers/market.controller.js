@@ -11,6 +11,16 @@ const response_util_1 = require("../utils/response.util");
 const market_maker_agent_1 = require("../agents/market-maker.agent");
 const market_validator_1 = require("../validators/market.validator");
 const jobTracker = new Map();
+// Prune completed/failed jobs older than 1 hour to prevent unbounded Map growth
+const JOB_RETENTION_MS = 60 * 60 * 1000;
+function pruneJobTracker() {
+    const cutoff = Date.now() - JOB_RETENTION_MS;
+    for (const [id, job] of jobTracker) {
+        if (job.completedAt && job.completedAt.getTime() < cutoff) {
+            jobTracker.delete(id);
+        }
+    }
+}
 /**
  * GET /markets
  * Returns a paginated list of prediction markets.
@@ -109,6 +119,8 @@ async function getMarket(req, res) {
  */
 async function triggerMarketGeneration(req, res) {
     const jobId = (0, uuid_1.v4)();
+    // Prune old jobs to keep memory bounded
+    pruneJobTracker();
     // ── Register RUNNING job ─────────────────────────────────────
     jobTracker.set(jobId, {
         status: types_1.JobStatus.RUNNING,
@@ -159,7 +171,7 @@ async function triggerMarketGeneration(req, res) {
     });
     (0, response_util_1.sendSuccess)(res, {
         jobId,
-        message: 'Market Maker cycle started. Gemini is analysing live signals.',
+        message: 'Market Maker cycle started. AI agent is analysing live signals.',
         statusUrl: `/api/v1/markets/generation-status/${jobId}`,
         hint: 'Poll statusUrl every 5 seconds until status is COMPLETED or FAILED.',
     }, 202);

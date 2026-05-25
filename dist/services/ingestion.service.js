@@ -12,7 +12,7 @@ const prisma_1 = require("../lib/prisma");
 const logger_1 = require("../lib/logger");
 const config_1 = require("../config");
 const dayjs_1 = __importDefault(require("dayjs"));
-const CACHE_TTL_MINUTES = 15;
+const CACHE_TTL_MINUTES = 20; // Slightly longer than the 15-min cron interval to prevent expiry-at-fire races
 // ─── Cache helpers ────────────────────────────────────────────────────────────
 async function getCachedSignals(source) {
     const cached = await prisma_1.prisma.signalCache.findFirst({
@@ -24,6 +24,11 @@ async function getCachedSignals(source) {
     return cached.payload;
 }
 async function cacheSignals(source, signals) {
+    // Delete all expired rows for this source before inserting the fresh one
+    // to prevent unbounded DB growth over time.
+    await prisma_1.prisma.signalCache.deleteMany({
+        where: { source, expiresAt: { lte: new Date() } },
+    }).catch(() => { }); // non-fatal — just a cleanup step
     await prisma_1.prisma.signalCache.create({
         data: {
             source,
