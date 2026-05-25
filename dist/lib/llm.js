@@ -28,7 +28,7 @@ const sdk_1 = __importDefault(require("@anthropic-ai/sdk"));
 const config_1 = require("../config");
 const logger_1 = require("./logger");
 const gemini_1 = require("./gemini");
-const CLAUDE_MODEL = 'claude-sonnet-4-20250514';
+const CLAUDE_MODEL = 'claude-sonnet-4-6';
 // ─── Lazy Anthropic client ────────────────────────────────────────────────────
 let _anthropic = null;
 function getAnthropicClient() {

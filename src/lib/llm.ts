@@ -23,7 +23,7 @@ import { config } from '../config';
 import { logger } from './logger';
 import { callGeminiJSON } from './gemini';
 
-const CLAUDE_MODEL = 'claude-sonnet-4-20250514';
+const CLAUDE_MODEL = 'claude-sonnet-4-6';
 
 // ─── Lazy Anthropic client ────────────────────────────────────────────────────
 let _anthropic: Anthropic | null = null;
