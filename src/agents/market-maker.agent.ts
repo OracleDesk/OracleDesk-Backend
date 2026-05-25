@@ -9,6 +9,8 @@ import { uploadTraceToIPFS } from '../services/ipfs.service';
 import { deployMarket } from '../services/chain.service';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
+import { config } from '../config';
+import { keccak256, toBytes } from 'viem';
 
 // Return shape used by the job tracker
 export interface MarketCycleResult {
@@ -98,12 +100,32 @@ export async function runMarketMakerCycle(): Promise<MarketCycleResult | null> {
       });
 
       logger.info({ marketId: market.id, txHash }, 'Market Maker Agent: market deployment submitted to Arc');
-      
-      // Update market with txHash (indexer will set ACTIVE and onChainAddress later)
+
+      // Derive a deterministic mock on-chain address in non-production environments.
+      // In production the blockchain indexer watches for the real MarketCreated event
+      // and sets onChainAddress once the tx is mined.  In dev/mock mode no real event
+      // ever fires, so we simulate it here so the market is immediately resolvable.
+      const isMockMode = config.CHAIN_EXECUTION_MODE === 'mock' || config.NODE_ENV !== 'production';
+      const mockOnChainAddress = isMockMode
+        ? `0x${keccak256(toBytes(`onchain:${market.id}`)).slice(26)}` // last 20 bytes → valid address length
+        : null;
+
       await prisma.market.update({
         where: { id: market.id },
-        data: { txHash },
+        data: {
+          txHash,
+          ...(mockOnChainAddress
+            ? { onChainAddress: mockOnChainAddress, status: 'ACTIVE' }
+            : {}),
+        },
       });
+
+      if (mockOnChainAddress) {
+        logger.info(
+          { marketId: market.id, onChainAddress: mockOnChainAddress },
+          'Market Maker Agent: mock on-chain address assigned (dev mode)',
+        );
+      }
     } catch (err) {
       logger.error({ err, marketId: market.id }, 'Market Maker Agent: Arc deployment failed');
       // We keep it PENDING in DB, could be retried later

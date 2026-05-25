@@ -24,19 +24,12 @@ const publicClient = createPublicClient({
 });
 
 // ─── Block-index write debounce ───────────────────────────────────────────────
-// Problem: the backfill loop processes ~87,000 batches (43M blocks ÷ 500) and
-// calls prisma.blockIndex.upsert() after EVERY batch — that's 87K slow DB writes
-// flooding the logs and hammering the connection pool.
-//
-// Fix: only write to block_index every WRITE_EVERY_N_BATCHES batches during
-// backfill, and always write at the very end. The live watcher uses a time-based
-// debounce so it doesn't write more than once per WATCHER_DEBOUNCE_MS.
-//
-// This reduces ~87K writes to ~175 writes during backfill, with zero data loss
-// (we always persist the final block before the function returns).
+// Only write to block_index every WRITE_EVERY_N_BATCHES batches during backfill,
+// and always write on the very last batch.  The live watcher uses a time-based
+// debounce so it never writes more than once per WATCHER_DEBOUNCE_MS.
 
-const WRITE_EVERY_N_BATCHES = 500;   // write once per 500 batches (~250K blocks)
-const WATCHER_DEBOUNCE_MS   = 30_000; // live watcher: max 1 write per 30 seconds
+const WRITE_EVERY_N_BATCHES = 500;
+const WATCHER_DEBOUNCE_MS   = 30_000;
 
 let _watcherWriteTimer: ReturnType<typeof setTimeout> | null = null;
 let _pendingWatcherBlock: bigint | null = null;
@@ -49,11 +42,9 @@ async function persistBlockIndex(blockNumber: bigint): Promise<void> {
   });
 }
 
-// Debounced write for the live event watcher — collapses rapid successive
-// updates into a single write every 30 seconds.
 function scheduleDebouncedBlockWrite(blockNumber: bigint): void {
   _pendingWatcherBlock = blockNumber;
-  if (_watcherWriteTimer) return; // already scheduled
+  if (_watcherWriteTimer) return;
   _watcherWriteTimer = setTimeout(async () => {
     _watcherWriteTimer = null;
     if (_pendingWatcherBlock !== null) {
@@ -66,70 +57,123 @@ function scheduleDebouncedBlockWrite(blockNumber: bigint): void {
 }
 
 // ─── Live event watcher ───────────────────────────────────────────────────────
+//
+// WHY NOT watchContractEvent?
+//
+// viem's watchContractEvent({ poll: true }) internally calls eth_newFilter to
+// create a server-side filter, then polls it with eth_getFilterChanges.  Most
+// hosted/testnet RPC nodes (including Arc testnet) expire these filters after
+// just a few minutes, which causes a "filter not found" (-32602) error on every
+// poll tick.  This floods the logs with ERROR entries and silently stops
+// indexing new events.
+//
+// FIX: Use a manual polling loop that calls getContractEvents (which maps to
+// eth_getLogs) with an explicit fromBlock/toBlock range.  eth_getLogs is
+// stateless — no server-side filter is created or expired.  This is reliable
+// on every EVM node that supports standard JSON-RPC.
+//
+// POLLING INTERVAL: 4 seconds.  Arc block time is ~2s; polling every 4s means
+// we process each block within 2–6 seconds of it being mined.
+
 export function startEventListener(): () => void {
   if (isZeroAddress(CONTRACT_ADDRESSES.marketFactory)) {
     logger.warn('MarketFactory address not configured; event indexer disabled');
     return () => {};
   }
 
-  const unwatchers = [
-    publicClient.watchContractEvent({
-      poll:            true,
-      pollingInterval: 4000,
-      address:         CONTRACT_ADDRESSES.marketFactory as `0x${string}`,
-      abi:             MARKET_FACTORY_ABI as any,
-      eventName:       'MarketDeployed',
-      onLogs: (logs: any[]) => {
-        logs.forEach((log: any) => handleMarketDeployed(log).catch(logError));
-        if (logs.length) scheduleDebouncedBlockWrite(logs[logs.length - 1].blockNumber);
-      },
-      onError: (err: unknown) => logger.error({ err }, 'MarketDeployed watcher error'),
-    } as any),
+  let stopped = false;
+  let lastPolledBlock: bigint | null = null;
 
-    publicClient.watchContractEvent({
-      poll:            true,
-      pollingInterval: 4000,
-      address:         CONTRACT_ADDRESSES.reasoningRegistry as `0x${string}`,
-      abi:             REASONING_REGISTRY_ABI as any,
-      eventName:       'ReasoningPublished',
-      onLogs: (logs: any[]) => {
-        logs.forEach((log: any) => handleRegistryReasoningPublished(log).catch(logError));
-        if (logs.length) scheduleDebouncedBlockWrite(logs[logs.length - 1].blockNumber);
-      },
-      onError: (err: unknown) => logger.error({ err }, 'ReasoningRegistry watcher error'),
-    } as any),
+  const POLL_INTERVAL_MS  = 4_000;
+  const MAX_BLOCKS_PER_POLL = BigInt(20); // ~40 seconds of blocks per tick
 
-    publicClient.watchContractEvent({
-      poll:            true,
-      pollingInterval: 4000,
-      address:         CONTRACT_ADDRESSES.positionLedger as `0x${string}`,
-      abi:             POSITION_LEDGER_ABI as any,
-      eventName:       'PositionOpened',
-      onLogs: (logs: any[]) => {
-        logs.forEach((log: any) => handlePositionOpened(log).catch(logError));
-        if (logs.length) scheduleDebouncedBlockWrite(logs[logs.length - 1].blockNumber);
-      },
-      onError: (err: unknown) => logger.error({ err }, 'PositionOpened watcher error'),
-    } as any),
+  const pollLoop = async (): Promise<void> => {
+    while (!stopped) {
+      try {
+        const currentBlock = await publicClient.getBlockNumber();
 
-    publicClient.watchContractEvent({
-      poll:            true,
-      pollingInterval: 4000,
-      address:         CONTRACT_ADDRESSES.multiSigOracle as `0x${string}`,
-      abi:             MULTISIG_ORACLE_ABI as any,
-      eventName:       'MarketResolved',
-      onLogs: (logs: any[]) => {
-        logs.forEach((log: any) => handleMarketResolved(log).catch(logError));
-        if (logs.length) scheduleDebouncedBlockWrite(logs[logs.length - 1].blockNumber);
-      },
-      onError: (err: unknown) => logger.error({ err }, 'MarketResolved watcher error'),
-    } as any),
-  ];
+        // Initialise lastPolledBlock from the DB checkpoint on first tick
+        if (lastPolledBlock === null) {
+          const blockIndex = await prisma.blockIndex.findUnique({
+            where: { chainId: config.ARC_CHAIN_ID },
+          });
+          // Start from 1 block behind current so we don't miss the very latest
+          lastPolledBlock = blockIndex?.lastBlockNumber ?? currentBlock - BigInt(1);
+        }
+
+        if (currentBlock <= lastPolledBlock) {
+          await sleep(POLL_INTERVAL_MS);
+          continue;
+        }
+
+        // Clamp the window so a single tick never fetches thousands of blocks
+        const fromBlock = lastPolledBlock + BigInt(1);
+        const toBlock   = fromBlock + MAX_BLOCKS_PER_POLL - BigInt(1) < currentBlock
+          ? fromBlock + MAX_BLOCKS_PER_POLL - BigInt(1)
+          : currentBlock;
+
+        const [marketLogs, reasoningLogs, positionLogs, resolutionLogs] = await Promise.all([
+          publicClient.getContractEvents({
+            address:   CONTRACT_ADDRESSES.marketFactory as `0x${string}`,
+            abi:       MARKET_FACTORY_ABI,
+            eventName: 'MarketDeployed',
+            fromBlock,
+            toBlock,
+          }),
+          publicClient.getContractEvents({
+            address:   CONTRACT_ADDRESSES.reasoningRegistry as `0x${string}`,
+            abi:       REASONING_REGISTRY_ABI,
+            eventName: 'ReasoningPublished',
+            fromBlock,
+            toBlock,
+          }),
+          publicClient.getContractEvents({
+            address:   CONTRACT_ADDRESSES.positionLedger as `0x${string}`,
+            abi:       POSITION_LEDGER_ABI,
+            eventName: 'PositionOpened',
+            fromBlock,
+            toBlock,
+          }),
+          publicClient.getContractEvents({
+            address:   CONTRACT_ADDRESSES.multiSigOracle as `0x${string}`,
+            abi:       MULTISIG_ORACLE_ABI,
+            eventName: 'MarketResolved',
+            fromBlock,
+            toBlock,
+          }),
+        ]);
+
+        for (const log of marketLogs)    await handleMarketDeployed(log as any).catch(logError);
+        for (const log of reasoningLogs) await handleRegistryReasoningPublished(log as any).catch(logError);
+        for (const log of positionLogs)  await handlePositionOpened(log as any).catch(logError);
+        for (const log of resolutionLogs) await handleMarketResolved(log as any).catch(logError);
+
+        lastPolledBlock = toBlock;
+
+        if (marketLogs.length + reasoningLogs.length + positionLogs.length + resolutionLogs.length > 0) {
+          scheduleDebouncedBlockWrite(toBlock);
+        }
+
+      } catch (err: any) {
+        // Log and back off — don't crash the whole watcher on a transient RPC error
+        logger.warn({ err: err?.message?.slice(0, 200) }, 'Live event poll error — retrying in 10s');
+        await sleep(10_000);
+        continue;
+      }
+
+      await sleep(POLL_INTERVAL_MS);
+    }
+  };
+
+  // Start the loop — errors inside the loop are caught; we only log a fatal
+  // error if the loop itself throws unexpectedly (it shouldn't).
+  pollLoop().catch(err => logger.error({ err }, 'Live event poll loop terminated unexpectedly'));
 
   logger.info('Blockchain event indexer started');
+
   return () => {
+    stopped = true;
     if (_watcherWriteTimer) clearTimeout(_watcherWriteTimer);
-    unwatchers.forEach(unwatch => unwatch());
   };
 }
 
@@ -144,7 +188,7 @@ export async function backfillEvents(fromBlock?: bigint): Promise<void> {
     where: { chainId: config.ARC_CHAIN_ID },
   });
 
-  const startBlock  = fromBlock ?? ((blockIndex?.lastBlockNumber ?? BigInt(0)) + BigInt(1));
+  const startBlock   = fromBlock ?? ((blockIndex?.lastBlockNumber ?? BigInt(0)) + BigInt(1));
   const currentBlock = await publicClient.getBlockNumber();
 
   if (startBlock > currentBlock) {
@@ -152,8 +196,8 @@ export async function backfillEvents(fromBlock?: bigint): Promise<void> {
     return;
   }
 
-  const batchSize   = BigInt(500);
-  const totalBlocks = currentBlock - startBlock;
+  const batchSize    = BigInt(500);
+  const totalBlocks  = currentBlock - startBlock;
   const totalBatches = Number(totalBlocks / batchSize) + 1;
 
   logger.info({ startBlock, currentBlock, totalBatches }, 'Starting event backfill');
@@ -197,15 +241,13 @@ export async function backfillEvents(fromBlock?: bigint): Promise<void> {
         }),
       ]);
 
-      for (const log of marketLogs)   await handleMarketDeployed(log as any).catch(logError);
+      for (const log of marketLogs)    await handleMarketDeployed(log as any).catch(logError);
       for (const log of reasoningLogs) await handleRegistryReasoningPublished(log as any).catch(logError);
       for (const log of positionLogs)  await handlePositionOpened(log as any).catch(logError);
       for (const log of resolutionLogs) await handleMarketResolved(log as any).catch(logError);
 
       batchCount++;
 
-      // Only write block_index every N batches (not every batch).
-      // Always write on the final batch to ensure we never lose progress.
       const isFinalBatch = toBlock >= currentBlock;
       if (batchCount % WRITE_EVERY_N_BATCHES === 0 || isFinalBatch) {
         await persistBlockIndex(toBlock);
@@ -223,7 +265,7 @@ export async function backfillEvents(fromBlock?: bigint): Promise<void> {
   logger.info('Event backfill complete');
 }
 
-// ─── Event handlers (unchanged) ──────────────────────────────────────────────
+// ─── Event handlers ───────────────────────────────────────────────────────────
 
 async function handleMarketDeployed(log: any): Promise<void> {
   const { market, question, oracle, expiryTimestamp, initialYesPrice, liquiditySeed, reasoningCid } = log.args ?? {};
@@ -248,37 +290,37 @@ async function handleMarketDeployed(log: any): Promise<void> {
   });
 
   const initialProbability = Number(initialYesPrice ?? 5000) / 10_000;
-  const liquidityUsdc = Number(liquiditySeed ?? 0) / 1_000_000;
+  const liquidityUsdc      = Number(liquiditySeed ?? 0) / 1_000_000;
 
   if (pendingMarket) {
     await prisma.market.update({
       where: { id: pendingMarket.id },
       data: {
-        status: 'ACTIVE',
-        onChainAddress: String(market),
-        txHash: String(txHash),
+        status:           'ACTIVE',
+        onChainAddress:   String(market),
+        txHash:           String(txHash),
         resolutionOracle: String(oracle ?? pendingMarket.resolutionOracle ?? ''),
-        totalLiquidity: liquidityUsdc || pendingMarket.totalLiquidity,
+        totalLiquidity:   liquidityUsdc || pendingMarket.totalLiquidity,
       },
     });
   } else {
     await prisma.market.create({
       data: {
-        question:          String(question ?? `On-chain market ${market}`),
-        category:          'MACRO',
-        status:            'ACTIVE',
-        initialYesProb:    clampProbability(initialProbability),
-        currentYesProb:    clampProbability(initialProbability),
+        question:           String(question ?? `On-chain market ${market}`),
+        category:           'MACRO',
+        status:             'ACTIVE',
+        initialYesProb:     clampProbability(initialProbability),
+        currentYesProb:     clampProbability(initialProbability),
         confidenceInterval: {
           lower: Math.max(0.01, clampProbability(initialProbability) - 0.1),
           upper: Math.min(0.99, clampProbability(initialProbability) + 0.1),
         } as any,
-        expiryTimestamp:  new Date(Number(expiryTimestamp ?? 0) * 1000 || Date.now()),
-        resolutionOracle: String(oracle ?? ''),
-        minimumLiquidity: liquidityUsdc || 100,
-        totalLiquidity:   liquidityUsdc,
-        onChainAddress:   String(market),
-        txHash:           String(txHash),
+        expiryTimestamp:    new Date(Number(expiryTimestamp ?? 0) * 1000 || Date.now()),
+        resolutionOracle:   String(oracle ?? ''),
+        minimumLiquidity:   liquidityUsdc || 100,
+        totalLiquidity:     liquidityUsdc,
+        onChainAddress:     String(market),
+        txHash:             String(txHash),
       },
     });
   }
@@ -367,15 +409,15 @@ async function handlePositionOpened(log: any): Promise<void> {
 
   const trade = await prisma.trade.create({
     data: {
-      marketId:     trace.marketId,
+      marketId:      trace.marketId,
       direction,
-      status:       'EXECUTED',
+      status:        'EXECUTED',
       amount,
-      price:        clampProbability(price || trace.market.currentYesProb || trace.market.initialYesProb),
-      edgeDetected: edge,
+      price:         clampProbability(price || trace.market.currentYesProb || trace.market.initialYesProb),
+      edgeDetected:  edge,
       kellyFraction: trace.betFraction ?? 0,
       txHash,
-      executedAt:   new Date(),
+      executedAt:    new Date(),
     },
   });
 
@@ -399,9 +441,9 @@ async function handlePositionOpened(log: any): Promise<void> {
       action:    'POSITION_OPENED_INDEXED',
       marketId:  trace.marketId,
       data: {
-        positionId:  String(positionId),
-        conditionId: String(conditionId ?? ''),
-        tokenId:     String(tokenId ?? ''),
+        positionId:   String(positionId),
+        conditionId:  String(conditionId ?? ''),
+        tokenId:      String(tokenId ?? ''),
         reasoningCid: String(reasoningCid ?? ''),
         txHash,
       },
@@ -440,12 +482,8 @@ async function handleMarketResolved(log: any): Promise<void> {
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
-const isZeroAddress = (addr: string) =>
-  !addr || addr === '0x0000000000000000000000000000000000000000';
-
+const sleep          = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const isZeroAddress  = (addr: string) => !addr || addr === '0x0000000000000000000000000000000000000000';
 const clampProbability = (value: number) => Math.min(0.99, Math.max(0.01, value));
-
-const normalizeBytes32Hash = (value: unknown) =>
-  String(value ?? '').replace(/^0x/, '').toLowerCase();
-
+const normalizeBytes32Hash = (value: unknown) => String(value ?? '').replace(/^0x/, '').toLowerCase();
 const logError = (err: unknown) => logger.error({ err }, 'Event handler error');

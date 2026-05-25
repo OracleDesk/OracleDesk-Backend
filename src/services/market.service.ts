@@ -108,10 +108,26 @@ CATEGORY GUIDE:
 - POLITICS: Political appointments, legislation passing, political party events
 `;
 
+  // Fetch existing active/pending market questions so the LLM never re-generates them
+  const existingMarkets = await prisma.market.findMany({
+    where:  { status: { in: ['PENDING', 'ACTIVE'] } },
+    select: { question: true, category: true },
+    orderBy: { createdAt: 'desc' },
+    take:   50,
+  });
+
+  const existingQuestionsBlock = existingMarkets.length > 0
+    ? `\nALREADY EXISTING MARKETS (DO NOT create similar markets on these topics):\n` +
+      existingMarkets
+        .map((m, i) => `  ${i + 1}. [${m.category}] ${m.question}`)
+        .join('\n') +
+      '\n'
+    : '';
+
   const now = dayjs();
   const userPrompt = `
 Current date: ${now.toISOString()}
-
+${existingQuestionsBlock}
 AGGREGATED SIGNALS (last 15 minutes — ${signals.signalCount} total):
 
 NEWS (${signals.news.length} items):
@@ -133,7 +149,9 @@ ${signals.macro
   .join('\n')}
 
 Generate ONE high-quality binary prediction market from these signals.
-Choose the most actionable, near-term, verifiable event.
+IMPORTANT: You MUST create a market on a DIFFERENT topic from the existing markets listed above.
+If all FED/rate questions are already covered, pick a different category entirely (MACRO, GEOPOLITICAL, CRYPTO, SPORTS, POLITICS, ENTERTAINMENT, etc).
+Choose the most actionable, near-term, verifiable event that is NOT already covered.
 Pick the category and currency that best fits the event.
 `;
 
@@ -289,20 +307,60 @@ export async function createMarketFromProposal(
 
 /**
  * Check if a similar market already exists to avoid duplicates.
+ *
+ * Two-pass check:
+ *  1. Word-overlap Jaccard similarity (threshold 0.55 — tighter than before)
+ *  2. Key-entity phrase overlap: if 3+ meaningful n-grams match, treat as duplicate
+ *     even when overall word overlap is lower (catches paraphrase variants like
+ *     "hold…unchanged" vs "keep…unchanged" vs "remain at").
  */
 export async function isDuplicateMarket(question: string): Promise<boolean> {
   const activeMarkets = await prisma.market.findMany({
-    where:  { status: { in: ["PENDING", "ACTIVE"] } },
+    where:  { status: { in: ['PENDING', 'ACTIVE'] } },
     select: { question: true },
   });
 
-  const questionWords = new Set(question.toLowerCase().split(/\s+/));
+  // Stop-words to exclude from meaningful token comparison
+  const STOP_WORDS = new Set([
+    'the','a','an','is','are','will','at','or','by','in','on','of','to',
+    'and','be','for','its','this','that','it','as','with','from','at',
+    'whether','if','has','have','been','was','were','not','no',
+  ]);
+
+  function meaningfulTokens(text: string): string[] {
+    return text
+      .toLowerCase()
+      .replace(/[^a-z0-9%.\s]/g, ' ')
+      .split(/\s+/)
+      .filter(w => w.length > 2 && !STOP_WORDS.has(w));
+  }
+
+  const newTokens    = meaningfulTokens(question);
+  const newTokensSet = new Set(newTokens);
 
   for (const m of activeMarkets) {
-    const existingWords = m.question.toLowerCase().split(/\s+/);
-    const overlap    = existingWords.filter((w) => questionWords.has(w)).length;
-    const similarity = overlap / Math.max(questionWords.size, existingWords.length);
-    if (similarity > 0.7) return true;
+    const existingTokens    = meaningfulTokens(m.question);
+    const existingTokensSet = new Set(existingTokens);
+
+    // Pass 1: Jaccard similarity on meaningful tokens (threshold 0.55)
+    const intersection = existingTokens.filter(w => newTokensSet.has(w)).length;
+    const union        = new Set([...newTokens, ...existingTokens]).size;
+    const jaccard      = union === 0 ? 0 : intersection / union;
+    if (jaccard > 0.55) return true;
+
+    // Pass 2: Key-entity n-gram overlap
+    // Build bigrams for both questions; if 3+ meaningful bigrams match → duplicate
+    function bigrams(tokens: string[]): Set<string> {
+      const bg = new Set<string>();
+      for (let i = 0; i < tokens.length - 1; i++) {
+        bg.add(`${tokens[i]} ${tokens[i + 1]}`);
+      }
+      return bg;
+    }
+    const newBigrams      = bigrams(newTokens);
+    const existingBigrams = bigrams(existingTokens);
+    const bigramOverlap   = [...newBigrams].filter(bg => existingBigrams.has(bg)).length;
+    if (bigramOverlap >= 3) return true;
   }
 
   return false;
