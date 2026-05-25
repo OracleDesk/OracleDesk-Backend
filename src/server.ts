@@ -1,3 +1,5 @@
+import http from 'http';
+import { Server } from 'socket.io';
 import app from './app';
 import { config } from './config';
 import { logger } from './lib/logger';
@@ -19,13 +21,7 @@ async function bootstrap(): Promise<void> {
   }
 
   // 2. Backfill blockchain events missed during downtime
-  // try {
-  //   await backfillEvents();
-  // } catch (err) {
-  //   logger.warn({ err }, 'Backfill failed — continuing without backfill');
-  // }
-  
-   backfillEvents().catch((err) => {
+  backfillEvents().catch((err) => {
     logger.warn({ err }, 'Backfill failed');
   });
 
@@ -36,8 +32,27 @@ async function bootstrap(): Promise<void> {
   startIngestionCron();
   startMonitorCron();
 
-  // 5. Start HTTP server
-  const server = app.listen(config.PORT, () => {
+  // 5. Start HTTP server with Socket.io
+  const server = http.createServer(app);
+  const io = new Server(server, {
+    cors: {
+      origin: '*', // In production, restrict this to your frontend URL
+      methods: ['GET', 'POST'],
+    },
+  });
+
+  io.on('connection', (socket) => {
+    logger.info({ socketId: socket.id }, 'New client connected to socket.io');
+    
+    socket.on('disconnect', () => {
+      logger.info({ socketId: socket.id }, 'Client disconnected from socket.io');
+    });
+  });
+
+  // Make io accessible via app
+  app.set('io', io);
+
+  server.listen(config.PORT, () => {
     logger.info(
       { port: config.PORT, env: config.NODE_ENV },
       `OracleDesk backend running on port ${config.PORT}`,

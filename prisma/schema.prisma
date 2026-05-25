@@ -322,8 +322,8 @@ model SignalCache {
   fetchedAt DateTime @default(now())
   expiresAt DateTime
 
-  @@index([source])
-  @@index([expiresAt])
+  @@index([source, expiresAt])
+  // @@index([expiresAt])
   @@map("signal_cache")
 }
 

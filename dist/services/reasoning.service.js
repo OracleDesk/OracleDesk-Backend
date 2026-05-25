@@ -4,11 +4,11 @@ exports.generateReasoningTrace = generateReasoningTrace;
 exports.calculateEdge = calculateEdge;
 exports.calculateConfidenceInterval = calculateConfidenceInterval;
 const prisma_1 = require("../lib/prisma");
-const gemini_1 = require("../lib/gemini"); // ← FIXED: Import callGeminiJSON instead
+const llm_1 = require("../lib/llm"); // ← Unified LLM (Claude → Gemini fallback)
 const logger_1 = require("../lib/logger");
 const hash_util_1 = require("../utils/hash.util");
 const zod_1 = require("zod");
-// ─── Zod schema for Gemini's hedge condition output ───────────────────────────
+// ─── Zod schema for LLM hedge condition output ───────────────────────────────
 const traceReasoningSchema = zod_1.z.object({
     hedge_conditions: zod_1.z.array(zod_1.z.string()),
     reasoning_summary: zod_1.z.string().min(10),
@@ -21,7 +21,7 @@ const traceReasoningSchema = zod_1.z.object({
  * Flow:
  * 1. Compute edge  (agent prob − market prob)
  * 2. Compute 90% confidence interval via jackknife sampling
- * 3. Call Gemini to generate hedge conditions and reasoning narrative
+ * 3. Call Claude/Gemini to generate hedge conditions and reasoning narrative
  * 4. SHA-256 hash the full trace payload for on-chain commitment
  * 5. Persist to DB (IPFS CID added later by ipfs.service.ts)
  */
@@ -116,12 +116,16 @@ function calculateConfidenceInterval(signals, centralEstimate) {
     };
 }
 /**
- * Uses Gemini to generate specific, measurable hedge conditions.
+ * Uses Claude/Gemini to generate specific, measurable hedge conditions.
+ *
+ * This is a secondary LLM call after market creation. It is intentionally
+ * non-blocking: if the LLM call fails for any reason (quota, timeout, etc.)
+ * we return safe defaults so the market creation cycle always completes.
  */
 async function generateHedgeConditions(input, edge, ci) {
     const systemPrompt = `You are a quantitative prediction market risk manager.
 Generate specific, measurable hedge conditions for a trading position.
-Return ONLY a valid JSON object matching this schema. Avoid markdown wrappings.
+Return ONLY a valid JSON object matching this schema exactly. No markdown, no preamble.
 {
   "hedge_conditions": ["string"],
   "reasoning_summary": "string",
@@ -148,21 +152,21 @@ Write 3–5 specific, measurable conditions that would invalidate this trade the
 and trigger an early close. Focus on data changes, not price changes.
 `;
     try {
-        // FIXED: Swapped callGemini to callGeminiJSON and expanded token limit parameter from 512 to 2048
-        const cleaned = await (0, gemini_1.callGeminiJSON)(systemPrompt, userPrompt, 2048);
+        const cleaned = await (0, llm_1.callLLMJSON)(systemPrompt, userPrompt, 1024);
         const parsed = JSON.parse(cleaned);
         const validated = traceReasoningSchema.parse(parsed);
         return { conditions: validated.hedge_conditions, reasoning: validated.reasoning_summary };
     }
     catch (err) {
-        logger_1.logger.warn({ err }, 'Gemini hedge condition generation failed — applying safe defaults');
+        // Non-fatal: log a warning but never fail the whole market creation cycle
+        logger_1.logger.warn({ err }, 'LLM hedge condition generation failed — applying safe defaults');
         return {
             conditions: [
                 `Close if market probability rises above ${(input.probabilityEstimate + 0.10).toFixed(2)}`,
                 `Close if primary signal source reverses direction`,
                 `Hard stop-loss at 15% adverse market move`,
             ],
-            reasoning: 'Default hedge conditions applied — Gemini call failed',
+            reasoning: 'Default hedge conditions applied — LLM call failed',
         };
     }
 }

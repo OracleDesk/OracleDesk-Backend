@@ -20,7 +20,20 @@ const app = (0, express_1.default)();
 app.use((0, helmet_1.default)());
 app.use((0, hpp_1.default)());
 app.use((0, cors_1.default)({
-    origin: config_1.config.NODE_ENV === 'production' ? 'https://oracledesk.app' : '*',
+    origin: (origin, callback) => {
+        const allowedOrigins = [
+            'https://oracledesk.app',
+        ];
+        // Allow requests with no origin (like mobile apps or curl requests)
+        if (!origin)
+            return callback(null, true);
+        if (allowedOrigins.indexOf(origin) !== -1 || config_1.config.NODE_ENV !== 'production') {
+            callback(null, true);
+        }
+        else {
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
     credentials: true,
 }));
 // Circle requires the exact raw JSON payload for webhook signature verification.

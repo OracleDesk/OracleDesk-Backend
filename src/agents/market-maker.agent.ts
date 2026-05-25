@@ -6,6 +6,7 @@ import {
 } from '../services/market.service';
 import { generateReasoningTrace } from '../services/reasoning.service';
 import { uploadTraceToIPFS } from '../services/ipfs.service';
+import { deployMarket } from '../services/chain.service';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 
@@ -56,7 +57,7 @@ export async function runMarketMakerCycle(): Promise<MarketCycleResult | null> {
 
     // Step 4: Persist market to DB
     const market = await createMarketFromProposal(proposal);
-    logger.info({ marketId: market.id, category: market.category }, 'Market Maker Agent: market created');
+    logger.info({ marketId: market.id, category: market.category }, 'Market Maker Agent: market created in DB');
 
     // Step 5: Generate reasoning trace for this creation decision
     const { trace, tracePayload } = await generateReasoningTrace({
@@ -75,10 +76,38 @@ export async function runMarketMakerCycle(): Promise<MarketCycleResult | null> {
       confidenceInterval:  proposal.confidence_interval,
     });
 
-    // Step 6: Pin trace to IPFS (non-blocking — don't fail the cycle if this errors)
-    uploadTraceToIPFS(tracePayload, trace.id).catch(err =>
-      logger.warn({ err, traceId: trace.id }, 'Market Maker Agent: IPFS pin failed'),
-    );
+    // Step 6: Pin trace to IPFS (CRITICAL for deployment)
+    let ipfsResult;
+    try {
+      ipfsResult = await uploadTraceToIPFS(tracePayload, trace.id);
+    } catch (err) {
+      logger.error({ err, traceId: trace.id }, 'Market Maker Agent: IPFS pin failed — cannot deploy');
+      return null;
+    }
+
+    // Step 7: Deploy to Arc via MarketFactory
+    try {
+      const txHash = await deployMarket({
+        question:              market.question,
+        expiryTimestamp:       Math.floor(market.expiryTimestamp.getTime() / 1000),
+        initialYesPriceBps:    Math.round(market.initialYesProb * 10000),
+        liquiditySeedUsdc:     market.minimumLiquidity,
+        reasoningCid:          ipfsResult.cid,
+        sha256Hash:            ipfsResult.sha256Hash,
+        confidenceIntervalBps: 800, // ±8% default confidence
+      });
+
+      logger.info({ marketId: market.id, txHash }, 'Market Maker Agent: market deployment submitted to Arc');
+      
+      // Update market with txHash (indexer will set ACTIVE and onChainAddress later)
+      await prisma.market.update({
+        where: { id: market.id },
+        data: { txHash },
+      });
+    } catch (err) {
+      logger.error({ err, marketId: market.id }, 'Market Maker Agent: Arc deployment failed');
+      // We keep it PENDING in DB, could be retried later
+    }
 
     logger.info({ marketId: market.id, traceId: trace.id }, 'Market Maker Agent: cycle complete');
 

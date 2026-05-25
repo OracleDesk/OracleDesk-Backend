@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.MULTISIG_ORACLE_ABI = exports.TREASURY_MANAGER_ABI = exports.POSITION_LEDGER_ABI = exports.REASONING_REGISTRY_ABI = exports.MARKET_FACTORY_ABI = exports.CONTRACT_ADDRESSES = void 0;
+exports.PREDICTION_MARKET_ABI = exports.MULTISIG_ORACLE_ABI = exports.TREASURY_MANAGER_ABI = exports.POSITION_LEDGER_ABI = exports.REASONING_REGISTRY_ABI = exports.MARKET_FACTORY_ABI = exports.CONTRACT_ADDRESSES = void 0;
 const viem_1 = require("viem");
 const index_1 = require("./index");
 exports.CONTRACT_ADDRESSES = {
@@ -12,7 +12,7 @@ exports.CONTRACT_ADDRESSES = {
 };
 exports.MARKET_FACTORY_ABI = (0, viem_1.parseAbi)([
     'event MarketDeployed(address indexed market, string question, address oracle, uint256 expiryTimestamp, uint256 initialYesPrice, uint256 liquiditySeed, string reasoningCid)',
-    'function createMarket(string _question, address _oracle, uint256 _expiryTimestamp, uint256 _initialYesPrice, uint256 _liquiditySeedUsdc, address _agentWallet, string _reasoningCid, bytes32 _sha256Hash) returns (address marketAddress)',
+    'function createMarket(string _question, address _oracle, uint256 _expiryTimestamp, uint256 _initialYesPrice, uint256 _liquiditySeedUsdc, address _agentWallet, string _reasoningCid, bytes32 _sha256Hash, uint256 _confidenceIntervalBps) returns (address marketAddress)',
     'function getAllMarkets() view returns (address[])',
     'function marketExists(string _question) view returns (bool)',
     'function publishReasoning(address _market, address _agentWallet, string _ipfsCid, bytes32 _sha256Hash)',
@@ -47,4 +47,14 @@ exports.MULTISIG_ORACLE_ABI = (0, viem_1.parseAbi)([
     'event ResolutionApproved(address signer, address market, bool yesWon, uint256 count)',
     'function approveResolution(address _market, bool _yesWon)',
     'function required() view returns (uint256)',
+]);
+exports.PREDICTION_MARKET_ABI = (0, viem_1.parseAbi)([
+    'function buy(bool _buyYes, uint256 _usdcIn, uint256 _minSharesOut) returns (uint256 sharesOut)',
+    'function sell(bool _sellYes, uint256 _sharesIn, uint256 _minUsdcOut) returns (uint256 usdcOut)',
+    'function resolve(bool _yesWon)',
+    'function redeem()',
+    'function currentYesPrice() view returns (uint256)',
+    'function currentSpreadBps() view returns (uint256)',
+    'function totalLiquidity() view returns (uint256)',
+    'function getMarketInfo() view returns (string, address, uint256, uint256, uint256, bool, bool, string)',
 ]);

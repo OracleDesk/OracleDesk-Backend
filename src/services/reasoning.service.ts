@@ -1,5 +1,5 @@
 import { prisma } from '../lib/prisma';
-import { callGeminiJSON } from '../lib/gemini';               // ← FIXED: Import callGeminiJSON instead
+import { callLLMJSON } from '../lib/llm';   // ← Unified LLM (Claude → Gemini fallback)
 import { logger } from '../lib/logger';
 import { sha256Json } from '../utils/hash.util';
 import { Prisma } from '@prisma/client';
@@ -11,7 +11,7 @@ import type {
 import { AppError } from '../middlewares/error.middleware';
 import { z } from 'zod';
 
-// ─── Zod schema for Gemini's hedge condition output ───────────────────────────
+// ─── Zod schema for LLM hedge condition output ───────────────────────────────
 const traceReasoningSchema = z.object({
   hedge_conditions:  z.array(z.string()),
   reasoning_summary: z.string().min(10),
@@ -25,7 +25,7 @@ const traceReasoningSchema = z.object({
  * Flow:
  * 1. Compute edge  (agent prob − market prob)
  * 2. Compute 90% confidence interval via jackknife sampling
- * 3. Call Gemini to generate hedge conditions and reasoning narrative
+ * 3. Call Claude/Gemini to generate hedge conditions and reasoning narrative
  * 4. SHA-256 hash the full trace payload for on-chain commitment
  * 5. Persist to DB (IPFS CID added later by ipfs.service.ts)
  */
@@ -51,7 +51,7 @@ export async function generateReasoningTrace(input: TraceInput) {
     timestamp:           new Date().toISOString(),
   };
 
-  const sha256Hash    = sha256Json(tracePayload);
+  const sha256Hash     = sha256Json(tracePayload);
   const previewSources = input.sourcesUsed.slice(0, 2);
 
   const trace = await prisma.reasoningTrace.create({
@@ -107,8 +107,8 @@ export function calculateConfidenceInterval(
   const jackknife: number[] = [];
 
   for (let i = 0; i < signals.length; i++) {
-    const subset   = signals.filter((_, idx) => idx !== i);
-    const totalW   = subset.reduce((acc, s) => acc + s.weight, 0);
+    const subset = signals.filter((_, idx) => idx !== i);
+    const totalW = subset.reduce((acc, s) => acc + s.weight, 0);
     if (totalW === 0) continue;
 
     const signal      = signals[i];
@@ -138,7 +138,11 @@ export function calculateConfidenceInterval(
 }
 
 /**
- * Uses Gemini to generate specific, measurable hedge conditions.
+ * Uses Claude/Gemini to generate specific, measurable hedge conditions.
+ *
+ * This is a secondary LLM call after market creation. It is intentionally
+ * non-blocking: if the LLM call fails for any reason (quota, timeout, etc.)
+ * we return safe defaults so the market creation cycle always completes.
  */
 async function generateHedgeConditions(
   input: TraceInput,
@@ -147,7 +151,7 @@ async function generateHedgeConditions(
 ): Promise<{ conditions: string[]; reasoning: string }> {
   const systemPrompt = `You are a quantitative prediction market risk manager.
 Generate specific, measurable hedge conditions for a trading position.
-Return ONLY a valid JSON object matching this schema. Avoid markdown wrappings.
+Return ONLY a valid JSON object matching this schema exactly. No markdown, no preamble.
 {
   "hedge_conditions": ["string"],
   "reasoning_summary": "string",
@@ -176,21 +180,20 @@ and trigger an early close. Focus on data changes, not price changes.
 `;
 
   try {
-    // FIXED: Swapped callGemini to callGeminiJSON and expanded token limit parameter from 512 to 2048
-    const cleaned = await callGeminiJSON(systemPrompt, userPrompt, 2048);
-    
+    const cleaned   = await callLLMJSON(systemPrompt, userPrompt, 1024);
     const parsed    = JSON.parse(cleaned);
     const validated = traceReasoningSchema.parse(parsed);
     return { conditions: validated.hedge_conditions, reasoning: validated.reasoning_summary };
   } catch (err) {
-    logger.warn({ err }, 'Gemini hedge condition generation failed — applying safe defaults');
+    // Non-fatal: log a warning but never fail the whole market creation cycle
+    logger.warn({ err }, 'LLM hedge condition generation failed — applying safe defaults');
     return {
       conditions: [
         `Close if market probability rises above ${(input.probabilityEstimate + 0.10).toFixed(2)}`,
         `Close if primary signal source reverses direction`,
         `Hard stop-loss at 15% adverse market move`,
       ],
-      reasoning: 'Default hedge conditions applied — Gemini call failed',
+      reasoning: 'Default hedge conditions applied — LLM call failed',
     };
   }
 }

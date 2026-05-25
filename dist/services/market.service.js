@@ -12,13 +12,12 @@ exports.createMarketFromProposal = createMarketFromProposal;
 exports.isDuplicateMarket = isDuplicateMarket;
 const zod_1 = require("zod");
 const prisma_1 = require("../lib/prisma");
-// import { callClaude } from "../lib/anthropic";
-const gemini_1 = require("../lib/gemini");
+const llm_1 = require("../lib/llm");
 const logger_1 = require("../lib/logger");
-const client_1 = require("@prisma/client"); // Make sure MarketCategory is imported
+const client_1 = require("@prisma/client");
 const error_middleware_1 = require("../middlewares/error.middleware");
 const dayjs_1 = __importDefault(require("dayjs"));
-// ─── Zod schema for Claude's JSON output ───
+// ─── Zod schema for Gemini's JSON output ─────────────────────────────────────
 const marketProposalSchema = zod_1.z.object({
     market_question: zod_1.z.string().min(10),
     initial_yes_probability: zod_1.z.number().min(0.01).max(0.99),
@@ -27,22 +26,14 @@ const marketProposalSchema = zod_1.z.object({
     settlement_currency: zod_1.z.enum(["USDC", "EURC"]),
     minimum_liquidity_usdc: zod_1.z.number().positive(),
     category: zod_1.z.enum([
-        "FED",
-        "ECB",
-        "ELECTION",
-        "GEOPOLITICAL",
-        "CRYPTO",
-        "MACRO",
-        "SPORTS",
-        "ENTERTAINMENT",
-        "POLITICS",
+        "FED", "ECB", "ELECTION", "GEOPOLITICAL",
+        "CRYPTO", "MACRO", "SPORTS", "ENTERTAINMENT", "POLITICS",
     ]),
     confidence_interval: zod_1.z.object({ lower: zod_1.z.number(), upper: zod_1.z.number() }),
     reasoning: zod_1.z.string().min(1),
 });
-// ─── Source credibility weights ───
+// ─── Source credibility weights ───────────────────────────────────────────────
 const SOURCE_WEIGHTS = {
-    // Macro / Economic
     FRED: 0.9,
     BLS: 0.9,
     ECB: 0.9,
@@ -53,17 +44,14 @@ const SOURCE_WEIGHTS = {
     ANALYST: 0.5,
     REDDIT: 0.3,
     TWITTER: 0.3,
-    // Sports
     SPORTRADAR: 0.9,
     ESPN: 0.8,
     BBC_SPORT: 0.8,
     SPORTS_REFERENCE: 0.85,
-    // Entertainment
     ENTERTAINMENT_WEEKLY: 0.6,
     BILLBOARD: 0.75,
     BOX_OFFICE_MOJO: 0.80,
     ROTTEN_TOMATOES: 0.70,
-    // Politics
     POLITICAL_WIRE: 0.80,
     REALCLEARPOLITICS: 0.75,
     POLITICO: 0.80,
@@ -72,9 +60,10 @@ const SOURCE_WEIGHTS = {
 /**
  * Generates a validated binary prediction market proposal from signal data.
  *
- * Calls Gemini with `callGeminiJSON` which forces clean JSON output via
- * `responseMimeType: 'application/json'`. The output is validated against
- * a Zod schema. Any LLM failure is logged with full context for debugging.
+ * Calls callLLMJSON (Claude → Gemini fallback) which forces clean JSON output.
+ * If ANTHROPIC_API_KEY is set, Claude handles the call. Otherwise it falls
+ * back to Gemini. The circuit breaker in gemini.ts fast-fails Gemini calls
+ * when the daily quota is exhausted so the cycle aborts cleanly.
  */
 async function generateMarketQuestion(signals) {
     const systemPrompt = `
@@ -146,26 +135,25 @@ Pick the category and currency that best fits the event.
 `;
     let rawResponse;
     try {
-        rawResponse = await (0, gemini_1.callGeminiJSON)(systemPrompt, userPrompt, 4096);
+        rawResponse = await (0, llm_1.callLLMJSON)(systemPrompt, userPrompt, 4096);
     }
     catch (err) {
-        await logAgentAction('MARKET_MAKER', 'ERROR', 'GENERATE_QUESTION_GEMINI_FAIL', null, {
+        await logAgentAction('MARKET_MAKER', 'ERROR', 'GENERATE_QUESTION_LLM_FAIL', null, {
             error: String(err),
             signalCount: signals.signalCount,
         });
-        throw new error_middleware_1.AppError(500, 'LLM_CALL_FAILED', 'Gemini API call failed during market generation');
+        throw new error_middleware_1.AppError(500, 'LLM_CALL_FAILED', 'LLM API call failed during market generation');
     }
     return validateMarketQuestion(rawResponse);
 }
 /**
- * Validates and parses Gemini's JSON output.
+ * Validates and parses Gemini's JSON output against the Zod schema.
  *
- * Even though we use `responseMimeType: 'application/json'`, we still
- * validate with Zod to catch semantic errors (wrong field types, out-of-range
- * probabilities, etc.) that JSON validity alone won't catch.
+ * Even with `responseMimeType: 'application/json'`, we validate with Zod to
+ * catch semantic errors (wrong field types, out-of-range probabilities) that
+ * JSON validity alone won't catch.
  */
 function validateMarketQuestion(rawLlmOutput) {
-    // Safety strip (callGeminiJSON already strips, this is belt-and-suspenders)
     const cleaned = rawLlmOutput
         .replace(/```json\n?/gi, '')
         .replace(/```\n?/g, '')
@@ -186,7 +174,6 @@ function validateMarketQuestion(rawLlmOutput) {
             rawOutput: cleaned.slice(0, 500),
         });
     }
-    // Sanity: probability must sit inside confidence interval
     const { initial_yes_probability: p, confidence_interval: ci } = result.data;
     if (ci.lower >= ci.upper || p < ci.lower || p > ci.upper) {
         throw new error_middleware_1.AppError(422, 'INVALID_CONFIDENCE_INTERVAL', 'Probability must be within the confidence interval bounds', { p, ci });
@@ -195,10 +182,6 @@ function validateMarketQuestion(rawLlmOutput) {
 }
 /**
  * Computes a weighted probability estimate from a list of signals.
- *
- * Each signal source has a credibility weight (0.0–1.0). The final
- * probability is the weighted mean. The confidence interval is
- * ±1.96 × std_dev (95% CI).
  */
 function calculateProbability(signals, baseMarketPrice) {
     if (signals.length === 0) {
@@ -227,7 +210,6 @@ function calculateProbability(signals, baseMarketPrice) {
 }
 /**
  * Derives a sensible expiry date from the market category.
- * Each category has a characteristic event horizon.
  */
 function generateExpiryDate(category) {
     const base = (0, dayjs_1.default)();
@@ -238,19 +220,17 @@ function generateExpiryDate(category) {
         case 'GEOPOLITICAL': return base.add(14, 'day').toDate();
         case 'CRYPTO': return base.add(7, 'day').toDate();
         case 'MACRO': return base.add(21, 'day').toDate();
-        case 'SPORTS': return base.add(14, 'day').toDate(); // Next game/match window
-        case 'ENTERTAINMENT': return base.add(30, 'day').toDate(); // Award shows, release windows
-        case 'POLITICS': return base.add(30, 'day').toDate(); // Legislative / appointment events
+        case 'SPORTS': return base.add(14, 'day').toDate();
+        case 'ENTERTAINMENT': return base.add(30, 'day').toDate();
+        case 'POLITICS': return base.add(30, 'day').toDate();
         default: return base.add(21, 'day').toDate();
     }
 }
 /**
  * Persists a validated MarketProposal to the database.
- * Also writes a creation log to agent_logs.
  */
 async function createMarketFromProposal(proposal) {
     const upperCategory = String(proposal.category).toUpperCase();
-    // Fall back to MACRO because it is guaranteed to exist on both old and new schemas
     const finalCategory = Object.values(client_1.MarketCategory).includes(upperCategory)
         ? upperCategory
         : client_1.MarketCategory.MACRO;
@@ -274,12 +254,11 @@ async function createMarketFromProposal(proposal) {
         oracle: market.resolutionOracle,
         category: market.category,
     });
-    logger_1.logger.info({ marketId: market.id, question: market.question, category: market.category, }, "Market created");
+    logger_1.logger.info({ marketId: market.id, question: market.question, category: market.category }, "Market created");
     return market;
 }
 /**
  * Check if a similar market already exists to avoid duplicates.
- * Uses a simple word-overlap heuristic.
  */
 async function isDuplicateMarket(question) {
     const activeMarkets = await prisma_1.prisma.market.findMany({
@@ -296,7 +275,7 @@ async function isDuplicateMarket(question) {
     }
     return false;
 }
-// ─── Internal helper ───
+// ─── Internal helper ──────────────────────────────────────────────────────────
 async function logAgentAction(agentType, level, action, marketId, data) {
     try {
         await prisma_1.prisma.agentLog.create({
