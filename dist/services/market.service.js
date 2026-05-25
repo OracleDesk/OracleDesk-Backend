@@ -24,7 +24,7 @@ const marketProposalSchema = zod_1.z.object({
     resolution_oracle: zod_1.z.string().min(1),
     expiry_timestamp: zod_1.z.number().int().positive(),
     settlement_currency: zod_1.z.enum(["USDC", "EURC"]),
-    minimum_liquidity_usdc: zod_1.z.number().positive(),
+    minimum_liquidity_usdc: zod_1.z.number().positive().default(100),
     category: zod_1.z.enum([
         "FED", "ECB", "ELECTION", "GEOPOLITICAL",
         "CRYPTO", "MACRO", "SPORTS", "ENTERTAINMENT", "POLITICS",
@@ -179,13 +179,13 @@ function validateMarketQuestion(rawLlmOutput) {
         parsed = JSON.parse(cleaned);
     }
     catch {
-        throw new error_middleware_1.AppError(422, 'INVALID_LLM_JSON', 'Gemini returned non-parseable JSON', {
+        throw new error_middleware_1.AppError(422, 'INVALID_LLM_JSON', 'LLM returned non-parseable JSON', {
             rawOutput: cleaned.slice(0, 500),
         });
     }
     const result = marketProposalSchema.safeParse(parsed);
     if (!result.success) {
-        throw new error_middleware_1.AppError(422, 'SCHEMA_VALIDATION_FAILED', 'Gemini output failed schema validation', {
+        throw new error_middleware_1.AppError(422, 'SCHEMA_VALIDATION_FAILED', 'LLM output failed schema validation', {
             errors: result.error.flatten().fieldErrors,
             rawOutput: cleaned.slice(0, 500),
         });

@@ -67,6 +67,7 @@ export async function callLLMJSON(
       const message = await anthropic.messages.create({
         model:      CLAUDE_MODEL,
         max_tokens: maxTokens,
+        temperature: 0.2,  // Low temperature for deterministic, well-structured JSON
         system:
           systemPrompt +
           '\n\nCRITICAL: Your response must be ONLY a valid JSON object. ' +
@@ -120,6 +121,7 @@ export async function callLLMText(
       const message = await anthropic.messages.create({
         model:      CLAUDE_MODEL,
         max_tokens: maxTokens,
+        temperature: 0.4,  // Moderate temperature for narrative text
         system:     systemPrompt,
         messages:   [{ role: 'user', content: userPrompt }],
       });
