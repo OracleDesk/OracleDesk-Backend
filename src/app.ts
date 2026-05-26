@@ -21,7 +21,7 @@ app.use(cors({
   origin: (origin, callback) => {
     const allowedOrigins = [
       'https://oracledesk.app',
-      'https://oracle-desk-frontend.vercel.app/',
+      'https://oracle-desk-frontend.vercel.app',
       'http://localhost:3000',
       'http://localhost:3001',
       'http://localhost:3002',
