@@ -21,6 +21,13 @@ app.use(cors({
   origin: (origin, callback) => {
     const allowedOrigins = [
       'https://oracledesk.app',
+      'https://oracle-desk-frontend.vercel.app/',
+      'http://localhost:3000',
+      'http://localhost:3001',
+      'http://localhost:3002',
+      'http://localhost:3003',
+      'http://localhost:3004',
+      'http://localhost:3005',
     ];
     
     // Allow requests with no origin (like mobile apps or curl requests)
