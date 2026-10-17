@@ -3,6 +3,7 @@ import {
   getMyPaymentEvents,
   getMySpendingAllowance,
   getTrace,
+  getTraceKey,
   listTraces,
   setSpendingAllowance,
   unlockTrace,
@@ -17,6 +18,7 @@ router.get('/',             listTraces);
 router.get('/access/allowance', requireAuth, getMySpendingAllowance);
 router.put('/access/allowance', requireAuth, setSpendingAllowance);
 router.get('/payments', requireAuth, getMyPaymentEvents);
+router.get('/:id/key',      requireAuth, getTraceKey);
 router.get('/:id', optionalAuth, getTrace);   // Preview without a token, full trace with a daily pass
 
 // Protected

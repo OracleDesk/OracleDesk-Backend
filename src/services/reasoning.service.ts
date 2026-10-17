@@ -27,33 +27,56 @@ const traceReasoningSchema = z.object({
  * 3. Call Claude/Gemini to generate hedge conditions and reasoning narrative
  * 4. Persist to DB. The hash is computed later, over the exact bytes pinned
  *    to IPFS (services/trace-publish.service.ts), never over this object.
- */
-export async function generateReasoningTrace(input: TraceInput) {
+import crypto from 'node:crypto';
+import { buildTraceDoc, TraceDocV1 } from '../schemas/trace';
+
+export async function generateReasoningTrace(
+  input: TraceInput & {
+    traceId?: string;
+    onChainMarketId?: string | bigint | number | null;
+  },
+): Promise<{ trace: any; tracePayload: TraceDocV1 }> {
   const edge = calculateEdge(input.probabilityEstimate, input.marketProbability);
   const ci   = calculateConfidenceInterval(input.sourcesUsed, input.probabilityEstimate);
 
   const hedgeConditions = await generateHedgeConditions(input, edge, ci);
+  const traceId = input.traceId || crypto.randomUUID();
 
-  const tracePayload: Record<string, unknown> = {
-    agentType:           input.agentType,
-    decisionType:        input.decisionType,
-    marketId:            input.marketId,
-    sourcesUsed:         input.sourcesUsed,
+  let onChainMarketId = input.onChainMarketId !== undefined ? input.onChainMarketId : null;
+  if (onChainMarketId === null && input.marketId) {
+    const market = await prisma.market.findUnique({
+      where: { id: input.marketId },
+      select: { onChainMarketId: true },
+    });
+    if (market?.onChainMarketId !== undefined && market.onChainMarketId !== null) {
+      onChainMarketId = market.onChainMarketId;
+    }
+  }
+
+  const traceDoc: TraceDocV1 = buildTraceDoc({
+    traceId,
+    agentType: input.agentType,
+    decisionType: input.decisionType,
+    action: input.decisionType.toLowerCase(),
+    backendMarketId: input.marketId,
+    onChainMarketId,
     probabilityEstimate: input.probabilityEstimate,
-    marketProbability:   input.marketProbability,
+    marketProbability: input.marketProbability,
     edge,
-    confidenceInterval:  ci,
-    betFraction:         input.betFraction,
-    betSizeUsdc:         input.betSizeUsdc,
-    hedgeConditions:     hedgeConditions.conditions,
-    agentWallet:         input.agentWallet,
-    timestamp:           new Date().toISOString(),
-  };
+    confidenceInterval: ci,
+    sourcesUsed: input.sourcesUsed,
+    betFraction: input.betFraction ?? null,
+    betSizeUsdc: input.betSizeUsdc ?? null,
+    hedgeConditions: hedgeConditions.conditions,
+    agentWallet: input.agentWallet ?? null,
+  });
 
   const previewSources = input.sourcesUsed.slice(0, 2);
 
-  const trace = await prisma.reasoningTrace.create({
-    data: {
+  const trace = await prisma.reasoningTrace.upsert({
+    where: { id: traceId },
+    create: {
+      id: traceId,
       marketId:            input.marketId,
       agentType:           input.agentType,
       decisionType:        input.decisionType,
@@ -62,18 +85,19 @@ export async function generateReasoningTrace(input: TraceInput) {
       marketProbability:   input.marketProbability,
       edge,
       confidenceInterval:  ci as Prisma.InputJsonValue,
-      betFraction:         input.betFraction,
-      betSizeUsdc:         input.betSizeUsdc,
+      betFraction:         input.betFraction ?? null,
+      betSizeUsdc:         input.betSizeUsdc ?? null,
       hedgeConditions:     hedgeConditions.conditions as any,
-      agentWallet:         input.agentWallet,
+      agentWallet:         input.agentWallet ?? null,
       previewSources:      previewSources as any,
       verified:            false,
       isPublic:            false,
     },
+    update: {},
   });
 
   logger.info({ traceId: trace.id, edge, marketId: input.marketId }, 'Reasoning trace generated');
-  return { trace, tracePayload: { ...tracePayload, traceId: trace.id } };
+  return { trace, tracePayload: traceDoc };
 }
 
 /**

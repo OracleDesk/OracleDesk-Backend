@@ -561,5 +561,69 @@ Every call in the frontend's `lib/api/*.ts` and where it lands:
 | `unlockTrace` | `POST /traces/:id/unlock` (daily pass) |
 | `getSpendingAllowance` / `setSpendingAllowance` | `GET` / `PUT /traces/access/allowance` |
 | `getPaymentEvents` | `GET /traces/payments` |
+| `getTraceKey` | `GET /traces/:id/key` |
+| `getLeaderboard` | `GET /leaderboard` |
+| `getWalletStats` | `GET /wallets/:address/stats` |
 | `getResolution` | `GET /oracle/markets/:marketId/resolution` |
 | per-trace unlock | x402 `GET {X402_URL}/traces/:onChainTraceId` |
+
+---
+
+## Schemas
+
+Public, immutable JSON Schema 2020-12 documents defining verifiable artefacts:
+
+- `GET /api/v1/schemas/trace/v1.json`: Reasoning trace document schema v1.
+- `GET /api/v1/schemas/question/v2.json`: Question document schema v2 (with `resolutionSpecHash` and category enums).
+- `GET /api/v1/schemas/question/v1.json`: Legacy question document schema v1 for historical verification.
+
+Served with `Content-Type: application/schema+json` and `Cache-Control: public, max-age=31536000, immutable`.
+
+---
+
+## Confidential Trace Key Release
+
+#### `GET /traces/:id/key` (auth, active subscription required)
+Returns the per-trace data key for client-side decryption:
+```json
+{
+  "kid": "kek-2026-10",
+  "dataKey": "<base64 32 bytes>",
+  "plaintextHash": "64-hex"
+}
+```
+
+#### `POST /internal/traces/:onChainTraceId/key` (shared secret HMAC)
+Internal endpoint for x402 services to obtain data keys after verifying on-chain micropayments. Requires `x-signature`, `x-timestamp`, `x-nonce` with replay protection.
+
+---
+
+## Admin Generation Runs (auth, admin)
+
+#### `GET /admin/generation-runs`
+Lists saga generation runs with status, inputs, outputs, and lock details. Query: `state`, `page`, `limit`.
+
+#### `GET /admin/generation-runs/:id`
+Inspects a specific saga generation run.
+
+#### `POST /admin/generation-runs/:id/cancel`
+Cancels an incomplete run in `NEEDS_ATTENTION` before on-chain submission, safely setting associated pending market to `CANCELLED`.
+
+---
+
+## Leaderboard and Wallet Stats
+
+Exact integer accounting in 7-decimal USDC base units (no floating-point rounding drift).
+
+#### Accounting Rules:
+- **Average Cost Basis**: Buy collateral (including protocol fee) enters the cost basis. On partial sells, cost is removed proportionally (`cost * sharesIn / shares`).
+- **Settlement**: On resolution, winning shares are worth 1.0 USDC each; losing shares are worth 0. Void markets settle combined Yes and No positions with integer division `(yes + no) / 2` matching contract `settle_value`.
+- **Incomplete History Flag**: Wallets with trades prior to indexer retention or exceeding known balances are flagged `incomplete: true` and excluded from rankings by default.
+
+#### `GET /leaderboard`
+Query params: `window=7d|30d|all` (default `all`), `category`, `metric=pnl|volume|roi` (default `pnl`), `page`, `limit`, `includeIncomplete=true|false`.
+Responses are cached in Redis for 30 seconds.
+
+#### `GET /wallets/:address/stats`
+Returns totals, category breakdown, open positions with mark-to-market valuations, and last 50 trades from the indexer.
+

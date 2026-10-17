@@ -1,5 +1,6 @@
 import cron from 'node-cron';
 import { runMarketMakerCycle } from '../agents/market-maker.agent';
+import { resumeIncomplete } from '../services/market-saga.service';
 import { logger } from '../lib/logger';
 
 let isRunning = false;
@@ -23,6 +24,9 @@ export function startIngestionCron(): void {
 
     isRunning = true;
     try {
+      await resumeIncomplete().catch((err) =>
+        logger.error({ err }, 'Ingestion cron: error resuming incomplete sagas'),
+      );
       await runMarketMakerCycle();
     } catch (err) {
       logger.error({ err }, 'Ingestion cron: cycle failed');

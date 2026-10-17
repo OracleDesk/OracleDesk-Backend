@@ -269,13 +269,14 @@ export function generateExpiryDate(category: string): Date {
  */
 export async function createMarketFromProposal(
   proposal: MarketProposal,
+  client: any = prisma,
 ): Promise<Market> {
   const upperCategory = String(proposal.category).toUpperCase();
   const finalCategory = Object.values(MarketCategory).includes(upperCategory as MarketCategory)
     ? (upperCategory as MarketCategory)
     : MarketCategory.MACRO;
 
-  const market = await prisma.market.create({
+  const market = await client.market.create({
     data: {
       question:           proposal.market_question,
       category:           finalCategory,

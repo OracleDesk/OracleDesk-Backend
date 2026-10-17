@@ -30,6 +30,7 @@ Forgot `--recurse-submodules`? Run `git submodule update --init`.
 
 ```bash
 npm run check:contracts     # generated contract code matches the submodule
+npm run check:schemas       # JSON schemas match source definitions
 npx prisma migrate deploy   # against a scratch database
 npm run build
 npm test

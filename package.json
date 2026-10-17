@@ -13,7 +13,10 @@
     "prisma:generate": "prisma generate",
     "prisma:studio": "prisma studio",
     "sync:contracts": "node scripts/sync-contracts.mjs",
-    "check:contracts": "node scripts/sync-contracts.mjs --check"
+    "check:contracts": "node scripts/sync-contracts.mjs --check",
+    "gen:schemas": "node scripts/gen-schemas.mjs",
+    "check:schemas": "node scripts/gen-schemas.mjs --check",
+    "pnl:rebuild": "npx tsx scripts/rebuild-wallet-pnl.ts"
   },
   "keywords": [],
   "author": "",

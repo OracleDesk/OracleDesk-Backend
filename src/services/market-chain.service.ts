@@ -15,15 +15,21 @@ import { USDC_UNIT, usdcFromNumber } from '../lib/amounts';
 import { resolutionHash, type ResolutionSpecJson } from '../lib/resolution-spec';
 import { agentCreateMarket, type WriteResult } from './chain.service';
 import { agentSigner } from './stellar/clients';
-import { pinJson } from './ipfs.service';
+import { pinDocument } from './ipfs.service';
+import {
+  questionDocument as buildQuestionDoc,
+  QuestionDocV1,
+  QuestionDocV2,
+} from '../schemas/question';
 
 /** market-core MIN_SEED is 100 USDC. */
 export const MIN_SEED_RAW = 100n * USDC_UNIT;
 
 export function defaultResolutionSpec(): ResolutionSpecJson {
-  const signers = config.RESOLUTION_SIGNERS.length > 0
-    ? config.RESOLUTION_SIGNERS
-    : [agentSigner().publicKey as string];
+  const signers =
+    config.RESOLUTION_SIGNERS.length > 0
+      ? config.RESOLUTION_SIGNERS
+      : [agentSigner().publicKey as string];
   return {
     kind: 'signers',
     signers,
@@ -33,30 +39,67 @@ export function defaultResolutionSpec(): ResolutionSpecJson {
 }
 
 /** The question document pinned to IPFS; its sha256 is the on-chain question_hash. */
-export function questionDocument(market: Market, resolutionHashHex: string) {
-  return {
-    version: 1,
-    question: market.question,
-    category: market.category,
-    contractCategory: toContractCategory(market.category),
-    closeTime: Math.floor(market.expiryTimestamp.getTime() / 1000),
-    resolutionSource: market.resolutionOracle ?? null,
-    resolutionHash: resolutionHashHex,
-    backendMarketId: market.id,
-  };
+export function questionDocument(
+  market: Market,
+  resolutionHashHex: string,
+  version: 1 | 2 = (config.QUESTION_DOC_VERSION as 1 | 2) || 2,
+) {
+  return buildQuestionDoc(
+    {
+      id: market.id,
+      question: market.question,
+      category: market.category,
+      expiryTimestamp: market.expiryTimestamp,
+    },
+    {
+      specHash: resolutionHashHex,
+      source: market.resolutionOracle,
+    },
+    toContractCategory(market.category),
+    version,
+  );
 }
 
 export function initialYesBps(probability: number): number {
   return Math.min(9900, Math.max(100, Math.round(probability * 10_000)));
 }
 
-export async function createMarketOnChain(
+export interface PreparedMarketCommitment {
+  spec: ResolutionSpecJson;
+  resolutionHashBytes: Buffer;
+  resolutionHashHex: string;
+  questionCid: string;
+  questionHash: string;
+  metaUri: string;
+  seedAmountRaw: bigint;
+}
+
+/**
+ * Prepares resolution spec, pins the question document to IPFS, and updates the database row.
+ * Idempotent: re-calling on a market with questionHash already set will not re-pin.
+ */
+export async function prepareMarketCommitment(
   market: Market,
   spec: ResolutionSpecJson = defaultResolutionSpec(),
-): Promise<WriteResult<bigint>> {
+): Promise<PreparedMarketCommitment> {
   const resolutionHashBytes = resolutionHash(spec);
   const resolutionHashHex = resolutionHashBytes.toString('hex');
-  const pinned = await pinJson(questionDocument(market, resolutionHashHex), `oracledesk-market-${market.id}`);
+
+  let questionHash = market.questionHash;
+  let metaUri = market.metaUri;
+  let questionCid = metaUri ? metaUri.replace(/^ipfs:\/\//, '') : '';
+
+  if (!questionHash || !metaUri) {
+    const doc = questionDocument(market, resolutionHashHex);
+    const pinned =
+      config.QUESTION_DOC_VERSION === 1
+        ? await pinDocument(QuestionDocV1, doc as any, `oracledesk-market-${market.id}`)
+        : await pinDocument(QuestionDocV2, doc as any, `oracledesk-market-${market.id}`);
+
+    questionHash = pinned.hash;
+    questionCid = pinned.cid;
+    metaUri = `ipfs://${pinned.cid}`;
+  }
 
   const requested = usdcFromNumber(market.minimumLiquidity);
   const seed = requested < MIN_SEED_RAW ? MIN_SEED_RAW : requested;
@@ -66,19 +109,39 @@ export async function createMarketOnChain(
     data: {
       resolutionSpec: spec as object,
       resolutionHash: resolutionHashHex,
-      questionHash: pinned.hash,
-      metaUri: `ipfs://${pinned.cid}`,
+      questionHash,
+      metaUri,
       seedAmountRaw: seed.toString(),
     },
   });
 
+  return {
+    spec,
+    resolutionHashBytes,
+    resolutionHashHex,
+    questionCid,
+    questionHash,
+    metaUri,
+    seedAmountRaw: seed,
+  };
+}
+
+/**
+ * Submits the market creation transaction to the chain (or simulates in dry-run).
+ */
+export async function submitMarketCreation(
+  market: Market,
+  prepared?: PreparedMarketCommitment,
+): Promise<WriteResult<bigint>> {
+  const prep = prepared ?? (await prepareMarketCommitment(market));
+
   const result = await agentCreateMarket({
-    question_hash: Buffer.from(pinned.hash, 'hex'),
-    resolution_hash: resolutionHashBytes,
-    meta_uri: `ipfs://${pinned.cid}`,
+    question_hash: Buffer.from(prep.questionHash, 'hex'),
+    resolution_hash: prep.resolutionHashBytes,
+    meta_uri: prep.metaUri,
     category: toContractCategoryValue(market.category),
     close_time: BigInt(Math.floor(market.expiryTimestamp.getTime() / 1000)),
-    seed_amount: seed,
+    seed_amount: prep.seedAmountRaw,
     initial_yes_bps: initialYesBps(market.initialYesProb),
   });
 
@@ -95,4 +158,12 @@ export async function createMarketOnChain(
     );
   }
   return result;
+}
+
+export async function createMarketOnChain(
+  market: Market,
+  spec: ResolutionSpecJson = defaultResolutionSpec(),
+): Promise<WriteResult<bigint>> {
+  const prep = await prepareMarketCommitment(market, spec);
+  return submitMarketCreation(market, prep);
 }

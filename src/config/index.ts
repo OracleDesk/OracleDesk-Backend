@@ -91,6 +91,20 @@ const envSchema = z
     PINATA_SECRET_API_KEY: optionalString,
     IPFS_GATEWAY_URL: z.string().url().default('https://gateway.pinata.cloud/ipfs'),
 
+    // ── Public API Base URL & Schema ──────────────────────────────────────
+    PUBLIC_API_BASE_URL: z.string().url().default('http://localhost:8000'),
+    QUESTION_DOC_VERSION: z.string().default('2').transform(Number),
+
+    // ── Confidential Traces ──────────────────────────────────────────────
+    TRACE_CONFIDENTIAL: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
+    TRACE_KEKS: optionalString,
+    TRACE_KEK_ACTIVE: z.string().default('kek-2026-10'),
+    X402_KEY_RELEASE_SECRET: optionalString,
+
+    // ── Saga ─────────────────────────────────────────────────────────────
+    SAGA_RECOVERY_SCAN: z.string().default('50').transform(Number),
+    SAGA_MAX_ATTEMPTS: z.string().default('8').transform(Number),
+
     // ── Data sources ──────────────────────────────────────────────────────
     NEWSAPI_KEY: optionalString,
     FRED_API_KEY: optionalString,
@@ -121,6 +135,21 @@ const envSchema = z
         });
       }
     }
+    if (env.NODE_ENV === 'production' && env.TRACE_CONFIDENTIAL) {
+      if (!env.TRACE_KEKS) {
+        ctx.addIssue({ code: 'custom', path: ['TRACE_KEKS'], message: 'is required in production when TRACE_CONFIDENTIAL=true' });
+      }
+    }
+    if (env.TRACE_KEKS) {
+      try {
+        const parsed = JSON.parse(env.TRACE_KEKS);
+        if (typeof parsed !== 'object' || parsed === null) {
+          ctx.addIssue({ code: 'custom', path: ['TRACE_KEKS'], message: 'must be a JSON object mapping kid to base64 key' });
+        }
+      } catch {
+        ctx.addIssue({ code: 'custom', path: ['TRACE_KEKS'], message: 'must be valid JSON' });
+      }
+    }
   });
 
 export type Config = z.infer<typeof envSchema> & {
@@ -146,6 +175,11 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
   if (!data.AUTH_SIGNING_SECRET) {
     data.AUTH_SIGNING_SECRET = Keypair.random().secret();
     ephemeralSecrets.push('AUTH_SIGNING_SECRET');
+  }
+  if (!data.TRACE_KEKS) {
+    const rawKey = crypto.randomBytes(32).toString('base64');
+    data.TRACE_KEKS = JSON.stringify({ [data.TRACE_KEK_ACTIVE]: rawKey });
+    ephemeralSecrets.push('TRACE_KEKS');
   }
   if (!data.AUTH_WEB_AUTH_DOMAIN) data.AUTH_WEB_AUTH_DOMAIN = data.AUTH_HOME_DOMAIN;
   return { ...data, ephemeralSecrets };

@@ -171,7 +171,16 @@ export async function getTracWithAccessControl(
   }
 
   if (access.hasAccess) {
-    return { ...trace, accessLevel: access.accessType };
+    return {
+      ...trace,
+      accessLevel: access.accessType,
+      contentMode: trace.contentMode,
+      plaintextHash: trace.plaintextHash,
+      verification: {
+        envelopeHash: trace.traceHash,
+        plaintextHash: trace.plaintextHash,
+      },
+    };
   }
 
   // Return free preview — strip full sources
@@ -189,6 +198,8 @@ export async function getTracWithAccessControl(
     verified:            trace.verified,
     ipfsCid:             trace.ipfsCid,
     traceHash:           trace.traceHash,
+    contentMode:         trace.contentMode,
+    plaintextHash:       trace.plaintextHash,
     onChainTraceId:      trace.onChainTraceId,
     createdAt:           trace.createdAt,
     accessLevel:         'FREE_PREVIEW',

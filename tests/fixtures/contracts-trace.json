@@ -1,0 +1,29 @@
+{
+  "agent": "market-maker",
+  "marketId": 0,
+  "action": "create_market",
+  "reasoning": "Fed funds futures imply a 78% probability of a 25bps cut at the upcoming FOMC meeting.",
+  "inputs": [
+    {
+      "source": "CME FedWatch",
+      "weight": 0.85,
+      "signal": "78% cut probability priced",
+      "rawValue": 0.78
+    },
+    {
+      "source": "FRED CPI",
+      "weight": 0.65,
+      "signal": "headline CPI YoY 2.5%",
+      "rawValue": 2.5
+    }
+  ],
+  "timestamp": 1729000000,
+  "traceId": "00000000-0000-0000-0000-000000000001",
+  "probabilityEstimate": 0.78,
+  "marketProbability": 0.5,
+  "edge": 0.28,
+  "confidenceInterval": {
+    "lower": 0.72,
+    "upper": 0.84
+  }
+}

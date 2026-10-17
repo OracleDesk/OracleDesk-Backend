@@ -94,6 +94,21 @@ export async function pinJson(document: unknown, name: string): Promise<PinnedDo
   throw new AppError(502, 'IPFS_UPLOAD_FAILED', 'Failed to pin document to IPFS', { name });
 }
 
+export async function pinDocument<T>(
+  schema: { parse: (val: unknown) => T },
+  document: T,
+  name: string,
+): Promise<PinnedDocument> {
+  let validated: T;
+  try {
+    validated = schema.parse(document);
+  } catch (err: any) {
+    logger.error({ err: err?.issues ?? err, name }, 'Document failed schema validation before pinning');
+    throw new AppError(500, 'DOCUMENT_SCHEMA_INVALID', 'Document failed schema validation before pinning');
+  }
+  return pinJson(validated, name);
+}
+
 export function fetchIpfsBytes(cid: string): Promise<Buffer> {
   return transport.fetch(cid);
 }

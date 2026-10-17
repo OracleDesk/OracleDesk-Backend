@@ -63,3 +63,26 @@ Outcomes are decided on-chain by the resolver contract. The backend only reads `
 ## Generated code
 
 `src/generated/` is copied from the pinned `contracts` submodule by `scripts/sync-contracts.mjs`, with a do-not-edit header and `// @ts-nocheck`. CI fails if it's stale.
+
+## Market Maker Saga
+
+`src/services/market-saga.service.ts` converts the market maker cycle into an idempotent, resumable saga.
+- **State Machine**: Explicit checkpoint states (`STARTED` → `SIGNALS_READY` → `PROPOSED` → `MARKET_PERSISTED` → `QUESTION_PINNED` → `CHAIN_SUBMITTED` → `CHAIN_CONFIRMED` → `TRACE_PERSISTED` → `TRACE_PINNED` → `TRACE_PUBLISHED` → `COMPLETED`).
+- **Idempotency & Recovery**: Before submitting market creation on-chain, the saga performs downward scans from `market_count()` matching `question_hash` and `creator === CONTRACTS.treasury` to prevent duplicate seed liquidity expenditure after transient failures or crashes.
+- **Resumer**: Runs at process boot and on every ingestion cron tick, with exponential back-off and terminal `NEEDS_ATTENTION` after `SAGA_MAX_ATTEMPTS`.
+- **Compensation**: Admin endpoint `POST /admin/generation-runs/:id/cancel` safely cancels pre-chain runs, marking associated pending markets `CANCELLED`.
+
+## Confidential Traces
+
+When `TRACE_CONFIDENTIAL=true`, reasoning traces are sealed in authenticated encrypted envelopes (`oracledesk.trace.enc` v1) using XChaCha20-Poly1305.
+- **Threat Model**: The backend and KEK holder can decrypt traces; verifiability for the public is commit-then-reveal.
+- **Verification**: The on-chain `trace_hash` in `reasoning_registry` commits to the exact bytes of the sealed envelope. Once entitled users obtain the plaintext and data key, they verify that `sha256(plaintext) === envelope.plaintextHash`.
+- **Key Management**: Per-trace 32-byte data keys are wrapped with server-side KEKs (`kid` in envelope header). Keys are never committed to IPFS or logged.
+
+## Wallet PnL and Performance Ledger
+
+`src/services/wallet-pnl.service.ts` projects indexed market-core events (`MarketCreated`, `Trade`, `Redeemed`, `MarketResolved`) into an exact integer accounting ledger (`wallet_positions` and `wallet_stats_daily`):
+- **Accounting**: Average-cost basis, realized PnL on partial sells, and liquidation or mid-market mark-to-market.
+- **Settlement**: Yes/No/Void settlement (void settles combined Yes and No positions with integer division `(yes + no) / 2`).
+- **Idempotency**: Ledgered through `wallet_events_applied`. Out-of-order events trigger dirty market marks and rebuilding via `npm run pnl:rebuild`.
+

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://api.oracledesk.io/api/v1/schemas/question/v1.json",
+  "title": "OracleDesk Question Document v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "question",
+    "category",
+    "contractCategory",
+    "closeTime",
+    "resolutionHash",
+    "backendMarketId"
+  ],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "question": {
+      "type": "string"
+    },
+    "category": {
+      "type": "string"
+    },
+    "contractCategory": {
+      "type": "string"
+    },
+    "closeTime": {
+      "type": "number"
+    },
+    "resolutionSource": {
+      "type": ["string", "null"]
+    },
+    "resolutionHash": {
+      "type": "string"
+    },
+    "backendMarketId": {
+      "type": "string"
+    }
+  }
+}

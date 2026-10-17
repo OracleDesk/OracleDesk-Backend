@@ -24,9 +24,61 @@ function sortKeysDeep(value: unknown): unknown {
   return value;
 }
 
+/**
+ * Strict canonical JSON: throws on undefined, functions, symbols, non-finite numbers and Date.
+ * Enforces explicit nulls and deterministic serialization.
+ */
+export function canonicalJsonStrict(value: unknown): string {
+  function validateAndSort(val: unknown, path = '$'): unknown {
+    if (val === undefined) {
+      throw new TypeError(`canonicalJsonStrict: undefined encountered at ${path}`);
+    }
+    if (typeof val === 'function' || typeof val === 'symbol') {
+      throw new TypeError(`canonicalJsonStrict: disallowed ${typeof val} encountered at ${path}`);
+    }
+    if (typeof val === 'number' && !Number.isFinite(val)) {
+      throw new TypeError(`canonicalJsonStrict: non-finite number (${val}) encountered at ${path}`);
+    }
+    if (val instanceof Date) {
+      throw new TypeError(`canonicalJsonStrict: Date instance encountered at ${path}; convert to ISO string explicitly`);
+    }
+    if (typeof val === 'bigint') {
+      return val.toString();
+    }
+    if (Array.isArray(val)) {
+      return val.map((item, idx) => validateAndSort(item, `${path}[${idx}]`));
+    }
+    if (val !== null && typeof val === 'object') {
+      const sorted: Record<string, unknown> = {};
+      const keys = Object.keys(val as Record<string, unknown>).sort();
+      for (const key of keys) {
+        sorted[key] = validateAndSort((val as Record<string, unknown>)[key], `${path}.${key}`);
+      }
+      return sorted;
+    }
+    return val;
+  }
+
+  const sorted = validateAndSort(value);
+  const serialized = JSON.stringify(sorted);
+
+  // Round-trip verification: parsing and re-serializing must produce identical output
+  const reparsed = JSON.parse(serialized);
+  const reSerialized = JSON.stringify(validateAndSort(reparsed));
+  if (serialized !== reSerialized) {
+    throw new Error('canonicalJsonStrict: round-trip serialization mismatch');
+  }
+
+  return serialized;
+}
+
 /** Canonical bytes for a JSON document. Hash and upload these exact bytes. */
 export function canonicalBytes(value: unknown): Buffer {
   return Buffer.from(canonicalJson(value), 'utf8');
+}
+
+export function canonicalBytesStrict(value: unknown): Buffer {
+  return Buffer.from(canonicalJsonStrict(value), 'utf8');
 }
 
 export function sha256Hex(bytes: Uint8Array | string): string {

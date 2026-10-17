@@ -137,6 +137,7 @@ model Market {
   updatedAt          DateTime           @updatedAt
 
   generationJob MarketGenerationJob? @relation("MarketGenerationJobMarket")
+  generationRun MarketGenerationRun?
 
   trades         Trade[]
   positions      Position[]
@@ -242,15 +243,18 @@ model ReasoningTrace {
   /// reasoning-registry u64 trace id.
   onChainTraceId      BigInt?   @unique
   publishTxHash       String?
-  verified            Boolean   @default(false)
-  isPublic            Boolean   @default(false)
-  previewSources      Json?     // First 2 sources (free preview)
-  createdAt           DateTime  @default(now())
-  updatedAt           DateTime  @updatedAt
+  verified            Boolean          @default(false)
+  isPublic            Boolean          @default(false)
+  previewSources      Json?            // First 2 sources (free preview)
+  contentMode         TraceContentMode @default(PLAINTEXT_LEGACY)
+  plaintextHash       String?          @db.VarChar(64)
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
 
   market        Market         @relation(fields: [marketId], references: [id], onDelete: Cascade)
   copyTrades    CopyTrade[]
   subscriptions Subscription[]
+  traceKey      TraceKey?
 
   @@index([marketId])
   @@index([ipfsCid])
@@ -413,3 +417,112 @@ model SpendingAllowance {
   @@index([userId])
   @@map("spending_allowances")
 }
+
+enum GenerationRunState {
+  STARTED
+  SIGNALS_READY
+  PROPOSED
+  MARKET_PERSISTED
+  QUESTION_PINNED
+  CHAIN_SUBMITTED
+  CHAIN_CONFIRMED
+  TRACE_PERSISTED
+  TRACE_PINNED
+  TRACE_PUBLISHED
+  COMPLETED
+  SKIPPED
+  NEEDS_ATTENTION
+  CANCELLED
+}
+
+model MarketGenerationRun {
+  id            String             @id @default(uuid())
+  trigger       String             // 'cron' | 'admin' | 'resume'
+  state         GenerationRunState @default(STARTED)
+  attempts      Int                @default(0)
+  nextAttemptAt DateTime?
+  lockedBy      String?
+  lockedUntil   DateTime?
+  inputs        Json?              // signals snapshot ids, proposal
+  outputs       Json               @default("{}") // { questionCid, questionHash, resolutionHash, chainTxHash, onChainMarketId, traceId, traceCid, traceHash, traceTxHash, onChainTraceId }
+  marketId      String?            @unique
+  lastError     Json?
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+
+  market Market? @relation(fields: [marketId], references: [id], onDelete: SetNull)
+
+  @@index([state, nextAttemptAt])
+  @@map("market_generation_runs")
+}
+
+enum TraceContentMode {
+  PLAINTEXT_LEGACY
+  ENCRYPTED
+}
+
+model TraceKey {
+  traceId       String   @id
+  kid           String
+  wrappedKey    Bytes
+  plaintextHash String   @db.VarChar(64)
+  createdAt     DateTime @default(now())
+
+  trace ReasoningTrace @relation(fields: [traceId], references: [id], onDelete: Cascade)
+
+  @@map("trace_keys")
+}
+
+model WalletPosition {
+  wallet           String
+  onChainMarketId  BigInt
+  outcome          String     // 'Yes' | 'No'
+  shares           Decimal    @default(0) @db.Decimal(39, 0)
+  costBasis        Decimal    @default(0) @db.Decimal(39, 0)
+  realizedPnl      Decimal    @default(0) @db.Decimal(39, 0)
+  boughtCollateral Decimal    @default(0) @db.Decimal(39, 0)
+  soldCollateral   Decimal    @default(0) @db.Decimal(39, 0)
+  feesPaid         Decimal    @default(0) @db.Decimal(39, 0)
+  redeemed         Decimal    @default(0) @db.Decimal(39, 0)
+  tradeCount       Int        @default(0)
+  lastEventId      String     @default("")
+  settled          Boolean    @default(false)
+  incomplete       Boolean    @default(false)
+  updatedAt        DateTime   @updatedAt
+
+  @@id([wallet, onChainMarketId, outcome])
+  @@index([onChainMarketId])
+  @@map("wallet_positions")
+}
+
+model WalletStatsDaily {
+  wallet      String
+  day         DateTime @db.Date
+  category    String
+  volume      Decimal  @default(0) @db.Decimal(39, 0)
+  realizedPnl Decimal  @default(0) @db.Decimal(39, 0)
+  fees        Decimal  @default(0) @db.Decimal(39, 0)
+  trades      Int      @default(0)
+  wins        Int      @default(0)
+  losses      Int      @default(0)
+
+  @@id([wallet, day, category])
+  @@index([day])
+  @@map("wallet_stats_daily")
+}
+
+model WalletEventApplied {
+  eventId   String   @id
+  appliedAt DateTime @default(now())
+
+  @@map("wallet_events_applied")
+}
+
+model WalletPnlDirtyMarket {
+  onChainMarketId BigInt   @id
+  dirtiedAt       DateTime @default(now())
+  reason          String?
+
+  @@map("wallet_pnl_dirty_markets")
+}
+

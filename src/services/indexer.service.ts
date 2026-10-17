@@ -21,6 +21,7 @@ import { logger } from '../lib/logger';
 import { readClients, rpcServer } from './stellar/clients';
 import { printable } from './chain.service';
 import { priceYesBps } from '../generated/fpmm';
+import { applyWalletEvent } from './wallet-pnl.service';
 
 export type EventSource = Pick<rpc.Server, 'getEvents' | 'getHealth'>;
 
@@ -102,6 +103,17 @@ const outcomeTag = (o: unknown): 'Yes' | 'No' | null =>
 
 async function applySideEffects(event: DecodedEvent, emit: IndexerDeps['emit']): Promise<void> {
   const p = event.params;
+
+  if (
+    event.contractName === 'marketCore' &&
+    ['MarketCreated', 'Trade', 'Redeemed', 'MarketResolved'].includes(event.eventName)
+  ) {
+    try {
+      await applyWalletEvent(event);
+    } catch (err: any) {
+      logger.error({ err, eventId: event.id }, 'Error applying wallet event');
+    }
+  }
 
   if (event.contractName === 'marketCore' && event.eventName === 'Trade') {
     const onChainMarketId = BigInt(p.market_id);

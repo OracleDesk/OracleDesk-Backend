@@ -7,6 +7,7 @@ import { prisma } from './lib/prisma';
 import { startIngestionCron } from './cron/ingestion.cron';
 import { startMonitorCron } from './cron/monitor.cron';
 import { startEventListener } from './services/indexer.service';
+import { resumeIncomplete } from './services/market-saga.service';
 import { closeRedis } from './lib/redis';
 
 let stopEventListener: (() => void) | null = null;
@@ -41,7 +42,12 @@ async function bootstrap(): Promise<void> {
   // 3. Index Stellar events (resumes from the stored ledger cursor)
   stopEventListener = startEventListener((event, payload) => io.emit(event, payload));
 
-  // 4. Start cron jobs
+  // 4. Resume any incomplete sagas from previous runs
+  resumeIncomplete().catch((err) =>
+    logger.warn({ err }, 'Error during boot saga recovery'),
+  );
+
+  // 5. Start cron jobs
   startIngestionCron();
   startMonitorCron();
 

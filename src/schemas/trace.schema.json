@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://api.oracledesk.io/api/v1/schemas/trace/v1.json",
+  "title": "OracleDesk Reasoning Trace v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "kind",
+    "traceId",
+    "agentType",
+    "decisionType",
+    "action",
+    "market",
+    "probabilityEstimate",
+    "marketProbability",
+    "edge",
+    "confidenceInterval",
+    "sourcesUsed",
+    "betFraction",
+    "betSizeUsdc",
+    "hedgeConditions",
+    "agentWallet",
+    "createdAt"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "kind": {
+      "const": "oracledesk.trace"
+    },
+    "traceId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "agentType": {
+      "type": "string",
+      "enum": ["MARKET_MAKER", "TRADER"]
+    },
+    "decisionType": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "action": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "market": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backendId", "onChainId"],
+      "properties": {
+        "backendId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "onChainId": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9]+$"
+        }
+      }
+    },
+    "probabilityEstimate": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "marketProbability": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "edge": {
+      "type": "number",
+      "minimum": -1,
+      "maximum": 1
+    },
+    "confidenceInterval": {
+      "type": "object",
+      "description": "lower must be <= upper",
+      "additionalProperties": false,
+      "required": ["lower", "upper"],
+      "properties": {
+        "lower": {
+          "type": "number"
+        },
+        "upper": {
+          "type": "number"
+        }
+      }
+    },
+    "sourcesUsed": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "weight", "signal", "rawValue"],
+        "properties": {
+          "source": {
+            "type": "string"
+          },
+          "weight": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "signal": {
+            "type": "string"
+          },
+          "rawValue": {
+            "type": ["number", "null"]
+          }
+        }
+      }
+    },
+    "betFraction": {
+      "type": ["number", "null"]
+    },
+    "betSizeUsdc": {
+      "type": ["number", "null"]
+    },
+    "hedgeConditions": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "string",
+        "maxLength": 500
+      }
+    },
+    "agentWallet": {
+      "type": ["string", "null"]
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

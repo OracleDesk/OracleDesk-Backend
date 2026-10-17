@@ -1,12 +1,4 @@
-import { aggregateSignals } from '../services/ingestion.service';
-import {
-  generateMarketQuestion,
-  isDuplicateMarket,
-  createMarketFromProposal,
-} from '../services/market.service';
-import { generateReasoningTrace } from '../services/reasoning.service';
-import { createMarketOnChain } from '../services/market-chain.service';
-import { pinAndPublishTrace } from '../services/trace-publish.service';
+import { startRun, advance } from '../services/market-saga.service';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 
@@ -20,105 +12,53 @@ export interface MarketCycleResult {
 
 /**
  * Market Maker Agent — main execution loop.
- *
- * Called by the ingestion cron every 15 minutes AND manually via
- * POST /markets/generate. Returns market details on success so the
- * job tracker can surface them in GET /markets/generation-status/:jobId.
- *
- * Returns null when the cycle is intentionally skipped (no signals,
- * duplicate detected, etc.) — not an error condition.
+ * Runs via the market-maker saga state machine.
  */
-export async function runMarketMakerCycle(): Promise<MarketCycleResult | null> {
-  logger.info('Market Maker Agent: starting cycle');
+export async function runMarketMakerCycle(
+  trigger: 'cron' | 'admin' = 'cron',
+): Promise<MarketCycleResult | null> {
+  logger.info({ trigger }, 'Market Maker Agent: starting cycle via saga');
 
   try {
-    // Step 1: Aggregate signals from all sources
-    const signals = await aggregateSignals();
-    if (signals.signalCount === 0) {
-      logger.warn('Market Maker Agent: no signals available — skipping cycle');
+    const runId = await startRun(trigger);
+    const run = await advance(runId, { maxSteps: 50 });
+
+    if (run.state === 'SKIPPED') {
       return null;
     }
 
-    // Step 2: Generate market proposal via the LLM
-    let proposal;
-    try {
-      proposal = await generateMarketQuestion(signals);
-    } catch (err) {
-      logger.error({ err }, 'Market Maker Agent: market generation failed');
-      return null;
-    }
-
-    // Step 3: Deduplicate
-    const isDuplicate = await isDuplicateMarket(proposal.market_question);
-    if (isDuplicate) {
-      logger.info({ question: proposal.market_question },
-        'Market Maker Agent: duplicate market — skipping');
-      return null;
-    }
-
-    // Step 4: Persist market to DB (PENDING until it exists on-chain)
-    const market = await createMarketFromProposal(proposal);
-    logger.info({ marketId: market.id, category: market.category }, 'Market Maker Agent: market created in DB');
-
-    // Step 5: Commit the resolution spec and create the market through the
-    // treasury. dry-run simulates; the market then stays PENDING.
-    let onChainMarketId: bigint | null = null;
-    try {
-      const result = await createMarketOnChain(market);
-      if (result.mode === 'live') onChainMarketId = result.value;
-    } catch (err) {
-      logger.error({ err, marketId: market.id }, 'Market Maker Agent: on-chain creation failed; market stays PENDING');
-    }
-
-    // Step 6: Reasoning trace for the creation decision
-    const { trace, tracePayload } = await generateReasoningTrace({
-      marketId:            market.id,
-      agentType:           'MARKET_MAKER',
-      decisionType:        'MARKET_CREATION',
-      sourcesUsed:         signals.news.slice(0, 3).map(s => ({
-        source:   s.source,
-        weight:   0.7,
-        signal:   s.title,
-        rawValue: proposal.initial_yes_probability,
-      })),
-      probabilityEstimate: proposal.initial_yes_probability,
-      marketProbability:   0.5,
-      edge:                proposal.initial_yes_probability - 0.5,
-      confidenceInterval:  proposal.confidence_interval,
-    });
-
-    // Step 7: Pin the trace and publish its hash to reasoning-registry
-    try {
-      await pinAndPublishTrace({
-        traceId: trace.id,
-        payload: { ...tracePayload, onChainMarketId: onChainMarketId?.toString() ?? null },
-        action: 'create_market',
-        onChainMarketId,
+    if (run.marketId) {
+      const market = await prisma.market.findUnique({
+        where: { id: run.marketId },
       });
-    } catch (err) {
-      logger.error({ err, traceId: trace.id }, 'Market Maker Agent: trace pin/publish failed');
+      if (market) {
+        const outputs = (run.outputs as any) || {};
+        return {
+          marketId: market.id,
+          question: market.question,
+          category: String(market.category),
+          onChainMarketId:
+            outputs.onChainMarketId ??
+            (market.onChainMarketId ? market.onChainMarketId.toString() : null),
+        };
+      }
     }
 
-    logger.info({ marketId: market.id, traceId: trace.id }, 'Market Maker Agent: cycle complete');
-
-    return {
-      marketId: market.id,
-      question: market.question,
-      category: String(market.category),
-      onChainMarketId: onChainMarketId?.toString() ?? null,
-    };
+    return null;
   } catch (err) {
     logger.error({ err }, 'Market Maker Agent: unhandled cycle error');
 
-    await prisma.agentLog.create({
-      data: {
-        agentType: 'MARKET_MAKER',
-        level:     'ERROR',
-        action:    'CYCLE_FAILED',
-        error:     String(err),
-      },
-    }).catch(() => {});
+    await prisma.agentLog
+      .create({
+        data: {
+          agentType: 'MARKET_MAKER',
+          level: 'ERROR',
+          action: 'CYCLE_FAILED',
+          error: String(err),
+        },
+      })
+      .catch(() => {});
 
-    throw err; // Re-throw so the job tracker records FAILED status
+    throw err;
   }
 }

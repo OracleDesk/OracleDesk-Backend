@@ -62,3 +62,22 @@ duplicate it, but today the adapter:
 If dry-run simulated (and returned the simulated result), the bindings were
 injectable, and `agentSell` existed, `src/services/chain.service.ts` here
 could become a thin wrapper around it. Its method names already match.
+
+## 6. Adopt versioned reasoning trace schemas
+
+The contracts repo (`agents/core/trace.ts`) currently defines a `ReasoningTrace` shape without versioning:
+`{ agent: 'market-maker'|'trader', marketId: number|null, action, reasoning, inputs, timestamp: unix seconds }`.
+The backend publishes versioned traces using `schemaVersion: 1` and `kind: 'oracledesk.trace'` (`docs/trace-format.md`), validating against a published JSON Schema 2020-12 at `https://api.oracledesk.io/api/v1/schemas/trace/v1.json`.
+We request that the contracts repo:
+- Adopt the `schemaVersion: 1` / `kind: 'oracledesk.trace'` envelope or publish its own formal JSON Schema.
+- Use explicit `null` for optional fields to preserve canonical JSON byte stability.
+
+## 7. x402 integration for confidential traces
+
+When `TRACE_CONFIDENTIAL=true`, premium reasoning traces pinned to IPFS are sealed inside an authenticated encrypted envelope (`oracledesk.trace.enc` v1).
+The contracts repo's x402 trace API (`x402/trace-api.ts`) should:
+- Detect `kind === 'oracledesk.trace.enc'`.
+- After payment verification, call the backend's internal key release endpoint:
+  `POST /internal/traces/:onChainTraceId/key` with shared HMAC authentication (`X402_KEY_RELEASE_SECRET`), timestamp, and nonce replay protection.
+- Decrypt the envelope using the retrieved data key and verify `sha256(plaintext) === envelope.plaintextHash` before returning the content to the paying user.
+

@@ -1,9 +1,13 @@
 import type { Request, Response } from 'express';
+import crypto from 'node:crypto';
 import { z } from 'zod';
+import { config } from '../config';
 import { prisma } from '../lib/prisma';
 import { sendSuccess, sendError, parsePagination, buildPaginationMeta } from '../utils/response.util';
 import { verifyTraceOnChain } from '../services/trace-publish.service';
+import { unwrapKey } from '../services/trace-crypto.service';
 import {
+  checkAccess,
   getTracWithAccessControl,
   getSpendingAllowance,
   listPaymentEvents,
@@ -186,4 +190,126 @@ export async function getMyPaymentEvents(req: Request, res: Response): Promise<v
 
   const payments = await listPaymentEvents(req.user.userId);
   sendSuccess(res, payments);
+}
+
+const usedNonces = new Set<string>();
+
+/**
+ * GET /traces/:id/key
+ * Returns decryption key for entitled users (daily pass / subscription).
+ */
+export async function getTraceKey(req: Request, res: Response): Promise<void> {
+  if (!req.user) {
+    sendError(res, 401, 'UNAUTHORIZED', 'Authentication required');
+    return;
+  }
+
+  const traceId = String(req.params.id);
+  const access = await checkAccess(req.user.userId, traceId);
+  if (!access.hasAccess) {
+    sendError(res, 403, 'FORBIDDEN', 'Active pass or subscription required to access trace key');
+    return;
+  }
+
+  const traceKey = await prisma.traceKey.findUnique({
+    where: { traceId },
+  });
+
+  if (!traceKey) {
+    sendError(res, 404, 'TRACE_KEY_NOT_FOUND', 'No encryption key found for this trace');
+    return;
+  }
+
+  const dataKey = unwrapKey(traceKey.wrappedKey, traceKey.kid);
+
+  await prisma.agentLog.create({
+    data: {
+      agentType: 'SUBSCRIPTION',
+      action: 'TRACE_KEY_RELEASED',
+      details: { traceId, userId: req.user.userId, kid: traceKey.kid },
+    },
+  });
+
+  sendSuccess(res, {
+    kid: traceKey.kid,
+    dataKey: dataKey.toString('base64'),
+    plaintextHash: traceKey.plaintextHash,
+  });
+}
+
+/**
+ * POST /internal/traces/:onChainTraceId/key
+ * Secure x402 trace key release with shared HMAC and replay protection.
+ */
+export async function releaseTraceKeyInternal(req: Request, res: Response): Promise<void> {
+  const secret = config.X402_KEY_RELEASE_SECRET;
+  if (!secret) {
+    sendError(res, 503, 'FEATURE_DISABLED', 'Internal key release is not configured');
+    return;
+  }
+
+  const signature = req.headers['x-signature'] as string;
+  const timestamp = req.headers['x-timestamp'] as string;
+  const nonce = req.headers['x-nonce'] as string;
+
+  if (!signature || !timestamp || !nonce) {
+    sendError(res, 401, 'UNAUTHORIZED', 'Missing authentication headers (x-signature, x-timestamp, x-nonce required)');
+    return;
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const ts = parseInt(timestamp, 10);
+  if (isNaN(ts) || Math.abs(now - ts) > 300) {
+    sendError(res, 401, 'EXPIRED_REQUEST', 'Request timestamp is outside the allowed window');
+    return;
+  }
+
+  if (usedNonces.has(nonce)) {
+    sendError(res, 401, 'REPLAYED_NONCE', 'Nonce has already been used');
+    return;
+  }
+  usedNonces.add(nonce);
+  if (usedNonces.size > 10000) {
+    usedNonces.clear();
+  }
+
+  const onChainTraceId = String(req.params.onChainTraceId);
+  const expectedSig = crypto
+    .createHmac('sha256', secret)
+    .update(`${timestamp}:${nonce}:${onChainTraceId}`)
+    .digest('hex');
+
+  if (signature.toLowerCase() !== expectedSig.toLowerCase()) {
+    sendError(res, 401, 'INVALID_SIGNATURE', 'HMAC signature verification failed');
+    return;
+  }
+
+  let onChainBigInt: bigint;
+  try {
+    onChainBigInt = BigInt(onChainTraceId);
+  } catch {
+    sendError(res, 400, 'INVALID_TRACE_ID', 'Invalid onChainTraceId format');
+    return;
+  }
+
+  const trace = await prisma.reasoningTrace.findFirst({
+    where: { onChainTraceId: onChainBigInt },
+    include: { traceKeys: true },
+  });
+
+  if (!trace || !trace.traceKeys) {
+    sendError(res, 404, 'TRACE_NOT_FOUND', 'Trace or encryption key not found');
+    return;
+  }
+
+  const traceKey = trace.traceKeys;
+  const dataKey = unwrapKey(traceKey.wrappedKey, traceKey.kid);
+
+  sendSuccess(res, {
+    onChainTraceId,
+    traceId: trace.id,
+    kid: traceKey.kid,
+    dataKey: dataKey.toString('base64'),
+    plaintextHash: traceKey.plaintextHash,
+  });
 }

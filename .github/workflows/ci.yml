@@ -51,6 +51,9 @@ jobs:
       - name: Generated contract code matches the submodule
         run: npm run check:contracts
 
+      - name: JSON schemas match source definitions
+        run: npm run check:schemas
+
       - run: npx prisma generate
       - run: npx prisma migrate deploy
       - run: npm run build
