@@ -569,6 +569,113 @@ Emitted when the indexer stores a reasoning-registry publish event.
 }
 ```
 
+## Webhooks
+
+Signed, server-to-server push for integrators who can't hold a socket open.
+Delivery is **at-least-once**: deduplicate on `OracleDesk-Event-Id`.
+
+### Event types
+
+| Type | When | `data` |
+|---|---|---|
+| `market.created` | market-core `MarketCreated` indexed | `{ onChainMarketId, marketId, creator, category, closeTime, seedAmountRaw, initialYesBps, txHash, ledger }` (`category` is the contract tag: `Macro`, `Geopolitics`, `Crypto`, `Sports`, `Culture`) |
+| `trade.executed` | market-core `Trade` indexed | identical to the `TRADE_EXECUTED` socket payload |
+| `market.resolved` | market-core `MarketResolved` indexed | `{ onChainMarketId, marketId, outcome: "Yes"\|"No"\|null, voided, resolvedAt, txHash, ledger }` |
+| `trace.published` | reasoning-registry `TracePublished` indexed | identical to the `REASONING_PUBLISHED` socket payload |
+
+Each event is produced once per chain event (id `"<type>:<chain event id>"`),
+so re-indexing the same ledgers never sends duplicates.
+
+### Endpoints
+
+All require `Authorization: Bearer <jwt>` and only see the caller's own subscriptions.
+
+| Method & path | Body / query | Response |
+|---|---|---|
+| `POST /webhooks` | `{ url, eventTypes[], onChainMarketIds?: string[], categories?: MarketCategory[] }` | `201` subscription **plus `secret` (shown once)**. Max 10 per user (`409 WEBHOOK_LIMIT`); unsafe URLs → `400 INVALID_WEBHOOK_URL`. |
+| `GET /webhooks` | | subscriptions (never the secret) |
+| `GET /webhooks/:id` | | subscription |
+| `PATCH /webhooks/:id` | any of `url`, `eventTypes`, `onChainMarketIds`, `categories`, `status` | `status: "ACTIVE"` re-enables a disabled subscription and resets its failure counters |
+| `DELETE /webhooks/:id` | | `{ deleted: true }` |
+| `POST /webhooks/:id/rotate-secret` | | `{ id, secret }` (new secret, shown once) |
+| `GET /webhooks/:id/deliveries` | `?status=PENDING\|SUCCEEDED\|DEAD&page=&limit=` | delivery log: `attempts`, `lastStatusCode`, `lastError`, `nextAttemptAt`, `eventType` |
+| `POST /webhooks/:id/deliveries/:deliveryId/redeliver` | | requeues now with a fresh retry budget |
+
+Empty `onChainMarketIds` / `categories` match everything. A category filter
+only matches events whose market is known to the backend.
+
+### Request
+
+```http
+POST <your url>
+Content-Type: application/json
+User-Agent: OracleDesk-Webhooks/1
+OracleDesk-Event-Id: trade.executed:0004951600-0000000001
+OracleDesk-Event-Type: trade.executed
+OracleDesk-Signature: t=1760000000,v1=5257a869e7ec…
+
+{"createdAt":"2026-10-17T12:00:00.000Z","data":{…},"id":"trade.executed:0004951600-0000000001","type":"trade.executed"}
+```
+
+Any `2xx` is success. Everything else (including `3xx`; redirects are never
+followed) is a failure.
+
+### Verifying signatures
+
+`v1 = hex(HMAC_SHA256(secret, t + "." + rawBody))`. Verify against the **raw
+request bytes** (don't re-serialise the JSON) and reject timestamps older
+than 5 minutes. During the 24 h after a secret rotation the header carries two
+`v1=` values (new and old secret); accept if any matches.
+
+```js
+// Node
+const crypto = require('crypto');
+function verify(rawBody, header, secret, toleranceSec = 300) {
+  const parts = header.split(',');
+  const t = Number(parts.find((p) => p.startsWith('t='))?.slice(2));
+  if (!t || Math.abs(Date.now() / 1000 - t) > toleranceSec) return false;
+  const expected = crypto.createHmac('sha256', secret).update(`${t}.`).update(rawBody).digest();
+  return parts.filter((p) => p.startsWith('v1=')).some((p) => {
+    const sig = Buffer.from(p.slice(3), 'hex');
+    return sig.length === expected.length && crypto.timingSafeEqual(sig, expected);
+  });
+}
+```
+
+```python
+# Python
+import hashlib, hmac, time
+def verify(raw_body: bytes, header: str, secret: str, tolerance=300) -> bool:
+    parts = header.split(",")
+    t = next((p[2:] for p in parts if p.startswith("t=")), None)
+    if not t or abs(time.time() - int(t)) > tolerance:
+        return False
+    expected = hmac.new(secret.encode(), f"{t}.".encode() + raw_body, hashlib.sha256).hexdigest()
+    return any(hmac.compare_digest(p[3:], expected) for p in parts if p.startswith("v1="))
+```
+
+### Retries, ordering and disabling
+
+- **Backoff:** 1 min, doubling per attempt, capped at 24 h, ±20% jitter. A `Retry-After` header (seconds or HTTP date) is honoured when it is longer. After **15 attempts** a delivery is dead-lettered (`DEAD`) and the next one proceeds.
+- **Ordering:** per subscription, deliveries are sent one at a time in event order, so a down receiver only delays its own queue.
+- **Timeouts:** 10 s per attempt; at most 64 KB of the response is read.
+- **Auto-disable:** after 50 consecutive failed deliveries, or 5 days of continuous failure, the subscription is `DISABLED` with a `disabledReason`. Fix the endpoint, then `PATCH { "status": "ACTIVE" }`.
+- **Retention:** delivered and dead deliveries are pruned after 30 days.
+
+### URL rules (SSRF protection)
+
+- `https://` only (`http://` only outside production with `WEBHOOKS_ALLOW_HTTP=true`); no credentials in the URL; ports 443/8443 only in production.
+- The host is resolved and rejected if **any** address is private, loopback, link-local, cloud-metadata, CGNAT, multicast or reserved (IPv4, IPv6 and IPv4-mapped IPv6; numeric aliases like `2130706433` or `0x7f.1` are normalised first).
+- Checked at create/update **and before every delivery**. The connection is pinned to the validated IP, so DNS rebinding can't redirect it.
+
+### Configuration
+
+| Variable | Default | Notes |
+|---|---|---|
+| `WEBHOOKS_ENABLED` | `true` | `false` stops enqueueing and the delivery worker |
+| `WEBHOOK_SECRET_KEY` | ephemeral | 32 bytes, base64 (`openssl rand -base64 32`). Encrypts signing secrets at rest (AES-256-GCM). **Required in production** when webhooks are enabled. |
+| `WEBHOOKS_ALLOW_HTTP` | `false` | Allow `http://` URLs for local receivers. Rejected in production. |
+
 ## Frontend call map
 
 Every call in the frontend's `lib/api/*.ts` and where it lands:
