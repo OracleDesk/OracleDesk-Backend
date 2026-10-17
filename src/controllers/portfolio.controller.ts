@@ -3,7 +3,7 @@ import { prisma } from '../lib/prisma';
 import { sendSuccess, parsePagination, buildPaginationMeta } from '../utils/response.util';
 import { getPortfolioSummary } from '../services/portfolio.service';
 import { getPortfolioCorrelations } from '../services/correlation.service';
-import { treasuryAvailableCapital } from '../services/chain.service';
+import { treasuryAvailableCapitalCached } from '../services/chain.service';
 import { logger } from '../lib/logger';
 
 /**
@@ -13,21 +13,27 @@ import { logger } from '../lib/logger';
  *   openPositions count, totalPnl, dailyPnl, builderFeesEarned
  */
 export async function getPortfolio(req: Request, res: Response): Promise<void> {
-  const [summary, correlations, availableCapitalRaw] = await Promise.all([
+  const [summary, correlations, capRes] = await Promise.all([
     getPortfolioSummary(),
     getPortfolioCorrelations(10_000),
-    treasuryAvailableCapital(req.signal)
-      .then((v) => v.toString())
+    treasuryAvailableCapitalCached(req.signal)
+      .then((res) => ({ raw: res.value.toString(), ledger: res.ledger }))
       .catch((err) => {
         logger.warn({ err: err instanceof Error ? err.message : err }, 'treasury.available_capital read failed');
-        return null;
+        return { raw: null, ledger: null };
       }),
   ]);
 
   const latestReport = await prisma.transparencyReport
     .findFirst({ orderBy: { date: 'desc' }, select: { date: true, anchorLedger: true, cid: true, hash: true, onChainTraceId: true, mode: true, consistency: true } })
     .catch(() => null);
-  sendSuccess(res, { ...summary, correlationRisk: correlations, availableCapitalRaw, latestReport });
+  sendSuccess(res, {
+    ...summary,
+    correlationRisk: correlations,
+    availableCapitalRaw: capRes.raw,
+    availableCapitalLedger: capRes.ledger,
+    latestReport,
+  });
 }
 
 /**

@@ -10,7 +10,7 @@ import { runMarketMakerCycle } from '../agents/market-maker.agent';
 import { generateMarketSchema, listMarketsSchema } from '../validators/market.validator';
 import { toContractCategory } from '../lib/categories';
 import { parseU64 } from '../lib/amounts';
-import { getOnChainMarket, printable } from '../services/chain.service';
+import { getOnChainMarketCached, printable } from '../services/chain.service';
 import { marketStatusView } from '../services/oracle.service';
 import { priceYesBps } from '../generated/fpmm';
 import {
@@ -57,6 +57,21 @@ function pruneJobTracker(): void {
   }
 }
 
+export function buildMarketsWhere(query: {
+  status?: string;
+  category?: string;
+  currency?: string;
+  onChain?: string;
+}): Prisma.MarketWhereInput {
+  return {
+    ...(query.status ? { status: query.status as MarketStatus } : {}),
+    ...(query.category ? { category: query.category as MarketCategory } : {}),
+    ...(query.currency ? { settlementCurrency: query.currency as SettlementCurrency } : {}),
+    ...(query.onChain === 'true' ? { onChainMarketId: { not: null } } : {}),
+    ...(query.onChain === 'false' ? { onChainMarketId: null } : {}),
+  };
+}
+
 /**
  * GET /markets
  * Returns a paginated list of prediction markets.
@@ -96,25 +111,7 @@ export async function listMarkets(
     limit: l,
   });
 
-  const where: Prisma.MarketWhereInput = {
-  ...(status
-    ? { status: status as MarketStatus }
-    : {}),
-
-  ...(category
-    ? { category: category as MarketCategory }
-    : {}),
-
-  ...(currency
-    ? {
-        settlementCurrency:
-          currency as SettlementCurrency,
-      }
-    : {}),
-
-  ...(onChain === 'true' ? { onChainMarketId: { not: null } } : {}),
-  ...(onChain === 'false' ? { onChainMarketId: null } : {}),
-};
+  const where = buildMarketsWhere(parsed.data.query);
 
   const [markets, total] = await Promise.all([
     prisma.market.findMany({
@@ -407,12 +404,15 @@ export async function getOnChainMarketState(req: Request, res: Response): Promis
     sendError(res, 400, 'INVALID_MARKET_ID', 'onChainMarketId must be a decimal u64');
     return;
   }
-  const market = await getOnChainMarket(onChainMarketId, req.signal);
+  const result = await getOnChainMarketCached(onChainMarketId, req.signal);
+  const market = result.value;
   sendSuccess(res, {
     onChainMarketId: raw,
     ...(printable({ ...market, status: undefined, category: market.category.tag }) as object),
     status: marketStatusView(market.status),
     yesBps: Number(priceYesBps(market.reserve_yes, market.reserve_no)),
     source: 'chain',
+    ledger: result.ledger,
+    cached: result.cached,
   });
 }

@@ -10,11 +10,38 @@ import { startMonitorCron } from './cron/monitor.cron';
 import { startTraceAuditCron } from './cron/trace-audit.cron';
 import { startTracePublicationCron } from './cron/trace-publication.cron';
 import { startEventListener } from './services/indexer.service';
-import { closeRedis } from './lib/redis';
+import { getRedis, closeRedis } from './lib/redis';
 import { health } from './services/health.service';
+import {
+  clientIp,
+  isAllowedOrigin,
+  redisConnectionLimiter,
+  inboundEventLimiter,
+  recordSocketRejection,
+} from './lib/socket-limits';
+import { SocketThrottle, attachSlowConsumerGuard } from './lib/socket-throttle';
 
 let stopEventListener: (() => void) | null = null;
 let stopSecretRefresh: (() => void) | null = null;
+let throttle: SocketThrottle | null = null;
+let stopSlowGuard: (() => void) | null = null;
+
+const rejectionLogState = new Map<string, { count: number; lastLog: number }>();
+function logSocketRejection(reason: string, details: Record<string, unknown> = {}): void {
+  recordSocketRejection(reason);
+  const now = Date.now();
+  let state = rejectionLogState.get(reason);
+  if (!state) {
+    state = { count: 0, lastLog: 0 };
+    rejectionLogState.set(reason, state);
+  }
+  state.count++;
+  if (now - state.lastLog >= 10_000) {
+    logger.warn({ reason, count: state.count, ...details }, `Socket connection rejected (${reason})`);
+    state.count = 0;
+    state.lastLog = now;
+  }
+}
 
 async function bootstrap(): Promise<void> {
   // 0. Resolve secrets (mounted files or the configured remote provider).
@@ -43,31 +70,119 @@ async function bootstrap(): Promise<void> {
   }
   logger.info({ mode: config.CHAIN_EXECUTION_MODE }, 'Chain execution mode');
 
-  // 2. Start HTTP server with Socket.io
+  // 2. Start HTTP server with hardened Socket.io
   const server = http.createServer(app);
   const io = new Server(server, {
+    transports: config.SOCKET_TRANSPORTS as any,
+    maxHttpBufferSize: config.SOCKET_MAX_BUFFER_BYTES,
+    pingInterval: 25_000,
+    pingTimeout: 20_000,
+    connectTimeout: 10_000,
+    perMessageDeflate: false,
     cors: {
-      origin: config.CORS_ORIGINS,
+      origin: (origin, callback) => callback(null, isAllowedOrigin(origin)),
       methods: ['GET', 'POST'],
+      credentials: true,
+    },
+    allowRequest: (req, callback) => {
+      const origin = req.headers.origin;
+      if (origin && !isAllowedOrigin(origin)) {
+        logSocketRejection('ORIGIN', { origin });
+        return callback('ORIGIN_NOT_ALLOWED', false);
+      }
+      callback(null, true);
     },
   });
 
+  const limiter = redisConnectionLimiter(getRedis(), {
+    maxConnections: config.SOCKET_MAX_CONNECTIONS,
+    maxPerIp: config.SOCKET_MAX_PER_IP,
+    connectRatePerMin: config.SOCKET_CONNECT_RATE_PER_MIN,
+    exemptCidrs: config.SOCKET_IP_EXEMPT_CIDRS,
+  });
+
+  io.engine.on('connection_error', (err: any) => {
+    const origin = err.req?.headers?.origin;
+    if (origin && !isAllowedOrigin(origin)) {
+      logSocketRejection('ORIGIN', { origin });
+    } else {
+      logSocketRejection(err.message || 'HANDSHAKE_ERROR', { code: err.code });
+    }
+  });
+
+  io.use(async (socket, next) => {
+    const ip = clientIp(socket.request, config.TRUSTED_PROXIES);
+    const result = await limiter.acquire(ip, socket.id);
+    if (!result.ok) {
+      logSocketRejection(result.reason, { ip, socketId: socket.id });
+      return next(Object.assign(new Error('CONNECTION_LIMIT'), { data: { reason: result.reason } }));
+    }
+
+    socket.on('disconnect', () => {
+      limiter.release(ip, socket.id).catch((err) => {
+        logger.error({ err, socketId: socket.id }, 'Error releasing socket connection limit');
+      });
+      if (Math.random() < config.SOCKET_LOG_SAMPLE_RATE) {
+        logger.info({ socketId: socket.id }, 'Client disconnected from socket.io');
+      } else {
+        logger.debug({ socketId: socket.id }, 'Client disconnected from socket.io');
+      }
+    });
+
+    inboundEventLimiter(socket, {
+      eventsPer10s: config.SOCKET_INBOUND_EVENTS_PER_10S,
+    });
+
+    next();
+  });
+
+  io.on('connection', (socket) => {
+    if (Math.random() < config.SOCKET_LOG_SAMPLE_RATE) {
+      logger.info({ socketId: socket.id }, 'New client connected to socket.io');
+    } else {
+      logger.debug({ socketId: socket.id }, 'New client connected to socket.io');
+    }
+  });
+
+  // Slow consumer guard (Issue #96)
+  const slowGuard = attachSlowConsumerGuard(io, {
+    warnBytes: config.SOCKET_SLOW_WARN_BYTES,
+    dropBytes: config.SOCKET_SLOW_DROP_BYTES,
+    checkMs: config.SOCKET_SLOW_CHECK_MS,
+  });
+  stopSlowGuard = slowGuard.stop;
+
+  // Socket throttle (Issue #96)
+  throttle = new SocketThrottle(
+    {
+      emit: (event, payload, opts) => {
+        if (opts.room) {
+          const target = io.to(opts.room);
+          if (opts.volatile) target.volatile.emit(event, payload);
+          else target.emit(event, payload);
+        } else {
+          if (opts.volatile) io.volatile.emit(event, payload);
+          else io.emit(event, payload);
+        }
+      },
+    },
+    {
+      priceTickMs: config.SOCKET_PRICE_TICK_MS,
+      tradeVolatile: config.SOCKET_TRADE_VOLATILE,
+      dropHistorical: true,
+    },
+  );
+
   // 3. Index Stellar events (resumes from the stored ledger cursor)
-  stopEventListener = startEventListener((event, payload) => io.emit(event, payload));
+  stopEventListener = startEventListener((event, payload, meta) => {
+    throttle?.handle(event, payload, meta);
+  });
 
   // 4. Start cron jobs
   startIngestionCron();
   startMonitorCron();
   startTraceAuditCron();
   startTracePublicationCron();
-
-  io.on('connection', (socket) => {
-    logger.info({ socketId: socket.id }, 'New client connected to socket.io');
-    
-    socket.on('disconnect', () => {
-      logger.info({ socketId: socket.id }, 'Client disconnected from socket.io');
-    });
-  });
 
   // Make io accessible via app
   app.set('io', io);
@@ -92,6 +207,13 @@ async function bootstrap(): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, config.SHUTDOWN_DRAIN_MS));
     const { triggerShutdown } = await import('./lib/shutdown');
     triggerShutdown();
+
+    if (throttle) {
+      throttle.flush();
+      throttle.stop();
+    }
+    if (stopSlowGuard) stopSlowGuard();
+    io.close();
 
     server.close(async () => {
       if (stopEventListener) stopEventListener();

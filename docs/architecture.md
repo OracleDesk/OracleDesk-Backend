@@ -159,3 +159,25 @@ deterministic throwaway G-addresses.
 Custom-format dumps plus a manifest (migrations, cursor, max ledger, counts)
 and checksums. Restore then replays the chain gap with
 `scripts/post-restore-reconcile.ts`; see the runbook.
+
+## Realtime and WebSocket hardening (#96, #97)
+
+The Socket.io server enforces connection security, buffer limits, and outbound throttling:
+- **Client IP derivation & Proxies:** Client IPs are determined via `clientIp()` by walking `X-Forwarded-For` right-to-left skipping proxies configured in `TRUSTED_PROXIES`. Untrusted direct connections ignore `X-Forwarded-For` to prevent spoofing. IPv4-mapped IPv6 addresses (`::ffff:1.2.3.4`) are normalized.
+- **Connection caps:** Distributed per-IP and global caps are enforced atomically via Redis Lua scripts with local in-memory fallback. `SOCKET_IP_EXEMPT_CIDRS` allows operators to exempt specific NAT or monitoring ranges from per-IP connection limits.
+- **Outbound Throttling & Degraded Mode:** Sockets buffering beyond `SOCKET_SLOW_WARN_BYTES` are removed from the `realtime:full` room and only receive coalesced `MARKET_PRICE` ticks. Sockets buffering beyond `SOCKET_SLOW_DROP_BYTES` are disconnected to prevent heap exhaustion.
+
+## Chain read cache (#98)
+
+Simulations of live contract state (`get_market`, `state`, `available_capital`) are cached in Redis via `src/lib/chain-cache.ts`:
+- **Lossless Codec:** Typed tagged representations preserve `bigint`, `Buffer`/`Uint8Array`, and tagged enum variants across round-trips.
+- **Tag Generation Invalidation:** Invalidation avoids key scans by incrementing generation counters (`chain:gen:<tag>`). Each cached entry records its tags' generations at read time.
+- **Ledger Invalidation & Single-Flight:** Invalidation tracks `chain:minLedger:<tag>`, ensuring simulation results read from older ledgers are never written back over fresher events. Cross-instance single-flight locks prevent stampeding RPC nodes during concurrent cache misses.
+
+## HTTP Caching & Conditional Requests (#99)
+
+The API sets declarative cache policies and strong ETags across all endpoints via `src/middlewares/cache.middleware.ts`:
+- Express's default weak ETag is disabled in favor of strong ETags computed from database row versions, counts, and access classes before running expensive queries.
+- Requests with matching `If-None-Match` are terminated with `304 Not Modified` and skip controller execution.
+- Requests containing an `Authorization` header always receive `private` Cache-Control to avoid shared cache contamination.
+

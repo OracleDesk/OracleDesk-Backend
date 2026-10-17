@@ -194,6 +194,31 @@ const envSchema = z
     // ── Copy Trading (Issue #151) ─────────────────────────────────────────
     COPY_TRADE_TTL_MINUTES: z.string().default('30').transform(Number),
     COPY_TRADE_MAX_PENDING: z.string().default('5').transform(Number),
+
+    // ── Socket.io throttling & slow-consumer guard (Issue #96) ─────────────
+    SOCKET_PRICE_TICK_MS: z.string().default('1000').transform(Number),
+    SOCKET_TRADE_VOLATILE: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
+    SOCKET_LIVE_LEDGER_LAG: z.string().default('12').transform(Number),
+    SOCKET_SLOW_WARN_BYTES: z.string().default('262144').transform(Number),
+    SOCKET_SLOW_DROP_BYTES: z.string().default('2097152').transform(Number),
+    SOCKET_SLOW_CHECK_MS: z.string().default('2000').transform(Number),
+
+    // ── Socket.io hardening & limits (Issue #97) ──────────────────────────
+    SOCKET_MAX_CONNECTIONS: z.string().default('5000').transform(Number),
+    SOCKET_MAX_PER_IP: z.string().default('20').transform(Number),
+    SOCKET_CONNECT_RATE_PER_MIN: z.string().default('60').transform(Number),
+    SOCKET_MAX_BUFFER_BYTES: z.string().default('16384').transform(Number),
+    SOCKET_TRANSPORTS: commaList(z.enum(['websocket', 'polling']), 'websocket,polling'),
+    SOCKET_INBOUND_EVENTS_PER_10S: z.string().default('20').transform(Number),
+    SOCKET_LOG_SAMPLE_RATE: z.string().default('0.01').transform(Number),
+    TRUSTED_PROXIES: commaList(z.string(), ''),
+    SOCKET_IP_EXEMPT_CIDRS: commaList(z.string(), ''),
+
+    // ── Chain read cache (Issue #98) ───────────────────────────────────────
+    CHAIN_CACHE_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
+    CHAIN_CACHE_TTL_MS: z.string().default('5000').transform(Number),
+    CHAIN_CACHE_NEG_TTL_MS: z.string().default('2000').transform(Number),
+    CHAIN_CACHE_WAIT_MS: z.string().default('1500').transform(Number),
   })
   .superRefine((env, ctx) => {
     if (env.SECRETS_PROVIDER === 'vault') {
@@ -233,6 +258,10 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     resolvedEnv = resolveFileVars(env);
   } catch (err) {
     throw new ConfigError(`Invalid environment configuration:\n  ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  if (resolvedEnv.CHAIN_CACHE_ENABLED === undefined) {
+    resolvedEnv.CHAIN_CACHE_ENABLED = (resolvedEnv.NODE_ENV || env.NODE_ENV) === 'test' ? 'false' : 'true';
   }
 
   const parsed = envSchema.safeParse(resolvedEnv);
