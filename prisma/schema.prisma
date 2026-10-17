@@ -14,6 +14,17 @@ datasource db {
 
 // ─────────────────────────── ENUMS ───────────────────────────
 
+enum WebhookSubscriptionStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum WebhookDeliveryStatus {
+  PENDING
+  SUCCEEDED
+  DEAD
+}
+
 enum MarketStatus {
   PENDING
   ACTIVE
@@ -140,6 +151,7 @@ model User {
   copyTrades    CopyTrade[]
   paymentEvents PaymentEvent[]
   spendingAllowance SpendingAllowance?
+  webhookSubscriptions WebhookSubscription[]
 
   @@index([walletAddress])
   @@map("users")
@@ -547,4 +559,70 @@ model ConstraintQuarantine {
 
   @@index([tableName, checkName])
   @@map("constraint_quarantine")
+}
+
+// ─────────────────────────── WEBHOOKS (#128) ───────────────────────────
+
+/// A user-registered outbound webhook endpoint. Empty filter arrays match all.
+model WebhookSubscription {
+  id                  String                    @id @default(uuid())
+  userId              String
+  url                 String
+  eventTypes          String[]
+  marketIds           BigInt[]
+  categories          MarketCategory[]
+  /// AES-256-GCM ciphertext (iv.tag.data, base64), keyed by WEBHOOK_SECRET_KEY.
+  secret              String
+  /// Encrypted previous secret; deliveries carry both signatures for 24 h after rotation.
+  previousSecret      String?
+  secretRotatedAt     DateTime?
+  status              WebhookSubscriptionStatus @default(ACTIVE)
+  disabledReason      String?
+  consecutiveFailures Int                       @default(0)
+  /// Set on the first failure of a failing streak; cleared on success.
+  failingSince        DateTime?
+  createdAt           DateTime                  @default(now())
+  updatedAt           DateTime                  @updatedAt
+
+  user       User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deliveries WebhookDelivery[]
+
+  @@index([status])
+  @@index([userId])
+  @@map("webhook_subscriptions")
+}
+
+/// One row per domain event. id = "<type>:<chain_events.id>" (dedup key).
+model WebhookEvent {
+  id        String   @id
+  type      String
+  payload   Json
+  createdAt DateTime @default(now())
+
+  deliveries WebhookDelivery[]
+
+  @@map("webhook_events")
+}
+
+/// One row per (event, subscription). Delivered at-least-once, in order per subscription.
+model WebhookDelivery {
+  id             String                @id @default(uuid())
+  eventId        String
+  subscriptionId String
+  status         WebhookDeliveryStatus @default(PENDING)
+  attempts       Int                   @default(0)
+  nextAttemptAt  DateTime              @default(now())
+  lastStatusCode Int?
+  lastError      String?
+  deliveredAt    DateTime?
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+
+  event        WebhookEvent        @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  subscription WebhookSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@unique([eventId, subscriptionId])
+  @@index([status, nextAttemptAt])
+  @@index([subscriptionId, status])
+  @@map("webhook_deliveries")
 }
