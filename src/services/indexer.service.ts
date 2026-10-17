@@ -1,7 +1,8 @@
 /**
  * Stellar event indexer: polls RPC getEvents for the four OracleDesk
  * contracts, stores each event once (keyed by its RPC event id), applies
- * side effects, and emits socket.io events.
+ * side effects, emits socket.io events, and enqueues signed outbound
+ * webhooks (#128; see webhooks.service.ts).
  *
  * - The ledger cursor is persisted in Postgres (indexer_cursors), so a
  *   restart resumes where it stopped.
@@ -22,6 +23,7 @@ import { readClients, rpcServer } from './stellar/clients';
 import { printable } from './chain.service';
 import { priceYesBps } from '../generated/fpmm';
 import { withTimeout, deadline } from '../lib/resilience';
+import { publishWebhookEvent } from './webhooks.service';
 
 export type EventSource = Pick<rpc.Server, 'getEvents' | 'getHealth'>;
 
@@ -107,7 +109,7 @@ async function applySideEffects(event: DecodedEvent, emit: IndexerDeps['emit']):
   if (event.contractName === 'marketCore' && event.eventName === 'Trade') {
     const onChainMarketId = BigInt(p.market_id);
     const yesBps = Number(priceYesBps(BigInt(p.reserve_yes), BigInt(p.reserve_no)));
-    const market = await prisma.market.findUnique({ where: { onChainMarketId }, select: { id: true, question: true } });
+    const market = await prisma.market.findUnique({ where: { onChainMarketId }, select: { id: true, question: true, category: true } });
     if (market) {
       await prisma.market.update({ where: { id: market.id }, data: { currentYesProb: yesBps / 10_000 } });
     }
@@ -120,7 +122,7 @@ async function applySideEffects(event: DecodedEvent, emit: IndexerDeps['emit']):
       }
     }
 
-    emit('TRADE_EXECUTED', {
+    const tradePayload = {
       onChainMarketId: onChainMarketId.toString(),
       marketId: market?.id ?? null,
       marketQuestion: market?.question ?? null,
@@ -134,15 +136,52 @@ async function applySideEffects(event: DecodedEvent, emit: IndexerDeps['emit']):
       txHash: event.txHash,
       ledger: event.ledger,
       eventId: event.id,
-    });
+    };
+    emit('TRADE_EXECUTED', tradePayload);
+    await publishWebhookEvent('trade.executed', event.id, tradePayload, { onChainMarketId, category: market?.category });
+    return;
+  }
+
+  if (event.contractName === 'marketCore' && event.eventName === 'MarketCreated') {
+    const onChainMarketId = BigInt(p.market_id);
+    const market = await prisma.market.findUnique({ where: { onChainMarketId }, select: { id: true, category: true } });
+    await publishWebhookEvent(
+      'market.created',
+      event.id,
+      {
+        onChainMarketId: onChainMarketId.toString(),
+        marketId: market?.id ?? null,
+        creator: p.creator,
+        // Contract category tag (Macro, Geopolitics, Crypto, Sports, Culture).
+        category: p.category && typeof p.category === 'object' && 'tag' in p.category ? p.category.tag : null,
+        closeTime: String(p.close_time),
+        seedAmountRaw: String(p.seed_amount),
+        initialYesBps: Number(p.initial_yes_bps),
+        txHash: event.txHash,
+        ledger: event.ledger,
+      },
+      { onChainMarketId, category: market?.category },
+    );
     return;
   }
 
   if (event.contractName === 'marketCore' && event.eventName === 'MarketResolved') {
     const onChainMarketId = BigInt(p.market_id);
     const outcome = outcomeTag(p.outcome); // null: the market was voided
-    const market = await prisma.market.findUnique({ where: { onChainMarketId }, select: { id: true } });
-    if (!market) return;
+    const market = await prisma.market.findUnique({ where: { onChainMarketId }, select: { id: true, category: true } });
+    const resolvedPayload = {
+      onChainMarketId: onChainMarketId.toString(),
+      marketId: market?.id ?? null,
+      outcome,
+      voided: outcome === null,
+      resolvedAt: new Date(event.ledgerClosedAt).toISOString(),
+      txHash: event.txHash,
+      ledger: event.ledger,
+    };
+    if (!market) {
+      await publishWebhookEvent('market.resolved', event.id, resolvedPayload, { onChainMarketId });
+      return;
+    }
     await prisma.$transaction([
       prisma.market.update({
         where: { id: market.id },
@@ -157,6 +196,7 @@ async function applySideEffects(event: DecodedEvent, emit: IndexerDeps['emit']):
         data: { status: 'CLOSED', closedAt: new Date(event.ledgerClosedAt), closeReason: outcome ? `${outcome.toUpperCase()}_RESOLVED` : 'VOIDED' },
       }),
     ]);
+    await publishWebhookEvent('market.resolved', event.id, resolvedPayload, { onChainMarketId, category: market.category });
     return;
   }
 
@@ -177,7 +217,7 @@ async function applySideEffects(event: DecodedEvent, emit: IndexerDeps['emit']):
         data: { onChainTraceId, publishTxHash: event.txHash },
       });
     }
-    emit('REASONING_PUBLISHED', {
+    const tracePayload = {
       onChainTraceId: onChainTraceId.toString(),
       onChainMarketId: String(p.market_id),
       traceId: trace?.id ?? null,
@@ -187,7 +227,12 @@ async function applySideEffects(event: DecodedEvent, emit: IndexerDeps['emit']):
       traceHash,
       txHash: event.txHash,
       ledger: event.ledger,
-    });
+    };
+    emit('REASONING_PUBLISHED', tracePayload);
+    if (config.WEBHOOKS_ENABLED) {
+      const traceMarket = await prisma.market.findUnique({ where: { onChainMarketId }, select: { category: true } });
+      await publishWebhookEvent('trace.published', event.id, tracePayload, { onChainMarketId, category: traceMarket?.category });
+    }
   }
 }
 
