@@ -129,6 +129,16 @@ const envSchema = z
     // ── Copy Trading (Issue #151) ─────────────────────────────────────────
     COPY_TRADE_TTL_MINUTES: z.string().default('30').transform(Number),
     COPY_TRADE_MAX_PENDING: z.string().default('5').transform(Number),
+
+    // ── Outbound webhooks (Issue #128) ────────────────────────────────────
+    WEBHOOKS_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
+    // 32-byte key (base64) encrypting webhook signing secrets at rest
+    // (AES-256-GCM). Required in production when webhooks are enabled; an
+    // ephemeral one is generated otherwise (stored secrets then stop
+    // decrypting after a restart).
+    WEBHOOK_SECRET_KEY: optionalString,
+    // Allow http:// webhook URLs. Development/test only; rejected in production.
+    WEBHOOKS_ALLOW_HTTP: z.enum(['true', 'false']).default('false').transform((v) => v === 'true'),
   })
   .superRefine((env, ctx) => {
     if (env.JWT_SECRET && env.JWT_SECRET.length < 32) {
@@ -143,6 +153,15 @@ const envSchema = z
       if (env[key] && !StrKey.isValidEd25519SecretSeed(env[key])) {
         ctx.addIssue({ code: 'custom', path: [key], message: 'must be a Stellar secret seed (S…)' });
       }
+    }
+    if (env.WEBHOOK_SECRET_KEY && Buffer.from(env.WEBHOOK_SECRET_KEY, 'base64').length !== 32) {
+      ctx.addIssue({ code: 'custom', path: ['WEBHOOK_SECRET_KEY'], message: 'must be 32 bytes, base64-encoded' });
+    }
+    if (env.NODE_ENV === 'production' && env.WEBHOOKS_ENABLED && !env.WEBHOOK_SECRET_KEY) {
+      ctx.addIssue({ code: 'custom', path: ['WEBHOOK_SECRET_KEY'], message: 'is required in production when WEBHOOKS_ENABLED=true' });
+    }
+    if (env.NODE_ENV === 'production' && env.WEBHOOKS_ALLOW_HTTP) {
+      ctx.addIssue({ code: 'custom', path: ['WEBHOOKS_ALLOW_HTTP'], message: 'must not be true in production' });
     }
     if (env.CHAIN_EXECUTION_MODE === 'live') {
       if (!env.AGENT_SECRET_KEY) {
@@ -181,6 +200,10 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
   if (!data.AUTH_SIGNING_SECRET) {
     data.AUTH_SIGNING_SECRET = Keypair.random().secret();
     ephemeralSecrets.push('AUTH_SIGNING_SECRET');
+  }
+  if (!data.WEBHOOK_SECRET_KEY) {
+    data.WEBHOOK_SECRET_KEY = crypto.randomBytes(32).toString('base64');
+    if (data.WEBHOOKS_ENABLED) ephemeralSecrets.push('WEBHOOK_SECRET_KEY');
   }
   if (!data.AUTH_WEB_AUTH_DOMAIN) data.AUTH_WEB_AUTH_DOMAIN = data.AUTH_HOME_DOMAIN;
   return { ...data, ephemeralSecrets };

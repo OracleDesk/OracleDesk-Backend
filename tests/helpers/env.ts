@@ -11,4 +11,6 @@ export function setupTestEnv(): void {
   process.env.STELLAR_RPC_URL = 'http://127.0.0.1:1'; // tests must never reach a real RPC
   process.env.INDEXER_ENABLED = 'false';
   process.env.ADMIN_ADDRESSES = '';
+  // Webhook enqueueing is exercised explicitly in tests/webhooks.test.ts.
+  process.env.WEBHOOKS_ENABLED = 'false';
 }

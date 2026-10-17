@@ -8,9 +8,11 @@ import { startIngestionCron } from './cron/ingestion.cron';
 import { startMonitorCron } from './cron/monitor.cron';
 import { startTraceAuditCron } from './cron/trace-audit.cron';
 import { startEventListener } from './services/indexer.service';
+import { startWebhookWorker } from './services/webhooks.service';
 import { closeRedis } from './lib/redis';
 
 let stopEventListener: (() => void) | null = null;
+let stopWebhookWorker: (() => void) | null = null;
 
 async function bootstrap(): Promise<void> {
   // 1. Connect to database
@@ -41,6 +43,9 @@ async function bootstrap(): Promise<void> {
 
   // 3. Index Stellar events (resumes from the stored ledger cursor)
   stopEventListener = startEventListener((event, payload) => io.emit(event, payload));
+
+  // 3b. Deliver signed outbound webhooks (#128)
+  stopWebhookWorker = startWebhookWorker();
 
   // 4. Start cron jobs
   startIngestionCron();
@@ -73,6 +78,7 @@ async function bootstrap(): Promise<void> {
 
     server.close(async () => {
       if (stopEventListener) stopEventListener();
+      if (stopWebhookWorker) stopWebhookWorker();
 
       await prisma.$disconnect();
       await closeRedis();
