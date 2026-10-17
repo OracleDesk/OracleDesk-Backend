@@ -26,6 +26,7 @@ export const logger = pino({
       '*.PINATA_SECRET_API_KEY',
       '*.ANTHROPIC_API_KEY',
       '*.GEMINI_API_KEY',
+      '*.WEBHOOK_SECRET_KEY',
       'secret',
       'token',
     ],
