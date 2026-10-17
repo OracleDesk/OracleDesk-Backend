@@ -2,6 +2,7 @@ import axios from 'axios';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { config } from '../config';
+import { secret } from '../config/secrets';
 import type { RawSignal, AggregatedSignals } from '../types';
 import dayjs from 'dayjs';
 
@@ -47,7 +48,8 @@ export async function fetchNewsSignals(): Promise<RawSignal[]> {
     return cached;
   }
 
-  if (!config.NEWSAPI_KEY) {
+  const newsApiKey = secret('NEWSAPI_KEY');
+  if (!newsApiKey) {
     logger.warn('NEWSAPI_KEY not set — skipping news ingestion');
     return [];
   }
@@ -68,7 +70,7 @@ export async function fetchNewsSignals(): Promise<RawSignal[]> {
           language: 'en',
           sortBy:   'publishedAt',
           pageSize: 30,
-          apiKey:   config.NEWSAPI_KEY,
+          apiKey:   newsApiKey,
         },
         timeout: 10_000,
       },
@@ -107,10 +109,20 @@ export async function fetchFedData(): Promise<RawSignal[]> {
 
   for (const seriesId of series) {
     try {
-      const apiKeyParam = config.FRED_API_KEY ? `&api_key=${config.FRED_API_KEY}` : '';
-      const url = `https://api.stlouisfed.org/fred/series/observations?series_id=${seriesId}&file_type=json&sort_order=desc&limit=2${apiKeyParam}`;
-
-      const { data } = await axios.get<{ observations: any[] }>(url, { timeout: 10_000 });
+      const fredApiKey = secret('FRED_API_KEY');
+      const { data } = await axios.get<{ observations: any[] }>(
+        'https://api.stlouisfed.org/fred/series/observations',
+        {
+          params: {
+            series_id: seriesId,
+            file_type: 'json',
+            sort_order: 'desc',
+            limit: 2,
+            ...(fredApiKey ? { api_key: fredApiKey } : {}),
+          },
+          timeout: 10_000,
+        },
+      );
       const observations = data.observations ?? [];
 
       if (observations.length > 0) {
