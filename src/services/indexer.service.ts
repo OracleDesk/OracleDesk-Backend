@@ -29,7 +29,11 @@ export type EventSource = Pick<rpc.Server, 'getEvents' | 'getHealth'>;
 export interface IndexerDeps {
   source: EventSource;
   /** Called for each newly stored event that should reach clients. */
-  emit: (event: string, payload: unknown) => void;
+  emit: (
+    event: string,
+    payload: unknown,
+    meta: { live: boolean; ledger: number; marketKey: string | null },
+  ) => void;
 }
 
 const PAGE_LIMIT = 200;
@@ -102,8 +106,41 @@ async function store(event: DecodedEvent): Promise<boolean> {
 const outcomeTag = (o: unknown): 'Yes' | 'No' | null =>
   o && typeof o === 'object' && 'tag' in o ? ((o as { tag: 'Yes' | 'No' }).tag) : null;
 
-async function applySideEffects(event: DecodedEvent, emit: IndexerDeps['emit']): Promise<void> {
+async function applySideEffects(
+  event: DecodedEvent,
+  emit: IndexerDeps['emit'],
+  meta: { live: boolean; ledger: number; marketKey: string | null },
+): Promise<void> {
   const p = event.params;
+
+  // ── Pre-step: Event-driven cache invalidation (Issue #98) ──
+  try {
+    const { getChainCache } = await import('./chain.service');
+    const cache = getChainCache();
+    const marketIdStr = p.market_id !== undefined ? String(p.market_id) : null;
+
+    if (event.contractName === 'marketCore') {
+      if (['Trade', 'MarketResolved', 'Redeemed', 'FeesSwept', 'MarketCreated'].includes(event.eventName)) {
+        if (marketIdStr) await cache.invalidateTag(`market:${marketIdStr}`, event.ledger);
+      }
+      if (event.eventName === 'Trade' && p.trader === CONTRACTS.treasury) {
+        await cache.invalidateTag('treasury:capital', event.ledger);
+      }
+    } else if (event.contractName === 'resolver') {
+      if (['ResolutionProposed', 'ResolutionFinalized', 'PriceResolution'].includes(event.eventName)) {
+        if (marketIdStr) {
+          await cache.invalidateTag(`resolver:${marketIdStr}`, event.ledger);
+          await cache.invalidateTag(`market:${marketIdStr}`, event.ledger);
+        }
+      }
+    } else if (event.contractName === 'treasury') {
+      if (['TradeAuthorized', 'PositionClosed', 'FeesCollected'].includes(event.eventName)) {
+        await cache.invalidateTag('treasury:capital', event.ledger);
+      }
+    }
+  } catch (err) {
+    logger.warn({ err, eventId: event.id }, 'Indexer: chain cache invalidation failed');
+  }
 
   if (event.contractName === 'marketCore' && event.eventName === 'Trade') {
     const onChainMarketId = BigInt(p.market_id);
@@ -121,21 +158,29 @@ async function applySideEffects(event: DecodedEvent, emit: IndexerDeps['emit']):
       }
     }
 
-    emit('TRADE_EXECUTED', {
-      onChainMarketId: onChainMarketId.toString(),
-      marketId: market?.id ?? null,
-      marketQuestion: market?.question ?? null,
-      trader: p.trader,
-      direction: outcomeTag(p.outcome) === 'No' ? 'NO' : 'YES',
-      isBuy: Boolean(p.is_buy),
-      collateralRaw: String(p.collateral),
-      sharesRaw: String(p.shares),
-      feeRaw: String(p.fee),
-      priceYesBps: yesBps,
-      txHash: event.txHash,
-      ledger: event.ledger,
-      eventId: event.id,
-    });
+    emit(
+      'TRADE_EXECUTED',
+      {
+        onChainMarketId: onChainMarketId.toString(),
+        marketId: market?.id ?? null,
+        marketQuestion: market?.question ?? null,
+        trader: p.trader,
+        direction: outcomeTag(p.outcome) === 'No' ? 'NO' : 'YES',
+        isBuy: Boolean(p.is_buy),
+        collateralRaw: String(p.collateral),
+        sharesRaw: String(p.shares),
+        feeRaw: String(p.fee),
+        priceYesBps: yesBps,
+        txHash: event.txHash,
+        ledger: event.ledger,
+        eventId: event.id,
+      },
+      {
+        live: meta.live,
+        ledger: event.ledger,
+        marketKey: onChainMarketId.toString(),
+      },
+    );
     return;
   }
 
@@ -191,17 +236,25 @@ async function applySideEffects(event: DecodedEvent, emit: IndexerDeps['emit']):
         data: { status: 'CONFIRMED', confirmedAt: new Date(), lastError: null },
       });
     }
-    emit('REASONING_PUBLISHED', {
-      onChainTraceId: onChainTraceId.toString(),
-      onChainMarketId: String(p.market_id),
-      traceId: trace?.id ?? null,
-      agent: p.agent,
-      action: p.action,
-      ipfsCid: p.ipfs_cid,
-      traceHash,
-      txHash: event.txHash,
-      ledger: event.ledger,
-    });
+    emit(
+      'REASONING_PUBLISHED',
+      {
+        onChainTraceId: onChainTraceId.toString(),
+        onChainMarketId: String(p.market_id),
+        traceId: trace?.id ?? null,
+        agent: p.agent,
+        action: p.action,
+        ipfsCid: p.ipfs_cid,
+        traceHash,
+        txHash: event.txHash,
+        ledger: event.ledger,
+      },
+      {
+        live: meta.live,
+        ledger: event.ledger,
+        marketKey: String(p.market_id),
+      },
+    );
   }
 }
 
@@ -246,6 +299,7 @@ export async function backfillEvents(
       return { startLedger, lastLedger: cursor ?? health.latestLedger, seen: 0, stored: 0 };
     }
 
+    const isCatchup = health.latestLedger - startLedger > config.SOCKET_LIVE_LEDGER_LAG;
     const known = specs();
     const filters: rpc.Api.EventFilter[] = [{ type: 'contract', contractIds: [...known.keys()] }];
     let seen = 0;
@@ -263,9 +317,13 @@ export async function backfillEvents(
         seen++;
         const decoded = decodeEvent(raw, known);
         if (!decoded) continue;
+        const live = page.latestLedger - decoded.ledger <= config.SOCKET_LIVE_LEDGER_LAG;
+        const marketKey = decoded.params?.market_id !== undefined ? String(decoded.params.market_id) : null;
+        const meta = { live, ledger: decoded.ledger, marketKey };
+
         if (await store(decoded)) {
           stored++;
-          await applySideEffects(decoded, deps.emit).catch((err) =>
+          await applySideEffects(decoded, deps.emit, meta).catch((err) =>
             logger.error({ err, eventId: decoded.id }, 'Indexer side effect failed'),
           );
         }
@@ -279,6 +337,17 @@ export async function backfillEvents(
     }
 
     await writeCursor(latestLedger);
+    if (isCatchup) {
+      deps.emit(
+        'CATCHUP_COMPLETE',
+        {
+          fromLedger: startLedger,
+          toLedger: latestLedger,
+          events: stored,
+        },
+        { live: true, ledger: latestLedger, marketKey: null },
+      );
+    }
     if (stored > 0) logger.info({ startLedger, lastLedger: latestLedger, seen, stored }, 'Indexed Stellar events');
     return { startLedger, lastLedger: latestLedger, seen, stored };
   } finally {
@@ -295,7 +364,12 @@ export async function reprojectEvent(
   event: DecodedEvent,
   emit: IndexerDeps['emit'] = () => undefined,
 ): Promise<void> {
-  await applySideEffects(event, emit);
+  const meta = {
+    live: true,
+    ledger: event.ledger,
+    marketKey: event.params?.market_id !== undefined ? String(event.params.market_id) : null,
+  };
+  await applySideEffects(event, emit, meta);
 }
 
 /** Converts a stored row back into the decoded shape used by applySideEffects. */

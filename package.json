@@ -71,6 +71,7 @@
     "@types/uuid": "~10.0.0",
     "nodemon": "~3.1.14",
     "pg": "^8.23.1",
+    "socket.io-client": "~4.8.3",
     "testcontainers": "^12.2.1",
     "ts-node-dev": "~2.0.0",
     "typescript": "~6.0.3",
