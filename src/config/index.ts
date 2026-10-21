@@ -386,10 +386,6 @@ const envSchema = z
     CHANNEL_ACQUIRE_TIMEOUT_MS: z.string().default('5000').transform(Number).pipe(z.number().int().positive()),
     CHANNEL_LEASE_MS: z.string().default('60000').transform(Number).pipe(z.number().int().positive()),
 
-    TRUST_INBOUND_REQUEST_ID: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
-    INDEXER_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
-    INDEXER_POLL_MS: z.string().default('5000').transform(Number),
-
     // ── Event bus and socket fan-out (#93) ────────────────────────────────
     // Redis Streams bus between the indexer and the socket fan-out. When
     // false, events go through an in-process bus (single instance only).
@@ -418,6 +414,28 @@ const envSchema = z
     ALERT_SLACK_WEBHOOK_URL: optionalString.refine((v) => v === '' || URL.canParse(v), 'must be a URL'),
     // HMAC-SHA256 key for the X-OracleDesk-Signature header on generic webhooks.
     ALERT_WEBHOOK_SECRET: optionalString,
+
+    // ── Transaction outbox (#35) ──────────────────────────────────────────
+    // Recovery worker interval; it resolves non-terminal chain_transactions.
+    OUTBOX_POLL_MS: z.string().default('5000').transform(Number)
+      .pipe(z.number().int().min(250)),
+    // How long a live write waits inline for confirmation before returning
+    // CHAIN_PENDING and leaving resolution to the worker.
+    OUTBOX_INLINE_WAIT_MS: z.string().default('30000').transform(Number)
+      .pipe(z.number().int().min(1000)),
+
+    // Spec compatibility gate (#34). Empty derives from the execution mode:
+    // live → enforce (refuse to start on breaking spec/wasm drift), dry-run →
+    // warn (log and keep running). off skips the check entirely.
+    SPEC_COMPAT_ENFORCE: z
+      .string()
+      .default('')
+      .refine((v) => ['', 'off', 'warn', 'enforce'].includes(v), 'must be off, warn or enforce'),
+
+    TRUST_INBOUND_REQUEST_ID: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
+    INDEXER_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
+    INDEXER_POLL_MS: z.string().default('5000').transform(Number),
+
 
     // ── Health probes (#111) ──────────────────────────────────────────────
     // Dependencies that make /readyz fail. RPC is non-critical by default so

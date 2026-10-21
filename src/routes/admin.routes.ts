@@ -11,6 +11,7 @@ import {
   getAdmins,
   getAgentControls,
   getReconciliationRun,
+  getSpecCompat,
   getSystemStatus,
   getChainFeesReport,
   pauseAgentControl,
@@ -57,7 +58,7 @@ router.post('/agents/:agent/pause', requirePermission('agents.manage'), pauseAge
 router.post('/agents/:agent/resume', requirePermission('agents.manage'), resumeAgentControl);
 router.get('/status', requirePermission('admin.read'), getSystemStatus);
 router.get('/fees', requirePermission('admin.read'), getChainFeesReport);
-router.get('/disputes', requirePermission('disputes.manage'), listDisputes);
+router.get('/disputes', requirePermission('disputes.manage'), getDisputes);
 router.post('/disputes/:id/ack', requirePermission('disputes.manage'), ackDispute);
 router.post('/disputes/:id/cancel-tx', requirePermission('disputes.manage'), cancelDisputeTx);
 router.post('/disputes/:id/void-tx', requirePermission('disputes.manage'), voidDisputeTx);
@@ -66,6 +67,8 @@ router.post('/trace-audit/run', requirePermission('trace_audit.run'), triggerTra
 router.get('/reconciliation/runs', requirePermission('reconciliation.run'), listReconciliationRuns);
 router.get('/reconciliation/runs/:id', requirePermission('reconciliation.run'), getReconciliationRun);
 router.post('/reconciliation/run', requirePermission('reconciliation.run'), triggerReconciliationRun);
+// Spec compatibility report from the boot gate (#34): read-only diagnostics.
+router.get('/chain/spec-compat', requirePermission('admin.read'), getSpecCompat);
 router.get('/treasury', getTreasury);
 router.get('/treasury/operations', listTreasuryOperations);
 router.post('/treasury/operations', createOperation);

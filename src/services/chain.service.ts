@@ -21,7 +21,14 @@ import type { rpc } from '@stellar/stellar-sdk';
 import { config } from '../config';
 import { logger } from '../lib/logger';
 import { agentClients, agentSigner, readClients } from './stellar/clients';
-import { ChainError, TransactionError, contractErrorName, ArchivedEntryError } from './stellar/errors';
+import { ChainError, ChainPendingError, TransactionError, contractErrorName, ArchivedEntryError } from './stellar/errors';
+import {
+  parseReturnValue,
+  prismaOutboxStore,
+  runCompletionHandler,
+  type ChainTransactionRow,
+  type OutboxStore,
+} from './stellar/outbox';
 import { SequenceLockLost, rebuildWithSequence, withSourceAccount } from './stellar/sequence';
 import {
   ChainWriteFailure,
@@ -74,9 +81,21 @@ export interface FeeDetails {
   feeCharged?: bigint;
 }
 
+/**
+ * Domain correlation for the transactional outbox (#35): which completion
+ * handler owns the write and which domain row it updates.
+ */
+export interface WriteRef {
+  kind: string;
+  refId: string;
+}
+
+export { ChainPendingError };
+export type { OnChainMarket };
+
 export type WriteResult<T> =
-  | { mode: 'dry-run'; method: string; value: T; txHash: null; fee?: FeeDetails }
-  | { mode: 'live'; method: string; value: T; txHash: string | null; fee?: FeeDetails };
+  | { mode: 'dry-run'; method: string; value: T; txHash: null; fee?: FeeDetails; outboxId?: string }
+  | { mode: 'live'; method: string; value: T; txHash: string | null; fee?: FeeDetails; outboxId?: string };
 
 export const Outcomes = {
   Yes: { tag: 'Yes', values: undefined } as Outcome,
@@ -199,13 +218,14 @@ async function write<T>(
   args: Record<string, unknown>,
   call: WriteCall,
   signal?: AbortSignal,
+  ref?: WriteRef,
 ): Promise<WriteResult<T>> {
   const seenVersion = await assertAgentActive(scope);
   try {
     const viaAgentAccount = config.CHAIN_EXECUTION_MODE === 'live' && getChannelPool().size === 0;
     const result = viaAgentAccount
-      ? await liveWriteWithRetry<T>(scope, seenVersion, opClass, contract, method, args, call, signal)
-      : await submitWrite<T>(scope, seenVersion, opClass, contract, method, args, call, signal);
+      ? await liveWriteWithRetry<T>(scope, seenVersion, opClass, contract, method, args, call, signal, ref)
+      : await submitWrite<T>(scope, seenVersion, opClass, contract, method, args, call, signal, ref);
     await recordChainWriteOutcome(scope, true, null);
     return result;
   } catch (err) {
@@ -229,6 +249,7 @@ async function submitWrite<T>(
   args: Record<string, unknown>,
   call: WriteCall,
   signal?: AbortSignal,
+  ref?: WriteRef,
 ): Promise<WriteResult<T>> {
   const oracle = getFeeOracle();
   const policy = oracle.getPolicies()[opClass];
@@ -298,7 +319,12 @@ async function submitWrite<T>(
     }
 
     const rawMaxTime = (tx as any)?.built?.timeBounds?.maxTime;
-    const maxTime = rawMaxTime !== undefined
+    // #35: once RPC retention has passed, a submitted transaction can only be
+    // resolved by its timebounds; a live write without a maxTime is refused.
+    if (config.CHAIN_EXECUTION_MODE !== 'dry-run' && (rawMaxTime === undefined || rawMaxTime === null || BigInt(rawMaxTime) === 0n)) {
+      throw new ChainError(`${method} was built without timebounds; refusing to submit`, null, { method });
+    }
+    const maxTime = rawMaxTime !== undefined && rawMaxTime !== null
       ? BigInt(rawMaxTime)
       : BigInt(Math.floor(Date.now() / 1000) + timeoutInSeconds);
     const minTime = 0n;
@@ -348,6 +374,24 @@ async function submitWrite<T>(
       return { mode: 'dry-run', method, value: simulated, txHash: null, fee: feeDetails };
     }
 
+  // #35: the write exists in the outbox before anything irreversible happens.
+  // The row moves BUILT -> SIGNED -> SUBMITTED around the steps below; a crash
+  // at any point leaves a row the recovery worker can resolve by hash.
+  const store = prismaOutboxStore();
+  let outboxRow: ChainTransactionRow = await store.create({
+    kind: ref?.kind ?? `${contract}.${method}`,
+    refId: ref?.refId ?? null,
+    contract,
+    method,
+    args: printable(args) as object,
+    simulated: printable(simulated) as object,
+    source: (signer?.publicKey as string | undefined) ?? (agentSigner().publicKey as string),
+    minTime,
+    maxTime,
+    innerFee: inclusionFee.toString(),
+    resourceFee: minResourceFee.toString(),
+  });
+
     if (typeof (tx as any).sign === 'function') {
       await (tx as any).sign();
     }
@@ -359,6 +403,18 @@ async function submitWrite<T>(
       txHash = rawTx.built.hash().toString('hex');
     }
   } catch {}
+
+  // The signed envelope and hash are durable before sendTransaction, so
+  // recovery can resubmit this exact envelope (same hash, same sequence).
+  {
+    const rawTx = tx as any;
+    const signedRow = await store.transition(outboxRow.id, ['BUILT'], 'SIGNED', {
+      envelopeXdr: typeof rawTx?.built?.toXDR === 'function' ? rawTx.built.toXDR() : null,
+      hash: txHash,
+      sequence: rawTx?.built?.sequence != null ? String(rawTx.built.sequence) : null,
+    });
+    if (signedRow) outboxRow = signedRow;
+  }
 
   const sender = getTransactionSender();
   const reader = getTransactionReader();
@@ -390,6 +446,8 @@ async function submitWrite<T>(
     });
   }
 
+  outboxRow = await acceptSend(store, outboxRow, contract, txHash, sendRes);
+
   const finalHash = sendRes?.sendTransactionResponse?.hash ?? sendRes?.hash ?? txHash;
   if (!finalHash) {
     throw new ChainError(`${method} no transaction hash returned from send`, null, { method });
@@ -410,184 +468,29 @@ async function submitWrite<T>(
     }
   }
 
-  const attemptId = (args as any)?.attemptId ?? null;
-  const pollIntervalMs = 2000;
-  const maxPollTimeoutMs = (timeoutInSeconds + 30) * 1000;
-  const pollStart = Date.now();
-  let confirmedTx: any = null;
-  let decision: ExpiryDecision = 'PENDING';
-
-  while (Date.now() - pollStart < maxPollTimeoutMs) {
-    if (signal?.aborted) {
-      throw new ChainError(
-        `${method} poll aborted`,
-        null,
-        { outcome: 'unknown', txHash: finalHash },
-        'CHAIN_SUBMISSION_TIMEOUT',
-      );
-    }
-
-    let txStatusRes: any;
-    try {
-      txStatusRes = await reader.getTransaction(finalHash);
-    } catch (err: any) {
-      logger.warn({ err: err?.message, txHash: finalHash }, 'getTransaction poll error; retrying');
-    }
-
-    if (txStatusRes) {
-      const latestLedgerCloseTime = Number(txStatusRes.latestLedgerCloseTime ?? Math.floor(Date.now() / 1000));
-      const oldestLedgerCloseTime = txStatusRes.oldestLedgerCloseTime !== undefined ? Number(txStatusRes.oldestLedgerCloseTime) : undefined;
-
-      decision = decideExpiry({
-        status: txStatusRes.status,
-        latestLedgerCloseTime,
-        maxTime: Number(maxTime),
-        submittedAtCloseTime: submittedAtCloseTime !== undefined ? Number(submittedAtCloseTime) : undefined,
-        oldestLedgerCloseTime,
-      });
-
-      if (decision === 'LANDED' || decision === 'FAILED') {
-        confirmedTx = txStatusRes;
-        break;
-      }
-
-      if (decision === 'EXPIRED') {
-        await prisma.chainSubmission.upsert({
-          where: { txHash: finalHash },
-          create: {
-            txHash: finalHash,
-            opClass,
-            minTime,
-            maxTime,
-            authExpirationLedger: (tx as any).authExpirationLedger ?? null,
-            submittedLedger: submittedLedger ? Number(submittedLedger) : null,
-            submittedAtCloseTime,
-            decision: 'EXPIRED',
-            attemptId,
-          },
-          update: { decision: 'EXPIRED' },
-        }).catch(() => undefined);
-
-        throw new ExpiredError(`Transaction ${finalHash} expired without inclusion`, attemptId, finalHash);
-      }
-
-      if (decision === 'UNKNOWN') {
-        await prisma.chainSubmission.upsert({
-          where: { txHash: finalHash },
-          create: {
-            txHash: finalHash,
-            opClass,
-            minTime,
-            maxTime,
-            authExpirationLedger: (tx as any).authExpirationLedger ?? null,
-            submittedLedger: submittedLedger ? Number(submittedLedger) : null,
-            submittedAtCloseTime,
-            decision: 'UNKNOWN',
-            attemptId,
-          },
-          update: { decision: 'UNKNOWN' },
-        }).catch(() => undefined);
-
-        throw new ChainError(
-          `Transaction ${finalHash} outcome is unknown (beyond RPC retention window)`,
-          null,
-          { outcome: 'unknown', txHash: finalHash },
-          'CHAIN_TX_UNKNOWN',
-        );
-      }
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
-  }
-
-  if (decision === 'PENDING') {
-    await prisma.chainSubmission.upsert({
-      where: { txHash: finalHash },
-      create: {
-        txHash: finalHash,
-        opClass,
-        minTime,
-        maxTime,
-        authExpirationLedger: (tx as any).authExpirationLedger ?? null,
-        submittedLedger: submittedLedger ? Number(submittedLedger) : null,
-        submittedAtCloseTime,
-        decision: 'PENDING',
-        attemptId,
-      },
-      update: { decision: 'PENDING' },
-    }).catch(() => undefined);
-
-    throw new ChainError(
-      `${method} submission timed out while still PENDING`,
-      null,
-      { outcome: 'unknown', txHash: finalHash },
-      'CHAIN_SUBMISSION_TIMEOUT',
-    );
-  }
-
-  if (decision === 'FAILED') {
-    await prisma.chainSubmission.upsert({
-      where: { txHash: finalHash },
-      create: {
-        txHash: finalHash,
-        opClass,
-        minTime,
-        maxTime,
-        authExpirationLedger: (tx as any).authExpirationLedger ?? null,
-        submittedLedger: submittedLedger ? Number(submittedLedger) : null,
-        submittedAtCloseTime,
-        decision: 'FAILED',
-        attemptId,
-      },
-      update: { decision: 'FAILED' },
-    }).catch(() => undefined);
-
-    const errName = contractErrorName(contract, confirmedTx);
-    throw new ChainError(`${method} failed on-chain: ${errName ?? 'Unknown error'}`, errName, { method, txHash: finalHash });
-  }
-
-  // Record LANDED submission
-  await prisma.chainSubmission.upsert({
-    where: { txHash: finalHash },
-    create: {
-      txHash: finalHash,
-      opClass,
-      minTime,
-      maxTime,
-      authExpirationLedger: (tx as any).authExpirationLedger ?? null,
-      submittedLedger: submittedLedger ? Number(submittedLedger) : null,
-      submittedAtCloseTime,
-      decision: 'LANDED',
-      attemptId,
-    },
-    update: { decision: 'LANDED' },
-  }).catch(() => undefined);
-
-  const feeChargedRaw = (confirmedTx as any)?.feeCharged ?? (sendRes as any)?.feeCharged;
-  const feeCharged = feeChargedRaw !== undefined ? BigInt(feeChargedRaw) : expectedTotal;
-  const liveFeeDetails: FeeDetails = {
-    ...feeDetails,
-    feeCharged,
-  };
-
-  await prisma.chainFee.upsert({
-    where: { txHash: finalHash },
-    create: {
-      txHash: finalHash,
-      opClass,
-      inclusionFee,
-      resourceFee: minResourceFee,
-      totalFee: expectedTotal,
-      feeCharged,
-    },
-    update: {
-      feeCharged,
-    },
-  }).catch((err: any) => logger.warn({ err: err?.message, txHash: finalHash }, 'Failed to record chain fee'));
-
-  const value = simulatedValueFromSent<T>(contract, method, (confirmedTx as any)?.returnValue ?? simulated);
-  logger.info({ method, txHash: finalHash }, 'submitted and confirmed');
-  return { mode: 'live', method, value, txHash: finalHash, fee: liveFeeDetails };
+  return await confirmSubmitted<T>({
+    store,
+    outboxRow,
+    contract,
+    method,
+    opClass,
+    args,
+    tx,
+    reader,
+    sendRes,
+    simulated,
+    minTime,
+    maxTime,
+    timeoutInSeconds,
+    feeDetails,
+    expectedTotal,
+    inclusionFee,
+    minResourceFee,
+    finalHash,
+    submittedLedger,
+    submittedAtCloseTime,
+    signal,
+  });
   } finally {
     if (leasedChannel) {
       await leasedChannel.release();
@@ -605,15 +508,20 @@ async function liveWriteWithRetry<T>(
   args: Record<string, unknown>,
   call: WriteCall,
   signal?: AbortSignal,
+  ref?: WriteRef,
 ): Promise<WriteResult<T>> {
   const opts = retryOptions();
   const startedAt = Date.now();
   let attempt = 0;
   for (;;) {
     try {
-      return await attemptWrite<T>(scope, seenVersion, opClass, contract, method, args, call, signal);
+      return await attemptWrite<T>(scope, seenVersion, opClass, contract, method, args, call, signal, ref);
     } catch (err) {
       if (err instanceof AgentPausedError) throw err;
+      // Expiry has its own recovery (#42) and a pending submission belongs to
+      // the outbox worker (#35): neither is retried blindly here.
+      if (err instanceof ExpiredError) throw err;
+      if (err instanceof ChainPendingError) throw err;
       const failure: ClassifiedFailure =
         err instanceof ChainWriteFailure ? err.failure : classifyFailure({ contract, err });
       const { retry, delayMs } = retryDecision(failure, attempt, opts, Date.now() - startedAt);
@@ -646,86 +554,446 @@ async function attemptWrite<T>(
   args: Record<string, unknown>,
   call: WriteCall,
   signal?: AbortSignal,
+  ref?: WriteRef,
 ): Promise<WriteResult<T>> {
-  // Live: build, simulate, sign and send inside the per-source-account critical
-  // section so the sequence number is collision-free across writers (#36). The
-  // lock is released as soon as sendTransaction returns, not after confirmation.
+  // Live, agent-sourced: build, simulate, sign and send inside the
+  // per-source-account critical section so the sequence number is
+  // collision-free across writers (#36). The lock is released as soon as
+  // sendTransaction returns; confirmation polling happens after release.
+  // The signed envelope is persisted before the send (#35) and the path never
+  // uses signAndSend: signing and submission are explicit, separate steps.
+  const oracle = getFeeOracle();
+  const inclusionFee = await oracle.pickInclusionFee(opClass);
+  const timeoutInSeconds = timeoutFor(opClass);
+  const store = prismaOutboxStore();
   const account = agentSigner().publicKey as string;
-  return withSourceAccount(
-    account,
-    async (ctx) => {
-      let tx: AssembledTransaction<unknown>;
-      try {
-        tx = await call({ fee: await getFeeOracle().pickInclusionFee(opClass), timeoutInSeconds: timeoutFor(opClass) });
-      } catch (err) {
-        throw new ChainError(`${method} could not be built`, contractErrorName(contract, err), {
-          method,
-          cause: err instanceof Error ? err.message : String(err),
-        });
-      }
-      const simulated = simulatedValue<T>(contract, method, tx);
+  let outboxRow: ChainTransactionRow | null = null;
 
-      // A pause that landed while the transaction was being built stops here.
-      await assertAgentActiveLocked(scope, seenVersion);
-
-      // The binding built and simulated against the RPC's account; rewrite the
-      // built transaction with the sequence allocated from the cached counter.
-      const rawTx = tx as unknown as { built?: unknown };
-      if (rawTx?.built) {
+  try {
+    const sent = await withSourceAccount(
+      account,
+      async (ctx) => {
+        let tx: AssembledTransaction<unknown>;
         try {
-          rawTx.built = rebuildWithSequence(rawTx.built, ctx.account, config.STELLAR_NETWORK_PASSPHRASE);
+          tx = await call({ fee: inclusionFee, timeoutInSeconds });
         } catch (err) {
-          throw new ChainError(`${method} could not apply the allocated sequence`, null, {
+          throw new ChainError(`${method} could not be built`, contractErrorName(contract, err), {
             method,
             cause: err instanceof Error ? err.message : String(err),
           });
         }
-      }
+        const simulated = simulatedValue<T>(contract, method, tx);
 
-      let txHash: string | null = null;
-      try {
-        const built = rawTx?.built as { hash?: () => Buffer } | undefined;
-        if (typeof built?.hash === 'function') txHash = built.hash().toString('hex');
-      } catch {}
+        // A pause that landed while the transaction was being built stops here.
+        await assertAgentActiveLocked(scope, seenVersion);
 
-      try {
-        // Fence: a holder that lost its lock must never submit.
-        ctx.assertHeld();
-        const sent = await withTimeout('rpc-write', async () => tx.signAndSend(), { signal });
-        // The network accepted the envelope: reserve the sequence.
-        await ctx.advanceSequence();
-        const value = simulatedValueFromSent<T>(contract, method, sent.result);
-        const finalHash = sent.sendTransactionResponse?.hash ?? txHash;
-        logger.info({ method, txHash: finalHash }, 'submitted');
-        return { mode: 'live', method, value, txHash: finalHash };
-      } catch (err: any) {
-        if (err instanceof SequenceLockLost) {
-          // Aborted before send: safe to retry on a fresh sequence.
-          await ctx.resync().catch(() => undefined);
-          throw new ChainWriteFailure(
-            { class: 'TRANSIENT_RPC', txCode: null, opCode: null, contractError: null, txHash, submitted: false },
-            err,
+        const rawMaxTime = (tx as any)?.built?.timeBounds?.maxTime;
+        // #35: past RPC retention only timebounds can resolve a row.
+        if (rawMaxTime === undefined || rawMaxTime === null || BigInt(rawMaxTime) === 0n) {
+          throw new ChainError(`${method} was built without timebounds; refusing to submit`, null, { method });
+        }
+        const maxTime = BigInt(rawMaxTime);
+        const minTime = 0n;
+        const minResourceFee = BigInt((tx.simulation as any)?.minResourceFee ?? '0');
+
+        // #35: the write exists in the outbox before anything irreversible happens.
+        outboxRow = await store.create({
+          kind: ref?.kind ?? `${contract}.${method}`,
+          refId: ref?.refId ?? null,
+          contract,
+          method,
+          args: printable(args) as object,
+          simulated: printable(simulated) as object,
+          source: account,
+          minTime,
+          maxTime,
+          innerFee: inclusionFee.toString(),
+          resourceFee: minResourceFee.toString(),
+        });
+
+        // The binding built and simulated against the RPC's account; rewrite the
+        // built transaction with the sequence allocated from the cached counter.
+        const rawTx = tx as unknown as { built?: any };
+        if (rawTx?.built) {
+          try {
+            rawTx.built = rebuildWithSequence(rawTx.built, ctx.account, config.STELLAR_NETWORK_PASSPHRASE);
+          } catch (err) {
+            throw new ChainError(`${method} could not apply the allocated sequence`, null, {
+              method,
+              cause: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+
+        if (typeof (tx as any).sign === 'function') {
+          await (tx as any).sign();
+        }
+        let txHash: string | null = null;
+        try {
+          if (typeof rawTx?.built?.hash === 'function') txHash = rawTx.built.hash().toString('hex');
+        } catch {}
+
+        // The signed envelope and hash are durable before sendTransaction, so
+        // recovery can resubmit this exact envelope (same hash, same sequence).
+        const signedRow = await store.transition(outboxRow.id, ['BUILT'], 'SIGNED', {
+          envelopeXdr: typeof rawTx?.built?.toXDR === 'function' ? rawTx.built.toXDR() : null,
+          hash: txHash,
+          sequence: rawTx?.built?.sequence != null ? String(rawTx.built.sequence) : null,
+        });
+        if (signedRow) outboxRow = signedRow;
+
+        const sender = getTransactionSender();
+        try {
+          // Fence: a holder that lost its lock must never submit.
+          ctx.assertHeld();
+          const sendRes: any = await withTimeout(
+            'rpc-write',
+            async () => {
+              if (typeof sender.sendTransaction === 'function') {
+                return sender.sendTransaction((tx as any).built ?? tx);
+              }
+              return (tx as any).send?.();
+            },
+            { signal },
           );
+          outboxRow = await acceptSend(store, outboxRow, contract, txHash, sendRes);
+          // The network accepted the envelope: reserve the sequence.
+          await ctx.advanceSequence();
+          return { tx, simulated, txHash, sendRes, maxTime, minTime, minResourceFee };
+        } catch (err: any) {
+          if (err instanceof SequenceLockLost) {
+            // Aborted before send: safe to retry on a fresh sequence.
+            await ctx.resync().catch(() => undefined);
+            throw new ChainWriteFailure(
+              { class: 'TRANSIENT_RPC', txCode: null, opCode: null, contractError: null, txHash, submitted: false },
+              err,
+            );
+          }
+          if (err instanceof TimeoutError || err?.code === 'UPSTREAM_TIMEOUT') {
+            // The submission may have been applied: re-read and never rebuild it.
+            await ctx.resync().catch(() => undefined);
+            throw new ChainWriteFailure(
+              { class: 'UNKNOWN_OUTCOME', txCode: null, opCode: null, contractError: null, txHash, submitted: true },
+              err,
+            );
+          }
+          if (err instanceof ChainWriteFailure) {
+            if (err.failure.class === 'BAD_SEQUENCE' || err.failure.class === 'UNKNOWN_OUTCOME') {
+              await ctx.resync().catch(() => undefined);
+            }
+            throw err;
+          }
+          if (err instanceof ChainError) throw err;
+          const failure = classifyFailure({ contract, err, send: extractSendResponse(err) });
+          if (failure.class === 'BAD_SEQUENCE' || failure.class === 'UNKNOWN_OUTCOME') {
+            await ctx.resync().catch(() => undefined);
+          }
+          throw new ChainWriteFailure({ ...failure, txHash: failure.txHash ?? txHash }, err);
         }
-        if (err instanceof TimeoutError || err?.code === 'UPSTREAM_TIMEOUT') {
-          // The submission may have been applied: re-read and never rebuild it.
-          await ctx.resync().catch(() => undefined);
-          throw new ChainWriteFailure(
-            { class: 'UNKNOWN_OUTCOME', txCode: null, opCode: null, contractError: null, txHash, submitted: true },
-            err,
-          );
-        }
-        const failure = classifyFailure({ contract, err, send: extractSendResponse(err) });
-        if (failure.class === 'BAD_SEQUENCE' || failure.class === 'UNKNOWN_OUTCOME') {
-          await ctx.resync().catch(() => undefined);
-        }
-        throw new ChainWriteFailure({ ...failure, txHash: failure.txHash ?? txHash }, err);
-      }
-    },
-    { waitMs: config.SEQ_LOCK_WAIT_MS, signal },
-  );
+      },
+      { waitMs: config.SEQ_LOCK_WAIT_MS, signal },
+    );
+
+    // Confirmation runs outside the sequence lock.
+    const oraclePolicy = oracle.getPolicies()[opClass];
+    void oraclePolicy;
+    const expectedTotal = inclusionFee + sent.minResourceFee;
+    const finalHash = sent.sendRes?.sendTransactionResponse?.hash ?? sent.sendRes?.hash ?? sent.txHash;
+    if (!finalHash) {
+      throw new ChainError(`${method} no transaction hash returned from send`, null, { method });
+    }
+    return await confirmSubmitted<T>({
+      store,
+      outboxRow: outboxRow!,
+      contract,
+      method,
+      opClass,
+      args,
+      tx: sent.tx,
+      reader: getTransactionReader(),
+      sendRes: sent.sendRes,
+      simulated: sent.simulated,
+      minTime: sent.minTime,
+      maxTime: sent.maxTime,
+      timeoutInSeconds,
+      feeDetails: { opClass, inclusionFee, resourceFee: sent.minResourceFee, totalFee: expectedTotal },
+      expectedTotal,
+      inclusionFee,
+      minResourceFee: sent.minResourceFee,
+      finalHash,
+      submittedLedger: sent.sendRes?.latestLedger ?? (sent.tx.simulation as any)?.latestLedger,
+      submittedAtCloseTime:
+        sent.sendRes?.latestLedgerCloseTime !== undefined ? BigInt(sent.sendRes.latestLedgerCloseTime) : undefined,
+      signal,
+    });
+  } catch (err: any) {
+    // #35: an attempt that provably never reached the network is terminal for
+    // its row (a retry builds a fresh envelope and a fresh row), and the live
+    // caller's error path stands in for the completion handler. Ambiguous
+    // outcomes leave the row for the recovery worker.
+    const ambiguous =
+      (err instanceof ChainWriteFailure && err.failure.submitted) || err instanceof ChainPendingError || err instanceof ExpiredError;
+    if (!ambiguous && outboxRow) {
+      await store
+        .transition((outboxRow as ChainTransactionRow).id, ['BUILT', 'SIGNED'], 'FAILED', {
+          error: err instanceof Error ? err.message : String(err),
+          handledAt: new Date(),
+        })
+        .catch(() => undefined);
+    }
+    throw err;
+  }
 }
 
+
+
+/**
+ * Maps a sendTransaction response onto the outbox state machine (#35):
+ * PENDING and DUPLICATE both mean the network has this exact envelope
+ * (SUBMITTED); ERROR (e.g. txBadSeq) means it can never land (terminal
+ * FAILED — a retry builds a fresh envelope and a fresh row); TRY_AGAIN_LATER
+ * stays SIGNED and throws retryable without consuming the row's hash.
+ */
+async function acceptSend(
+  store: OutboxStore,
+  row: ChainTransactionRow,
+  contract: WriteContract,
+  txHash: string | null,
+  sendRes: any,
+): Promise<ChainTransactionRow> {
+  const status = sendRes?.status ?? sendRes?.sendTransactionResponse?.status;
+  if (status === 'ERROR') {
+    const failure = classifyFailure({ contract, send: sendRes });
+    await store
+      .transition(row.id, ['SIGNED'], 'FAILED', {
+        error: failure.txCode ?? failure.class,
+        handledAt: new Date(),
+      })
+      .catch(() => undefined);
+    throw new ChainWriteFailure(
+      { ...failure, txHash: failure.txHash ?? txHash },
+      new Error(`sendTransaction returned ERROR (${failure.txCode ?? failure.class})`),
+    );
+  }
+  if (status === 'TRY_AGAIN_LATER') {
+    throw new ChainWriteFailure(
+      { class: 'TRANSIENT_RPC', txCode: null, opCode: null, contractError: null, txHash, submitted: false },
+      new Error('sendTransaction returned TRY_AGAIN_LATER'),
+    );
+  }
+  const moved = await store.transition(row.id, ['SIGNED'], 'SUBMITTED', {
+    submitLedger: typeof sendRes?.latestLedger === 'number' ? sendRes.latestLedger : null,
+  });
+  return moved ?? row;
+}
+
+interface ConfirmInput<T> {
+  store: OutboxStore;
+  outboxRow: ChainTransactionRow;
+  contract: WriteContract;
+  method: string;
+  opClass: OperationClass;
+  args: Record<string, unknown>;
+  tx: AssembledTransaction<unknown>;
+  reader: TransactionReader;
+  sendRes: any;
+  simulated: T;
+  minTime: bigint;
+  maxTime: bigint;
+  timeoutInSeconds: number;
+  feeDetails: FeeDetails;
+  expectedTotal: bigint;
+  inclusionFee: bigint;
+  minResourceFee: bigint;
+  finalHash: string;
+  submittedLedger: number | undefined;
+  submittedAtCloseTime: bigint | undefined;
+  signal?: AbortSignal;
+}
+
+/**
+ * Polls a submitted transaction to a decision and finishes the outbox row
+ * (#35): LANDED runs the completion handler inline and returns; FAILED and
+ * EXPIRED transition the row (handled: the live caller's error path owns
+ * them); an inline wait past OUTBOX_INLINE_WAIT_MS moves the row to PENDING
+ * and throws CHAIN_PENDING, leaving resolution to the recovery worker.
+ */
+async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> {
+  const { store, contract, method, opClass, args, tx, reader, sendRes, minTime, maxTime, timeoutInSeconds, finalHash } = c;
+  let outboxRow = c.outboxRow;
+
+  if (sendRes?.latestLedgerCloseTime) {
+    const hostSec = Math.floor(Date.now() / 1000);
+    if (Math.abs(hostSec - Number(sendRes.latestLedgerCloseTime)) > 30) {
+      logger.warn(
+        { hostTime: hostSec, ledgerCloseTime: Number(sendRes.latestLedgerCloseTime) },
+        'Host clock differs from ledger close time by > 30s',
+      );
+    }
+  }
+
+  const attemptId = (args as any)?.attemptId ?? null;
+  const submissionRecord = (decision: string) =>
+    prisma.chainSubmission
+      .upsert({
+        where: { txHash: finalHash },
+        create: {
+          txHash: finalHash,
+          opClass,
+          minTime,
+          maxTime,
+          authExpirationLedger: (tx as any).authExpirationLedger ?? null,
+          submittedLedger: c.submittedLedger ? Number(c.submittedLedger) : null,
+          submittedAtCloseTime: c.submittedAtCloseTime,
+          decision,
+          attemptId,
+        },
+        update: { decision },
+      })
+      .catch(() => undefined);
+
+  const pollIntervalMs = 2000;
+  // #35: the inline wait is bounded; past it the write returns CHAIN_PENDING
+  // and the outbox worker owns resolution.
+  const maxPollTimeoutMs = Math.min((timeoutInSeconds + 30) * 1000, config.OUTBOX_INLINE_WAIT_MS);
+  const pollStart = Date.now();
+  let confirmedTx: any = null;
+  let decision: ExpiryDecision = 'PENDING';
+
+  while (Date.now() - pollStart < maxPollTimeoutMs) {
+    if (c.signal?.aborted) {
+      throw new ChainError(
+        `${method} poll aborted`,
+        null,
+        { outcome: 'unknown', txHash: finalHash },
+        'CHAIN_SUBMISSION_TIMEOUT',
+      );
+    }
+
+    let txStatusRes: any;
+    try {
+      txStatusRes = await reader.getTransaction(finalHash);
+    } catch (err: any) {
+      logger.warn({ err: err?.message, txHash: finalHash }, 'getTransaction poll error; retrying');
+    }
+
+    if (txStatusRes) {
+      const latestLedgerCloseTime = Number(txStatusRes.latestLedgerCloseTime ?? Math.floor(Date.now() / 1000));
+      const oldestLedgerCloseTime = txStatusRes.oldestLedgerCloseTime !== undefined ? Number(txStatusRes.oldestLedgerCloseTime) : undefined;
+
+      decision = decideExpiry({
+        status: txStatusRes.status,
+        latestLedgerCloseTime,
+        maxTime: Number(maxTime),
+        submittedAtCloseTime: c.submittedAtCloseTime !== undefined ? Number(c.submittedAtCloseTime) : undefined,
+        oldestLedgerCloseTime,
+      });
+
+      if (decision === 'LANDED' || decision === 'FAILED') {
+        confirmedTx = txStatusRes;
+        break;
+      }
+
+      if (decision === 'EXPIRED') {
+        await submissionRecord('EXPIRED');
+        // The live caller's expiry handling (#42 rebuild) stands in for the
+        // completion handler, so the row is marked handled.
+        await store
+          .transition(outboxRow.id, ['SUBMITTED'], 'EXPIRED', {
+            error: 'expired without inclusion',
+            handledAt: new Date(),
+          })
+          .catch(() => undefined);
+        throw new ExpiredError(`Transaction ${finalHash} expired without inclusion`, attemptId, finalHash);
+      }
+
+      if (decision === 'UNKNOWN') {
+        await submissionRecord('UNKNOWN');
+        throw new ChainError(
+          `Transaction ${finalHash} outcome is unknown (beyond RPC retention window)`,
+          null,
+          { outcome: 'unknown', txHash: finalHash },
+          'CHAIN_TX_UNKNOWN',
+        );
+      }
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+  }
+
+  if (decision === 'PENDING') {
+    await submissionRecord('PENDING');
+    // #35: submitted but unconfirmed within the inline wait. The recovery
+    // worker resolves it; the caller records an intermediate state.
+    const pendingRow = await store.transition(outboxRow.id, ['SUBMITTED'], 'PENDING', {}).catch(() => null);
+    throw new ChainPendingError(
+      `${method} submitted; outcome pending (tx ${finalHash})`,
+      (pendingRow ?? outboxRow).id,
+      finalHash,
+    );
+  }
+
+  if (decision === 'FAILED') {
+    await submissionRecord('FAILED');
+    const errName = contractErrorName(contract, confirmedTx);
+    // The live caller's error path stands in for the completion handler.
+    await store
+      .transition(outboxRow.id, ['SUBMITTED'], 'FAILED', {
+        landedHash: finalHash,
+        ledger: (confirmedTx as any)?.ledger ?? null,
+        error: errName ?? 'failed on-chain',
+        handledAt: new Date(),
+      })
+      .catch(() => undefined);
+    throw new ChainError(`${method} failed on-chain: ${errName ?? 'Unknown error'}`, errName, { method, txHash: finalHash });
+  }
+
+  await submissionRecord('LANDED');
+
+  const feeChargedRaw = (confirmedTx as any)?.feeCharged ?? (sendRes as any)?.feeCharged;
+  const feeCharged = feeChargedRaw !== undefined ? BigInt(feeChargedRaw) : c.expectedTotal;
+  const liveFeeDetails: FeeDetails = { ...c.feeDetails, feeCharged };
+
+  await prisma.chainFee
+    .upsert({
+      where: { txHash: finalHash },
+      create: {
+        txHash: finalHash,
+        opClass,
+        inclusionFee: c.inclusionFee,
+        resourceFee: c.minResourceFee,
+        totalFee: c.expectedTotal,
+        feeCharged,
+      },
+      update: { feeCharged },
+    })
+    .catch((err: any) => logger.warn({ err: err?.message, txHash: finalHash }, 'Failed to record chain fee'));
+
+  // The on-chain return value decoded with the binding's spec is the source
+  // of truth; the simulation result is the fallback (#35).
+  const chainValue = parseReturnValue({ contract, method }, (confirmedTx as any)?.returnValue);
+  const value = (chainValue ?? simulatedValueFromSent<T>(contract, method, c.simulated)) as T;
+
+  const successRow = await store
+    .transition(outboxRow.id, ['SUBMITTED', 'PENDING'], 'SUCCESS', {
+      landedHash: finalHash,
+      ledger: (confirmedTx as any)?.ledger ?? null,
+      returnValue: printable(value) as object,
+    })
+    .catch(() => null);
+  if (successRow) {
+    outboxRow = successRow;
+    // The completion handler has run by the time write() resolves, so callers
+    // read success state back instead of writing it (#35). Idempotent: a crash
+    // here is re-run by the recovery worker.
+    await runCompletionHandler(successRow, { status: 'SUCCESS', value, txHash: finalHash }).catch((err) =>
+      logger.error({ err, outboxId: successRow.id, kind: successRow.kind }, 'completion handler failed; recovery will retry'),
+    );
+  }
+
+  logger.info({ method, txHash: finalHash, outboxId: outboxRow.id }, 'submitted and confirmed');
+  return { mode: 'live', method, value, txHash: finalHash, fee: liveFeeDetails, outboxId: outboxRow.id };
+}
 
 function simulatedValueFromSent<T>(contract: ContractKey, method: string, result: unknown): T {
   if (result && typeof result === 'object' && 'isOk' in result) {
@@ -853,9 +1121,9 @@ export interface CreateMarketArgs {
   initial_yes_bps: number;
 }
 
-const agentCreateMarketImpl = (args: CreateMarketArgs, signal?: AbortSignal) =>
+const agentCreateMarketImpl = (args: CreateMarketArgs, signal?: AbortSignal, ref?: WriteRef) =>
   write<bigint>('MARKET_MAKER', 'market_create', 'treasury', 'agent_create_market', { ...args }, async (opts, signer) =>
-    agentClients.treasury(signer).agent_create_market(args, opts as any), signal,
+    agentClients.treasury(signer).agent_create_market(args, opts as any), signal, ref,
   );
 
 export type AgentBuyArgs = { market_id: bigint; outcome: Outcome; collateral_in: bigint; min_shares_out: bigint };
@@ -868,17 +1136,23 @@ export type AgentBuyArgs = { market_id: bigint; outcome: Outcome; collateral_in:
 const agentBuyImpl = (
   args: AgentBuyArgs | (() => Promise<AgentBuyArgs>),
   signal?: AbortSignal,
-  /** Logged with the write and keyed into chain_submissions (#42). */
-  meta: { attemptId?: string; rebuildCount?: number } = {},
+  /** Logged with the write and keyed into chain_submissions (#42); the
+   *  trade.buy completion handler reads collateral_in/feeRaw from it (#35). */
+  meta: Record<string, unknown> = {},
+  ref?: WriteRef,
 ) => {
   const resolver = typeof args === 'function' ? args : async () => args;
   return write<bigint>('TRADER', 'trade', 'treasury', 'agent_buy', { ...(typeof args === 'function' ? {} : args), ...meta }, async (opts, signer) =>
-    agentClients.treasury(signer).agent_buy(await resolver(), opts as any), signal);
+    agentClients.treasury(signer).agent_buy(await resolver(), opts as any), signal, ref);
 };
 
-const agentSellImpl = (args: { market_id: bigint; outcome: Outcome; collateral_out: bigint; max_shares_in: bigint }, signal?: AbortSignal) =>
+const agentSellImpl = (
+  args: { market_id: bigint; outcome: Outcome; collateral_out: bigint; max_shares_in: bigint },
+  signal?: AbortSignal,
+  ref?: WriteRef,
+) =>
   write<bigint>('TRADER', 'trade', 'treasury', 'agent_sell', args, async (opts, signer) =>
-    agentClients.treasury(signer).agent_sell(args, opts as any), signal,
+    agentClients.treasury(signer).agent_sell(args, opts as any), signal, ref,
   );
 
 const publishTraceImpl = (args: {
@@ -887,9 +1161,9 @@ const publishTraceImpl = (args: {
   action: string;
   trace_hash: Buffer;
   ipfs_cid: string;
-}, signal?: AbortSignal, scope: AgentScope = agentScopeForTraceAction(args.action)) =>
+}, signal?: AbortSignal, scope: AgentScope = agentScopeForTraceAction(args.action), ref?: WriteRef) =>
   write<bigint>(scope, 'trace_publish', 'reasoningRegistry', 'publish_trace', args, async (opts, signer) =>
-    agentClients.reasoningRegistry(signer).publish_trace(args, opts as any), signal,
+    agentClients.reasoningRegistry(signer).publish_trace(args, opts as any), signal, ref,
   );
 
 // ─── Resolver writes (#90) ───────────────────────────────────────────────────

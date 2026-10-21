@@ -56,6 +56,27 @@ A live write failure is classified from the actual Stellar result codes (`servic
 
 Backoff is jittered exponential, `min(CHAIN_RETRY_MAX_MS, CHAIN_RETRY_BASE_MS × 2^attempt) × U(0.5, 1)`, capped by `CHAIN_RETRY_MAX_ATTEMPTS` attempts and `CHAIN_RETRY_DEADLINE_MS` total. Trade execution re-quotes `min_shares_out` on each rebuild so a retry never reuses a bound a moved price has invalidated, and it marks a `PENDING` trade `FAILED` only for a permanent classification — transient or ambiguous failures stay retryable. The market-maker's on-chain creation likewise leaves a market `PENDING` rather than failed.
 
+### Transactional outbox (#35)
+
+A live chain write is not atomic with anything the backend does around it: the process can die between signing and sending, or after the network accepted the envelope, and the caller would then record the wrong outcome (a market stuck `PENDING` after the treasury spent the seed, a `FAILED` trade whose shares the treasury holds). Every live write therefore persists a `chain_transactions` row and moves it through an explicit state machine with compare-and-set transitions:
+
+```
+BUILT ──→ SIGNED ──→ SUBMITTED ──→ PENDING ──→ SUCCESS
+   │          │           │            │   └──→ FAILED
+   │          │           │            └──────→ EXPIRED
+   └──────────┴───────────┴── (crash) ──→ resolved by the recovery worker
+```
+
+- `BUILT`: built and simulated; `kind`, `refId`, `args` and the simulated value are durable.
+- `SIGNED`: the signed envelope, hash, sequence and timebounds are in the database **before** `sendTransaction`. A write whose built transaction has no `maxTime` is refused: past the RPC retention window (~7 days on testnet), timebounds are the only way left to resolve a row.
+- `SUBMITTED`: the network has the envelope (`PENDING` and `DUPLICATE` send results both count; `ERROR` is terminal `FAILED`, e.g. `txBadSeq` can never land; `TRY_AGAIN_LATER` throws retryable without consuming the row's hash).
+- `PENDING`: the inline wait (`OUTBOX_INLINE_WAIT_MS`) expired; the write returned a `CHAIN_PENDING` error carrying the outbox id and hash, the caller recorded an intermediate state (the Trade stays `PENDING`, never `FAILED`), and the recovery worker owns resolution.
+- Terminal states record `landedHash`, `ledger` and the decoded `returnValue`.
+
+The recovery worker (`startOutboxWorker`) runs one pass at boot — before the indexer and crons issue new writes — then every `OUTBOX_POLL_MS`, under a best-effort Redis lock (`outbox:recover`) so one instance recovers at a time (transitions are compare-and-set, so a second recoverer cannot double-apply either way). A pass resolves every non-terminal row by polling `getTransaction` over all known hashes: landed rows transition and run their completion handler; `NOT_FOUND` past `maxTime` becomes `EXPIRED`; a `SIGNED` row older than 30 s (crash between sign and send) is resubmitted **byte-for-byte** from the stored envelope — safe because the hash and sequence are fixed, so at most one copy can execute; a `BUILT` row older than the grace was never signed and fails. Terminal rows whose handler never ran (crash in between) are swept too. The indexer short-circuits all of this: a stored event whose `txHash` matches a non-terminal row triggers recovery immediately.
+
+Completion handlers, registered per `kind` in the owning service, are the **single writers** of write success state and must be idempotent: `market.create` links the landed market id (`linkLandedMarket`, never overwriting a different existing link), `trade.buy` marks the Trade `EXECUTED` and creates the Position (guarded on `PENDING`; `Position.tradeId` is unique), `trade.sell` applies the exit only while it is still `SUBMITTED`, and `trace.publish` links `onChainTraceId` when still null. The inline path runs the `SUCCESS` handler before `write()` resolves, so callers read their success state back instead of writing it; failures thrown to a live caller are marked handled (the caller's error path — e.g. #40 classification or the #42 expiry rebuild — stands in for the handler), so worker-driven failure handlers only fire for rows no caller was around to see. Attempt retries under #40 build a fresh envelope and a fresh row; the superseded row is terminal `FAILED`, so recovery can never resubmit an envelope the retry replaced.
+
 ### Fee bumps (#38)
 A transaction whose inclusion fee is below the surge price is not rebuilt: a rebuilt transaction is a new hash with a new sequence that can execute alongside the original, which would double-execute a treasury trade. Instead the stored inner envelope is wrapped unchanged in a `FeeBumpTransaction` (`services/stellar/fee-bump.ts`) paid by `FEE_PAYER_SECRET`, so at most one envelope can ever land.
 
@@ -536,6 +557,23 @@ The runner only issues `findMany` (events up to `--to`, because pools are rebuil
 ## Generated code
 
 `src/generated/` is copied from the pinned `contracts` submodule by `scripts/sync-contracts.mjs`, with a do-not-edit header and `// @ts-nocheck`. CI fails if it's stale.
+
+The sync also writes `src/generated/contracts-manifest.json`: for each binding, a sha256 over its embedded spec entries, a per-entry `{ kind, name, sha256 }` index, and the expected wasm hash when the submodule's `deployments/*.json` records one (see `docs/contract-requests.md`). The manifest is derived from the submodule only — `--check` needs no network — so a binding bump shows up in code review as changed spec hashes.
+
+## Contract compatibility (#34)
+
+The backend assumes the contracts at the `CONTRACTS` addresses run exactly the wasm the bindings were generated from. Deployed contracts can be upgraded, redeployed from another build, or replaced by an env override, and when they drift the failures appear late and far from the cause: a renamed entrypoint fails simulations with `MissingValue`, a changed struct decodes with missing fields, a changed event makes `Spec.parseEvent` return null or throw inside the indexer poll.
+
+Every deployed Soroban contract carries its interface: the wasm's `contractspecv0` custom section holds the same `ScSpecEntry` XDR the bindings embed, and the contract instance records its wasm hash. At boot, `src/services/stellar/spec-compat.ts`:
+
+- fetches each contract's instance and code ledger entries over RPC (`getLedgerEntries`), reads the wasm hash and parses the embedded spec (`contract.Spec.fromWasm`), cached per wasm hash;
+- diffs the deployed spec structurally against the synced binding — docs are ignored, types compare canonically (`Option`/`Vec`/`Map`/`BytesN`/UDT-by-name) — and classifies each difference as **breaking** or **compatible** against a usage table of the entrypoints the services actually call and the events the indexer projects (a unit test greps the services and fails when the table is stale);
+- checks the wasm hash against the manifest pin when one is recorded and the contract id is not overridden by env;
+- only confirms the USDC contract's executable is a Stellar Asset (its interface is a SAC, never checked).
+
+Classification rules: a used function removed or changed is breaking, an unused or new one is compatible; a struct/union/enum reachable from a used function or projected event is breaking when changed, except a union/enum case appended at the end, which is compatible for read-only types and breaking for types the backend encodes (e.g. `Category`); an error enum code reassigned under an existing name is breaking (error naming depends on it), new codes are compatible; a projected event changed in topics or data fields is breaking. A contract that cannot be verified (archived code entry, RPC failure) is breaking — the gate never fails open.
+
+In live mode (default `SPEC_COMPAT_ENFORCE=enforce`) any breaking difference or wasm-hash mismatch refuses startup, listing every breaking item. Dry-run (default `warn`) logs a structured warning and keeps running; `off` skips the check. The indexer keeps **storing** events whose spec changed in a breaking way but stops projecting and publishing them (and a `parseEvent` throw skips that event instead of aborting the poll). Admins can read the last report at `GET /api/v1/admin/chain/spec-compat`.
 
 ## LLM router (#157)
 

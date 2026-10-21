@@ -23,6 +23,7 @@ import { secret } from '../config/secrets';
 import { health } from '../services/health.service';
 import { indexerStatus } from '../services/indexer.service';
 import { agentSigner } from '../services/stellar/clients';
+import { effectiveMode, specCompatReport } from '../services/stellar/spec-compat';
 import { getFeeOracle } from '../services/stellar/fees';
 import { getLlmUsage } from '../lib/llm-budget';
 import { getCronStatus } from '../cron/registry';
@@ -225,6 +226,17 @@ export async function triggerTraceAuditRun(req: Request, res: Response): Promise
 }
 
 /**
+ * GET /admin/chain/spec-compat (#34)
+ * The last contract spec compatibility report from the boot gate: per
+ * contract, the deployed wasm hash against the pinned one and every spec
+ * difference with its breaking/compatible classification. `report` is null
+ * when the gate has not run (SPEC_COMPAT_ENFORCE=off).
+ */
+export async function getSpecCompat(_req: Request, res: Response): Promise<void> {
+  sendSuccess(res, { mode: effectiveMode(), report: specCompatReport() });
+}
+
+/**
  * GET /admin/status (#111)
  * Probe details, indexer lag, cron runs, chain mode and LLM state. Unlike
  * /readyz this includes ledger numbers, so it is admin-only.
@@ -386,6 +398,8 @@ export async function getAdminAudit(req: Request, res: Response): Promise<void> 
   const { page, limit, skip } = parsePagination(req.query as any);
   const { rows, total } = await listAdminAudit(limit, skip);
   sendSuccess(res, rows, 200, buildPaginationMeta(page, limit, total) as any);
+}
+
 // ─── Dispute monitor (#92) ───────────────────────────────────────────────
 
 const disputeIdSchema = z.object({ id: z.string().uuid('id must be a dispute review UUID') });

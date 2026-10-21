@@ -19,6 +19,8 @@ import { startTraceAuditCron } from './cron/trace-audit.cron';
 import { startTracePublicationCron } from './cron/trace-publication.cron';
 import { startPaymentIntentCron } from './cron/payment-intent.cron';
 import { startEventListener } from './services/indexer.service';
+import { gateDecision, runSpecCompatGate } from './services/stellar/spec-compat';
+import { startOutboxWorker } from './services/stellar/outbox';
 import { closeRedis, getRedis, checkRedisPolicy } from './lib/redis';
 import { memoryEventBus, redisEventBus } from './lib/event-bus';
 import { startFanout, startLocalFanout } from './lib/fanout';
@@ -29,6 +31,7 @@ import { health } from './services/health.service';
 let stopEventListener: (() => void) | null = null;
 let stopFanout: (() => Promise<void>) | null = null;
 let stopSecretRefresh: (() => void) | null = null;
+let stopOutboxWorker: (() => void) | null = null;
 
 async function bootstrap(): Promise<void> {
   // 0. Resolve secrets (mounted files or the configured remote provider).
@@ -89,6 +92,20 @@ async function bootstrap(): Promise<void> {
     }
   }
 
+  // 1b. Contract spec compatibility gate (#34): verify the deployed contracts
+  // still run what the synced bindings were generated from, before anything
+  // simulates calls or decodes events against those bindings. Live mode
+  // refuses to start on breaking drift; dry-run warns and keeps running.
+  const specCompat = await runSpecCompatGate();
+  if (specCompat && gateDecision(specCompat, specCompat.mode) === 'refuse') {
+    process.exit(1);
+  }
+
+  // 1c. Transaction outbox recovery (#35): resolve whatever a previous process
+  // left in flight before the indexer and crons start issuing new writes, then
+  // keep recovering on an interval (one instance at a time via a Redis lock).
+  stopOutboxWorker = startOutboxWorker();
+
   // 2. Start HTTP server with Socket.io
   const server = http.createServer(app);
   const io = new Server(server, {
@@ -133,7 +150,7 @@ async function bootstrap(): Promise<void> {
   // Price-mode reveal + resolve loop (#90).
   startPriceResolutionCron();
 
-  io.on('connection', (socket) => {
+  io.on('connection', async (socket) => {
     logger.info({ socketId: socket.id }, 'New client connected to socket.io');
     if (await isAdminToken(socket.handshake.auth?.token)) void socket.join('admins');
     
@@ -166,6 +183,8 @@ async function bootstrap(): Promise<void> {
     // Stop producing and consuming first, then close sockets and the HTTP
     // server (io.close also closes `server`), then the shared connections.
     if (stopEventListener) stopEventListener();
+    // In-flight outbox rows stay in the table and resolve on the next boot.
+    if (stopOutboxWorker) stopOutboxWorker();
     if (stopSecretRefresh) stopSecretRefresh();
     if (stopFanout) await stopFanout().catch(() => undefined);
     io.close(async () => {
