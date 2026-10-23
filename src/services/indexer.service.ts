@@ -1,7 +1,14 @@
 /**
  * Stellar event indexer: polls RPC getEvents for the four OracleDesk
  * contracts, stores each event once (keyed by its RPC event id), applies
- * side effects, and emits socket.io events.
+ * side effects, and publishes public events to the event bus (#93).
+ *
+ * - Publication is tied to the committed chain_events row: `published` flips
+ *   to true only after the bus accepted the event, and publishPending()
+ *   republishes whatever is still false, in (ledger, id) order. A crash
+ *   between store and publish therefore loses nothing; a crash between the
+ *   bus accepting the event and the flag republishes it, and the consumer
+ *   drops the duplicate by id.
  *
  * - The ledger cursor is persisted in Postgres (indexer_cursors), so a
  *   restart resumes where it stopped.
@@ -20,20 +27,29 @@ import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { newId, runWithContext } from '../lib/context';
 import { readClients, rpcServer } from './stellar/clients';
+import { disabledEventProjections } from './stellar/spec-compat';
 import { printable } from './chain.service';
 import { priceYesBps } from '../generated/fpmm';
 import { withTimeout, deadline } from '../lib/resilience';
+import { applyMarketFinality } from './market-finality';
 
 export type EventSource = Pick<rpc.Server, 'getEvents' | 'getHealth'>;
 
+/** Identity of the committed event a public message came from. */
+export interface PublishMeta {
+  /** chain_events.id */
+  id: string;
+  ledger: number;
+  /** On-chain market id (decimal string) when the event belongs to a market. */
+  marketKey: string | null;
+}
+
+export type PublishFn = (event: string, payload: unknown, meta: PublishMeta) => unknown;
+
 export interface IndexerDeps {
   source: EventSource;
-  /** Called for each newly stored event that should reach clients. */
-  emit: (
-    event: string,
-    payload: unknown,
-    meta: { live: boolean; ledger: number; marketKey: string | null },
-  ) => void;
+  /** Publishes a public event (to the event bus). Rejecting leaves the row unpublished. */
+  emit: PublishFn;
 }
 
 const PAGE_LIMIT = 200;
@@ -61,13 +77,34 @@ export interface DecodedEvent {
   params: Record<string, any>;
 }
 
+// One warning per key per process: a breaking spec change would otherwise
+// repeat the same line on every poll.
+const warned = new Set<string>();
+function warnOnce(key: string, context: Record<string, unknown>, message: string): void {
+  if (warned.has(key)) return;
+  warned.add(key);
+  logger.warn(context, message);
+}
+
 /** Decodes one RPC event with its contract's spec; null for unknown events. */
 export function decodeEvent(event: rpc.Api.EventResponse, known = specs()): DecodedEvent | null {
   const contractId = event.contractId?.contractId();
   if (!contractId) return null;
   const entry = known.get(contractId);
   if (!entry) return null;
-  const parsed = entry.spec.parseEvent(event.topic as xdr.ScVal[], event.value);
+  let parsed: ReturnType<Spec['parseEvent']>;
+  try {
+    parsed = entry.spec.parseEvent(event.topic as xdr.ScVal[], event.value);
+  } catch (err) {
+    // A deployed event whose shape drifted from the binding spec (#34) must
+    // not abort the whole poll; the spec-compat report names the drift.
+    warnOnce(
+      `decode:${entry.name}`,
+      { contract: entry.name, eventId: event.id, err: err instanceof Error ? err.message : String(err) },
+      'Indexer: event does not decode with the binding spec (skipped; see /admin/chain/spec-compat)',
+    );
+    return null;
+  }
   if (!parsed) return null;
   return {
     id: event.id,
@@ -81,8 +118,16 @@ export function decodeEvent(event: rpc.Api.EventResponse, known = specs()): Deco
   };
 }
 
+/** Events that reach socket clients; every other stored event has nothing to publish. */
+function hasPublicEvent(event: Pick<DecodedEvent, 'contractName' | 'eventName'>): boolean {
+  return (
+    (event.contractName === 'marketCore' && event.eventName === 'Trade') ||
+    (event.contractName === 'reasoningRegistry' && event.eventName === 'TracePublished')
+  );
+}
+
 /** Stores an event; returns false if it was already stored (idempotent). */
-async function store(event: DecodedEvent): Promise<boolean> {
+async function store(event: DecodedEvent, publishable = hasPublicEvent(event)): Promise<boolean> {
   try {
     await prisma.chainEvent.create({
       data: {
@@ -94,6 +139,7 @@ async function store(event: DecodedEvent): Promise<boolean> {
         ledgerClosedAt: new Date(event.ledgerClosedAt),
         txHash: event.txHash,
         params: printable(event.params) as Prisma.InputJsonValue,
+        published: !publishable,
       },
     });
     return true;
@@ -106,11 +152,7 @@ async function store(event: DecodedEvent): Promise<boolean> {
 const outcomeTag = (o: unknown): 'Yes' | 'No' | null =>
   o && typeof o === 'object' && 'tag' in o ? ((o as { tag: 'Yes' | 'No' }).tag) : null;
 
-async function applySideEffects(
-  event: DecodedEvent,
-  emit: IndexerDeps['emit'],
-  meta: { live: boolean; ledger: number; marketKey: string | null },
-): Promise<void> {
+async function applySideEffects(event: DecodedEvent): Promise<void> {
   const p = event.params;
 
   // ── Pre-step: Event-driven cache invalidation (Issue #98) ──
@@ -147,7 +189,12 @@ async function applySideEffects(
     const yesBps = Number(priceYesBps(BigInt(p.reserve_yes), BigInt(p.reserve_no)));
     const market = await prisma.market.findUnique({ where: { onChainMarketId }, select: { id: true, question: true } });
     if (market) {
-      await prisma.market.update({ where: { id: market.id }, data: { currentYesProb: yesBps / 10_000 } });
+      // Only a newer (or same-ledger) observation may move the price: the
+      // reconciler may already have written a later one.
+      await prisma.market.updateMany({
+        where: { id: market.id, OR: [{ chainSyncedLedger: null }, { chainSyncedLedger: { lte: event.ledger } }] },
+        data: { currentYesProb: yesBps / 10_000, chainSyncedLedger: event.ledger },
+      });
     }
     if (Boolean(p.is_buy)) {
       try {
@@ -157,30 +204,6 @@ async function applySideEffects(
         logger.error({ err, eventId: event.id }, 'Indexer: copy trade reconciliation failed');
       }
     }
-
-    emit(
-      'TRADE_EXECUTED',
-      {
-        onChainMarketId: onChainMarketId.toString(),
-        marketId: market?.id ?? null,
-        marketQuestion: market?.question ?? null,
-        trader: p.trader,
-        direction: outcomeTag(p.outcome) === 'No' ? 'NO' : 'YES',
-        isBuy: Boolean(p.is_buy),
-        collateralRaw: String(p.collateral),
-        sharesRaw: String(p.shares),
-        feeRaw: String(p.fee),
-        priceYesBps: yesBps,
-        txHash: event.txHash,
-        ledger: event.ledger,
-        eventId: event.id,
-      },
-      {
-        live: meta.live,
-        ledger: event.ledger,
-        marketKey: onChainMarketId.toString(),
-      },
-    );
     return;
   }
 
@@ -189,20 +212,24 @@ async function applySideEffects(
     const outcome = outcomeTag(p.outcome); // null: the market was voided
     const market = await prisma.market.findUnique({ where: { onChainMarketId }, select: { id: true } });
     if (!market) return;
-    await prisma.$transaction([
-      prisma.market.update({
-        where: { id: market.id },
-        data: {
-          status: outcome ? 'RESOLVED' : 'CANCELLED',
-          resolvedOutcome: outcome ? outcome === 'Yes' : null,
-          resolvedAt: new Date(event.ledgerClosedAt),
-        },
-      }),
-      prisma.position.updateMany({
-        where: { marketId: market.id, status: 'OPEN' },
-        data: { status: 'CLOSED', closedAt: new Date(event.ledgerClosedAt), closeReason: outcome ? `${outcome.toUpperCase()}_RESOLVED` : 'VOIDED' },
-      }),
-    ]);
+    await applyMarketFinality(market.id, outcome, new Date(event.ledgerClosedAt), event.ledger);
+    return;
+  }
+
+  // #92: a signer proposal opens a dispute review. The independent evaluation
+  // and its alerts run after this poll tick (scheduleReview), never inside it.
+  if (event.contractName === 'resolver' && event.eventName === 'ResolutionProposed') {
+    if (!config.DISPUTE_MONITOR_ENABLED) return;
+    const monitor = await import('./dispute-monitor.service');
+    const { review, created } = await monitor.recordProposal(event);
+    if (created) monitor.scheduleReview(review.id);
+    return;
+  }
+
+  if (event.contractName === 'resolver' && event.eventName === 'ResolutionFinalized') {
+    if (!config.DISPUTE_MONITOR_ENABLED) return;
+    const monitor = await import('./dispute-monitor.service');
+    await monitor.recordFinalized(event);
     return;
   }
 
@@ -222,11 +249,21 @@ async function applySideEffects(
     });
     if (trace && (trace.onChainTraceId === null || trace.onChainTraceId === onChainTraceId)) {
       // The event's trace_hash equals our stored traceHash, which is exactly
-      // what verification means for our own traces (#131).
+      // what verification means for our own traces (#131). RPC reports a
+      // fee-bumped transaction by its outer hash, so resolve the inner hash
+      // from the outbox by any known hash (#38).
+      const innerTxHash = await import('./stellar/outbox')
+        .then((m) => m.innerHashForTx(event.txHash))
+        .catch(() => null);
       if (trace.onChainTraceId === null) {
         await prisma.reasoningTrace.update({
           where: { id: trace.id },
-          data: { onChainTraceId, publishTxHash: event.txHash, verified: true },
+          data: {
+            onChainTraceId,
+            publishTxHash: event.txHash,
+            ...(innerTxHash && innerTxHash !== event.txHash ? { publishInnerTxHash: innerTxHash } : {}),
+            verified: true,
+          },
         });
       } else {
         await prisma.reasoningTrace.update({ where: { id: trace.id }, data: { verified: true } });
@@ -236,10 +273,61 @@ async function applySideEffects(
         data: { status: 'CONFIRMED', confirmedAt: new Date(), lastError: null },
       });
     }
-    emit(
-      'REASONING_PUBLISHED',
-      {
-        onChainTraceId: onChainTraceId.toString(),
+  }
+}
+
+export interface PublicEvent {
+  type: 'TRADE_EXECUTED' | 'REASONING_PUBLISHED';
+  payload: Record<string, unknown>;
+  marketKey: string | null;
+}
+
+/**
+ * The socket message for a stored event, or null when it has none. Built from
+ * the stored event plus current database state, so the live path and the
+ * recovery path (publishPending) produce the same payload.
+ */
+export async function publicEventFor(event: DecodedEvent): Promise<PublicEvent | null> {
+  const p = event.params;
+
+  if (event.contractName === 'marketCore' && event.eventName === 'Trade') {
+    const onChainMarketId = BigInt(p.market_id);
+    const yesBps = Number(priceYesBps(BigInt(p.reserve_yes), BigInt(p.reserve_no)));
+    const market = await prisma.market.findUnique({ where: { onChainMarketId }, select: { id: true, question: true } });
+    return {
+      type: 'TRADE_EXECUTED',
+      marketKey: onChainMarketId.toString(),
+      payload: {
+        onChainMarketId: onChainMarketId.toString(),
+        marketId: market?.id ?? null,
+        marketQuestion: market?.question ?? null,
+        trader: p.trader,
+        direction: outcomeTag(p.outcome) === 'No' ? 'NO' : 'YES',
+        isBuy: Boolean(p.is_buy),
+        collateralRaw: String(p.collateral),
+        sharesRaw: String(p.shares),
+        feeRaw: String(p.fee),
+        priceYesBps: yesBps,
+        txHash: event.txHash,
+        ledger: event.ledger,
+        eventId: event.id,
+      },
+    };
+  }
+
+  if (event.contractName === 'reasoningRegistry' && event.eventName === 'TracePublished') {
+    const traceHash =
+      typeof p.trace_hash === 'string' ? p.trace_hash : Buffer.from(p.trace_hash).toString('hex');
+    const onChainMarketId = BigInt(p.market_id);
+    const trace = await prisma.reasoningTrace.findFirst({
+      where: { traceHash, market: { onChainMarketId } },
+      select: { id: true },
+    });
+    return {
+      type: 'REASONING_PUBLISHED',
+      marketKey: onChainMarketId.toString(),
+      payload: {
+        onChainTraceId: BigInt(p.trace_id).toString(),
         onChainMarketId: String(p.market_id),
         traceId: trace?.id ?? null,
         agent: p.agent,
@@ -249,13 +337,55 @@ async function applySideEffects(
         txHash: event.txHash,
         ledger: event.ledger,
       },
-      {
-        live: meta.live,
-        ledger: event.ledger,
-        marketKey: String(p.market_id),
-      },
-    );
+    };
   }
+
+  return null;
+}
+
+const PUBLISH_BATCH = 200;
+
+// The live path and the recovery loop both go through this queue, so they can
+// never publish concurrently and (ledger, id) order holds within one instance.
+let publishQueue: Promise<unknown> = Promise.resolve();
+function serialised<T>(fn: () => Promise<T>): Promise<T> {
+  const run = publishQueue.then(fn, fn);
+  publishQueue = run.catch(() => undefined);
+  return run;
+}
+
+/**
+ * Publishes every stored event with published = false, oldest first, flagging
+ * each one after the bus accepted it. Stops at the first failure so a later
+ * event never overtakes an earlier one; the next call retries from there.
+ */
+export function publishPending(emit: PublishFn): Promise<{ published: number; failed: boolean }> {
+  return serialised(async () => {
+    let published = 0;
+    for (;;) {
+      const rows = await prisma.chainEvent.findMany({
+        where: { published: false },
+        orderBy: [{ ledger: 'asc' }, { id: 'asc' }],
+        take: PUBLISH_BATCH,
+      });
+      for (const row of rows) {
+        try {
+          const decoded = decodedFromStored(row);
+          const pub = await publicEventFor(decoded);
+          if (pub) await emit(pub.type, pub.payload, { id: row.id, ledger: row.ledger, marketKey: pub.marketKey });
+          await prisma.chainEvent.update({ where: { id: row.id }, data: { published: true } });
+          published++;
+        } catch (err) {
+          logger.warn(
+            { err: err instanceof Error ? err.message : err, eventId: row.id },
+            'Indexer: publishing failed; will retry from this event',
+          );
+          return { published, failed: true };
+        }
+      }
+      if (rows.length < PUBLISH_BATCH) return { published, failed: false };
+    }
+  });
 }
 
 async function readCursor(): Promise<number | null> {
@@ -299,7 +429,6 @@ export async function backfillEvents(
       return { startLedger, lastLedger: cursor ?? health.latestLedger, seen: 0, stored: 0 };
     }
 
-    const isCatchup = health.latestLedger - startLedger > config.SOCKET_LIVE_LEDGER_LAG;
     const known = specs();
     const filters: rpc.Api.EventFilter[] = [{ type: 'contract', contractIds: [...known.keys()] }];
     let seen = 0;
@@ -317,15 +446,32 @@ export async function backfillEvents(
         seen++;
         const decoded = decodeEvent(raw, known);
         if (!decoded) continue;
-        const live = page.latestLedger - decoded.ledger <= config.SOCKET_LIVE_LEDGER_LAG;
-        const marketKey = decoded.params?.market_id !== undefined ? String(decoded.params.market_id) : null;
-        const meta = { live, ledger: decoded.ledger, marketKey };
-
-        if (await store(decoded)) {
-          stored++;
-          await applySideEffects(decoded, deps.emit, meta).catch((err) =>
-            logger.error({ err, eventId: decoded.id }, 'Indexer side effect failed'),
+        // #34: an event whose deployed spec has a breaking change is still
+        // stored, but no longer projected or published — its decoded params
+        // can no longer be trusted to match what the binding promised.
+        const key = `${decoded.contractName}:${decoded.eventName}`;
+        const projectable = !disabledEventProjections().has(key);
+        if (!projectable) {
+          warnOnce(
+            `project:${key}`,
+            { contract: decoded.contractName, event: decoded.eventName },
+            'Indexer: projections disabled for this event (breaking spec change; see /admin/chain/spec-compat)',
           );
+        }
+        if (await store(decoded, projectable && hasPublicEvent(decoded))) {
+          stored++;
+          // #35: an indexed event proves its transaction landed. A matching
+          // non-terminal outbox row resolves now instead of on the next poll.
+          await import('./stellar/outbox')
+            .then((m) => m.recoverByTxHash(decoded.txHash))
+            .catch((err) =>
+              logger.warn({ err: err instanceof Error ? err.message : err, txHash: decoded.txHash }, 'Indexer: outbox recovery by txHash failed'),
+            );
+          if (projectable) {
+            await applySideEffects(decoded).catch((err) =>
+              logger.error({ err, eventId: decoded.id }, 'Indexer side effect failed'),
+            );
+          }
         }
       }
       if (page.events.length < PAGE_LIMIT) break;
@@ -337,17 +483,10 @@ export async function backfillEvents(
     }
 
     await writeCursor(latestLedger);
-    if (isCatchup) {
-      deps.emit(
-        'CATCHUP_COMPLETE',
-        {
-          fromLedger: startLedger,
-          toLedger: latestLedger,
-          events: stored,
-        },
-        { live: true, ledger: latestLedger, marketKey: null },
-      );
-    }
+    // Also covers rows left unpublished by an earlier outage, not just this run's.
+    await publishPending(deps.emit).catch((err) =>
+      logger.warn({ err: err instanceof Error ? err.message : err }, 'Indexer: publish pass failed'),
+    );
     if (stored > 0) logger.info({ startLedger, lastLedger: latestLedger, seen, stored }, 'Indexed Stellar events');
     return { startLedger, lastLedger: latestLedger, seen, stored };
   } finally {
@@ -360,16 +499,8 @@ export async function backfillEvents(
  * does not insert the event first, so a restore can rebuild projections for
  * rows that survived the backup. Callers replay in (ledger, id) order.
  */
-export async function reprojectEvent(
-  event: DecodedEvent,
-  emit: IndexerDeps['emit'] = () => undefined,
-): Promise<void> {
-  const meta = {
-    live: true,
-    ledger: event.ledger,
-    marketKey: event.params?.market_id !== undefined ? String(event.params.market_id) : null,
-  };
-  await applySideEffects(event, emit, meta);
+export async function reprojectEvent(event: DecodedEvent): Promise<void> {
+  await applySideEffects(event);
 }
 
 /** Converts a stored row back into the decoded shape used by applySideEffects. */

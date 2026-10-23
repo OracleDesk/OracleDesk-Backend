@@ -7,15 +7,17 @@ import { randomBytes } from 'node:crypto';
  */
 export async function withRedisPrefix(label: string) {
   const { getRedis } = await import('../../src/lib/redis');
+  type ChallengeRecord = import('../../src/services/auth.service').ChallengeRecord;
   const prefix = `test:${label}:${randomBytes(3).toString('hex')}:`;
   return {
     prefix,
     store: {
-      async put(hash: string, address: string, ttl: number) {
-        await getRedis().set(`${prefix}auth:challenge:${hash}`, address, 'EX', ttl);
+      async put(hash: string, record: import('../../src/services/auth.service').ChallengeRecord, ttl: number) {
+        await getRedis().set(`${prefix}auth:challenge:${hash}`, JSON.stringify(record), 'EX', ttl);
       },
       async take(hash: string) {
-        return getRedis().getdel(`${prefix}auth:challenge:${hash}`);
+        const raw = await getRedis().getdel(`${prefix}auth:challenge:${hash}`);
+        return raw === null ? null : (JSON.parse(raw) as import('../../src/services/auth.service').ChallengeRecord);
       },
     },
     /** Deletes this file's keys with SCAN + UNLINK. */

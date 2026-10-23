@@ -42,6 +42,54 @@ export class ChainError extends AppError {
   }
 }
 
+/**
+ * Terminal failure of a live write (#40). Carries the classified failure so
+ * callers can distinguish genuinely retryable from permanent without parsing
+ * message text.
+ */
+export class TransactionError extends ChainError {
+  constructor(
+    message: string,
+    failure: {
+      class: string;
+      txCode: string | null;
+      opCode: string | null;
+      contractError: string | null;
+      txHash: string | null;
+      submitted: boolean;
+    },
+    attempts: number,
+  ) {
+    super(message, failure.contractError, {
+      failureClass: failure.class,
+      txCode: failure.txCode,
+      opCode: failure.opCode,
+      txHash: failure.txHash,
+      submitted: failure.submitted,
+      attempts,
+    }, 'CHAIN_TX_FAILED');
+    this.name = 'TransactionError';
+  }
+}
+
+/**
+ * A live write was submitted but its outcome was not confirmed within the
+ * inline wait (#35). The outbox row owns resolution from here: the recovery
+ * worker confirms, fails or expires it and runs the completion handler.
+ * Callers record an intermediate state (e.g. a Trade stays PENDING), never a
+ * failure.
+ */
+export class ChainPendingError extends AppError {
+  constructor(
+    message: string,
+    public readonly outboxId: string,
+    public readonly txHash: string | null,
+  ) {
+    super(502, 'CHAIN_PENDING', message, { outboxId, txHash });
+    this.name = 'ChainPendingError';
+  }
+}
+
 export class ArchivedEntryError extends AppError {
   constructor(message = 'Entry is archived on-chain', details?: Record<string, unknown>) {
     super(410, 'ARCHIVED_ENTRY', message, details);

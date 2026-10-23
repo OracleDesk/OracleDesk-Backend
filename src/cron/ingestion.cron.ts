@@ -1,6 +1,10 @@
 import cron from 'node-cron';
 import { runMarketMakerCycle } from '../agents/market-maker.agent';
+import { backfillEmbeddings } from '../services/embeddings.service';
+import { reconcileUnresolvedAttempts } from '../services/market-idempotency.service';
+import { config } from '../config';
 import { logger } from '../lib/logger';
+import { newId, runWithContext } from '../lib/context';
 import { recordCronRun } from './registry';
 
 let runningCycleId: string | null = null;
@@ -25,17 +29,26 @@ export function startIngestionCron(): void {
         return;
       }
 
-    isRunning = true;
-    const startedAt = new Date();
-    try {
-      await runMarketMakerCycle();
-      recordCronRun('ingestion', 'success', startedAt, new Date());
-    } catch (err) {
-      recordCronRun('ingestion', 'failure', startedAt, new Date(), err);
-      logger.error({ err }, 'Ingestion cron: cycle failed');
-    } finally {
-      isRunning = false;
-    }
+      runningCycleId = cycleId;
+      const startedAt = new Date();
+      try {
+        await runMarketMakerCycle();
+        // Retry sweep (#69): embed markets whose vector is still NULL (a failed
+        // fire-and-forget, or created before an embedding provider was set up).
+        await backfillEmbeddings(32, { maxBatches: 1 }).catch((err) =>
+          logger.warn({ err: (err as Error)?.message?.slice(0, 200) }, 'Ingestion cron: embedding sweep failed'));
+        if (config.CHAIN_EXECUTION_MODE === 'live') {
+          await reconcileUnresolvedAttempts().catch((err) =>
+            logger.warn({ err: (err as Error)?.message?.slice(0, 200) }, 'Ingestion cron: attempt reconciliation failed'));
+        }
+        recordCronRun('ingestion', 'success', startedAt, new Date());
+      } catch (err) {
+        recordCronRun('ingestion', 'failure', startedAt, new Date(), err);
+        logger.error({ err }, 'Ingestion cron: cycle failed');
+      } finally {
+        runningCycleId = null;
+      }
+    });
   });
 
   logger.info('Ingestion cron started (every 15 minutes)');

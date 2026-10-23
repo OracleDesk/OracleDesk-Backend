@@ -23,8 +23,9 @@ import { logger } from '../lib/logger';
 import { config } from '../config';
 import { AppError } from '../middlewares/error.middleware';
 import { pinJson } from '../services/ipfs.service';
-import { publishTrace } from '../services/chain.service';
+import { publishTrace, ExpiredError, ChainPendingError } from '../services/chain.service';
 import { ChainError } from '../services/stellar/errors';
+import { AgentPausedError } from '../services/agent-controls.service';
 import { agentSigner } from '../services/stellar/clients';
 import { defaultRegistryReader, type RegistryReader } from '../services/trace-audit.service';
 
@@ -35,6 +36,8 @@ const PERMANENT_CONTRACT_ERRORS = new Set(['AgentNotRegistered', 'EmptyAction', 
 const BASE_BACKOFF_MS = 30_000;
 const MAX_BACKOFF_MS = 60 * 60_000;
 const MARKET_WAIT_MS = 5 * 60_000;
+/** How long a trace waits when its agent is paused (#79). */
+const PAUSED_RECHECK_MS = 5 * 60_000;
 const DRY_RUN_RECHECK_MS = 6 * 60 * 60_000;
 const CLAIM_LEASE_MS = 2 * 60_000;
 /** How many of a market's newest registry traces the duplicate check reads. */
@@ -44,17 +47,20 @@ const MAX_STEPS = 6;
 
 export interface TracePublisher {
   agent(): string;
-  publish(args: {
-    market_id: bigint;
-    action: string;
-    trace_hash: Buffer;
-    ipfs_cid: string;
-  }): Promise<{ mode: 'dry-run' | 'live'; value: bigint; txHash: string | null }>;
+  publish(
+    args: {
+      market_id: bigint;
+      action: string;
+      trace_hash: Buffer;
+      ipfs_cid: string;
+    },
+    ref?: { kind: string; refId: string },
+  ): Promise<{ mode: 'dry-run' | 'live'; value: bigint; txHash: string | null }>;
 }
 
 export const defaultPublisher: TracePublisher = {
   agent: () => agentSigner().publicKey as string,
-  publish: (args) => publishTrace({ agent: agentSigner().publicKey as string, ...args }),
+  publish: (args, ref) => publishTrace({ agent: agentSigner().publicKey as string, ...args }, undefined, undefined, ref),
 };
 
 export interface PublicationRow {
@@ -276,12 +282,17 @@ async function advance(row: PublicationRow, ctx: Ctx): Promise<Advance> {
         const dup = await findOnChainDuplicate(ctx, trace.market.onChainMarketId, trace.traceHash);
         if (dup !== null) return confirm(ctx, row, dup, false);
       }
-      const result = await ctx.publisher.publish({
-        market_id: trace.market.onChainMarketId,
-        action: row.action,
-        trace_hash: Buffer.from(trace.traceHash, 'hex'),
-        ipfs_cid: trace.ipfsCid,
-      });
+      const result = await ctx.publisher.publish(
+        {
+          market_id: trace.market.onChainMarketId,
+          action: row.action,
+          trace_hash: Buffer.from(trace.traceHash, 'hex'),
+          ipfs_cid: trace.ipfsCid,
+        },
+        // #35: the trace.publish completion handler links onChainTraceId even
+        // when this worker dies before its own confirm step runs.
+        { kind: 'trace.publish', refId: row.traceId },
+      );
       if (result.mode === 'dry-run') {
         logger.info({ traceId: row.traceId, simulatedTraceId: String(result.value) }, 'dry-run: trace publish simulated, row stays READY');
         await update(ctx, row.id, { nextAttemptAt: after(ctx.now, DRY_RUN_RECHECK_MS) });
@@ -323,6 +334,37 @@ async function advance(row: PublicationRow, ctx: Ctx): Promise<Advance> {
 }
 
 async function handleError(row: PublicationRow, err: unknown, ctx: Ctx): Promise<TracePublicationStatus> {
+  // A paused agent publishes later; waiting is not a failed attempt.
+  if (err instanceof AgentPausedError) {
+    await update(ctx, row.id, { nextAttemptAt: after(ctx.now, PAUSED_RECHECK_MS) });
+    logger.info({ traceId: row.traceId }, 'Trace publication deferred: agent paused');
+    return row.status;
+  }
+  // Submitted but unconfirmed within the inline wait (#35): the outbox worker
+  // and the trace.publish handler confirm it; this row re-checks chain state
+  // from SUBMITTED exactly as it does after an indexer-confirmation timeout.
+  if (err instanceof ChainPendingError) {
+    await update(ctx, row.id, {
+      status: S.SUBMITTED,
+      submittedTxHash: err.txHash ?? null,
+      nextAttemptAt: after(ctx.now, ctx.confirmTimeoutMs),
+      lastError: null,
+    });
+    logger.info({ traceId: row.traceId, txHash: err.txHash }, 'Trace publication submitted; awaiting outbox confirmation');
+    return S.SUBMITTED;
+  }
+  if (err instanceof ExpiredError) {
+    const attempts = row.attempts + 1;
+    await update(ctx, row.id, {
+      status: S.READY,
+      attempts,
+      submittedTxHash: err.txHash ?? null,
+      lastError: 'CHAIN_TX_EXPIRED',
+      nextAttemptAt: after(ctx.now, backoffMs(attempts)),
+    });
+    logger.info({ traceId: row.traceId, attempts, prevTxHash: err.txHash }, 'Trace publication expired; will rebuild and resubmit');
+    return S.READY;
+  }
   const contractError = err instanceof ChainError ? err.contractError : null;
   const message = contractError ?? (err instanceof Error ? err.message : String(err));
   if (contractError && PERMANENT_CONTRACT_ERRORS.has(contractError)) {

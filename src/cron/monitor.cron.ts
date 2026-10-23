@@ -1,12 +1,18 @@
 import cron from 'node-cron';
 import { runTraderCycle } from '../agents/trader.agent';
-import { expireStaleSubscriptions } from '../services/subscription.service';
+import { computeCorrelationSnapshot } from '../services/correlation.service';
+import { expireStaleSubscriptions, notifyExpiringPasses } from '../services/subscription.service';
 import { logger } from '../lib/logger';
-import { newId, runWithContext } from '../lib/context';
+import { config } from '../config';
+import { postgresContentStore } from '../services/content-store.service';
+import { correlation, newId, runWithContext } from '../lib/context';
 import { purgeExpiredIdempotencyKeys } from '../middlewares/idempotency.middleware';
+import { computeAndStoreSnapshots } from '../services/calibration.service';
+import { purgeSignalStore } from '../services/signal-store.service';
 import { recordCronRun } from './registry';
 
 let runningTraderCycleId: string | null = null;
+let correlationSnapshotRunning = false;
 
 /** One correlated context per cron tick. */
 function tick(job: string, fn: () => Promise<void>): Promise<void> {
@@ -24,6 +30,25 @@ function tick(job: string, fn: () => Promise<void>): Promise<void> {
  * Separate guard flags prevent the Trader Agent from overlapping with itself.
  */
 export function startMonitorCron(): void {
+  // Correlation snapshot (#80) — every 15 minutes, just before the trader reads it.
+  cron.schedule('2,17,32,47 * * * *', () => tick('correlation-snapshot', async () => {
+    if (correlationSnapshotRunning) {
+      logger.warn({ skippedJob: 'correlation-snapshot' }, 'Monitor cron: correlation snapshot still running — skipping');
+      return;
+    }
+    correlationSnapshotRunning = true;
+    const startedAt = new Date();
+    try {
+      await computeCorrelationSnapshot();
+      recordCronRun('correlation-snapshot', 'success', startedAt, new Date());
+    } catch (err) {
+      recordCronRun('correlation-snapshot', 'failure', startedAt, new Date(), err);
+      logger.error({ err }, 'Monitor cron: correlation snapshot failed');
+    } finally {
+      correlationSnapshotRunning = false;
+    }
+  }));
+
   // Trader Agent — every 15 minutes
   cron.schedule('5,20,35,50 * * * *', () => tick('trader', async () => {
     if (runningTraderCycleId) {
@@ -31,7 +56,7 @@ export function startMonitorCron(): void {
       return;
     }
 
-    traderRunning = true;
+    runningTraderCycleId = correlation().cycleId ?? 'trader';
     const startedAt = new Date();
     try {
       await runTraderCycle();
@@ -41,6 +66,33 @@ export function startMonitorCron(): void {
       logger.error({ err }, 'Monitor cron: trader cycle failed');
     } finally {
       runningTraderCycleId = null;
+    }
+  }));
+
+  // Calibration snapshots (#68) — daily at 03:10. The computation takes a
+  // Postgres advisory lock, so with several instances only one does the work.
+  cron.schedule('10 3 * * *', () => tick('calibration', async () => {
+    const startedAt = new Date();
+    try {
+      await computeAndStoreSnapshots();
+      recordCronRun('calibration', 'success', startedAt, new Date());
+    } catch (err) {
+      recordCronRun('calibration', 'failure', startedAt, new Date(), err);
+      logger.error({ err }, 'Monitor cron: calibration snapshots failed');
+    }
+  }));
+
+  // Signal store retention (#73) — nightly at 03:41: raw payloads after
+  // SIGNAL_RAW_RETENTION_DAYS, fetch logs after 30 days, and signals last seen
+  // over 30 days ago unless a reasoning trace cites them.
+  cron.schedule('41 3 * * *', () => tick('signal-retention', async () => {
+    const startedAt = new Date();
+    try {
+      await purgeSignalStore();
+      recordCronRun('signal-retention', 'success', startedAt, new Date());
+    } catch (err) {
+      recordCronRun('signal-retention', 'failure', startedAt, new Date(), err);
+      logger.error({ err }, 'Monitor cron: signal store retention failed');
     }
   }));
 
@@ -54,7 +106,19 @@ export function startMonitorCron(): void {
       recordCronRun('subscription-expiry', 'failure', startedAt, new Date(), err);
       logger.error({ err }, 'Monitor cron: subscription expiry failed');
     }
-  }));
+  });
+
+  // PASS_EXPIRING socket events (#94) — every 10 minutes, once per pass.
+  cron.schedule('*/10 * * * *', async () => {
+    const startedAt = new Date();
+    try {
+      await notifyExpiringPasses();
+      recordCronRun('pass-expiry-notify', 'success', startedAt, new Date());
+    } catch (err) {
+      recordCronRun('pass-expiry-notify', 'failure', startedAt, new Date(), err);
+      logger.error({ err }, 'Monitor cron: pass expiry notification failed');
+    }
+  });
 
   // Expired Idempotency-Key rows (24h TTL, #123) — hourly at :10, in batches of 5 000
   cron.schedule('10 * * * *', async () => {
@@ -67,7 +131,7 @@ export function startMonitorCron(): void {
       recordCronRun('idempotency-purge', 'failure', startedAt, new Date(), err);
       logger.error({ err }, 'Monitor cron: idempotency key purge failed');
     }
-  }));
+  });
 
   // Copy trade sweep — every 5 minutes
   cron.schedule('*/5 * * * *', () => tick('copy_trade_sweep', sweepCopyTrades));
@@ -91,7 +155,7 @@ async function sweepCopyTrades(): Promise<void> {
   sweepRunning = true;
   try {
     const { prisma } = await import('../lib/prisma');
-    const { CopyTradeStatus, expireStaleCopyTrades, verifyCopyTradeTx, CopyTradePendingError } = await import('../services/copy-trade.service');
+    const { CopyTradeStatus, expireStaleCopyTrades, verifyCopyTradeTx, CopyTradePendingError, notifyCopyTradeConfirmed } = await import('../services/copy-trade.service');
     const { toDisplayUsdc } = await import('../lib/amounts');
     const { AppError } = await import('../middlewares/error.middleware');
 
@@ -129,11 +193,11 @@ async function sweepCopyTrades(): Promise<void> {
           if (
             isBuy &&
             marketId === ct.market.onChainMarketId &&
-            trader?.toLowerCase() === ct.followerWallet.toLowerCase() &&
-            ((ct.outcome === 'YES' && outcomeTag === 'Yes') || (ct.outcome === 'NO' && outcomeTag === 'No'))
+            trader?.toLowerCase() === (ct as any).followerWallet.toLowerCase() &&
+            (((ct as any).outcome === 'YES' && outcomeTag === 'Yes') || ((ct as any).outcome === 'NO' && outcomeTag === 'No'))
           ) {
             const collateral = BigInt(params?.collateral ?? 0);
-            await prisma.copyTrade.update({
+            const done = await prisma.copyTrade.update({
               where: { id: ct.id },
               data: {
                 status: CopyTradeStatus.EXECUTED,
@@ -147,22 +211,23 @@ async function sweepCopyTrades(): Promise<void> {
                 failureCode: null,
               },
             });
+            notifyCopyTradeConfirmed({ ...done, userId: done?.userId ?? ct.userId }, true);
             continue;
           }
         }
 
         // Otherwise verify via RPC
-        const outcome = ct.outcome === 'YES' ? 'Yes' : 'No';
+        const outcome = (ct as any).outcome === 'YES' ? 'Yes' : 'No';
         const maxCollateral = BigInt(ct.amountRaw ?? '0');
         const verified = await verifyCopyTradeTx({
           txHash: ct.txHash,
-          trader: ct.followerWallet,
+          trader: (ct as any).followerWallet,
           onChainMarketId: ct.market.onChainMarketId,
           outcome,
           maxCollateral,
         });
 
-        await prisma.copyTrade.update({
+        const executed = await prisma.copyTrade.update({
           where: { id: ct.id },
           data: {
             status: CopyTradeStatus.EXECUTED,
@@ -176,6 +241,7 @@ async function sweepCopyTrades(): Promise<void> {
             failureCode: null,
           },
         });
+        notifyCopyTradeConfirmed({ ...executed, userId: executed?.userId ?? ct.userId }, true);
       } catch (err: any) {
         if (err instanceof CopyTradePendingError) {
           await prisma.copyTrade.update({

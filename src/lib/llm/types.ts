@@ -1,8 +1,11 @@
+import type { CallContext } from '../llm-budget';
+
 export type LlmTask =
   | 'market_generation'
   | 'hedge_conditions'
   | 'forecasting'
   | 'attestation'
+  | 'dispute_review'
   | 'generic_json'
   | 'generic_text';
 
@@ -39,6 +42,8 @@ export interface LlmRequest {
   mode: OutputMode;
   maxTokens?: number;
   signal?: AbortSignal;
+  /** Purpose and priority for the shared budget (#71). Defaults to a cron call. */
+  ctx?: CallContext;
 }
 
 export interface Attempt {

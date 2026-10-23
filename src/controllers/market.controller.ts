@@ -20,6 +20,7 @@ import {
   Prisma,
 } from '@prisma/client';
 import { AppError } from '../middlewares/error.middleware';
+import { assertAgentActive } from '../services/agent-controls.service';
 
 
 const jobTracker: Map<string, JobRecord> = new Map();
@@ -204,6 +205,9 @@ export async function triggerMarketGeneration(
     return;
   }
 
+  // A paused market maker answers 423 immediately instead of starting a job (#79).
+  await assertAgentActive('MARKET_MAKER');
+
   const jobId = uuidv4();
 
   // Prune old jobs to keep memory bounded
@@ -234,7 +238,7 @@ export async function triggerMarketGeneration(
 
   // ── Run generation in background ─────────────────────────────
 
-  bindDetached(() => runMarketMakerCycle(), { jobId, kind: 'job' })
+  bindDetached(() => runMarketMakerCycle({ priority: 'admin' }), { jobId, kind: 'job' })
     .then((result: any) => {
       const existingJob = jobTracker.get(jobId);
 

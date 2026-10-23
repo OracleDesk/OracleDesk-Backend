@@ -1,3 +1,4 @@
+import { nowMs, sleep as clockSleep } from '../clock';
 import { logger } from '../logger';
 import type {
   Attempt,
@@ -9,6 +10,7 @@ import type {
 } from './types';
 import { LlmError } from './types';
 import type { LlmPolicies } from './policy';
+import { LlmBudgetExceeded } from '../llm-budget';
 
 export interface ProviderHealth {
   state: 'healthy' | 'cooling' | 'open';
@@ -63,8 +65,9 @@ export function createRouter(
   providers: Partial<Record<ModelSpec['provider'], LlmProvider>>,
   options: RouterOptions = {},
 ): Router {
-  const clock = options.clock ?? Date.now;
-  const sleep = options.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
+  // Defaults read the shared clock (#72), so a test clock removes real waiting.
+  const clock = options.clock ?? nowMs;
+  const sleep = options.sleep ?? ((ms: number) => clockSleep(ms));
   const retryInlineMaxMs = options.retryInlineMaxMs ?? RETRY_INLINE_MAX_MS;
   const quotaCooldownMs = options.quotaCooldownMs ?? QUOTA_COOLDOWN_MS;
   const failureCooldownMs = options.failureCooldownMs ?? FAILURE_COOLDOWN_MS;
@@ -150,6 +153,8 @@ export function createRouter(
               },
             };
           } catch (err) {
+            // The budget is global: another provider would draw on the same one.
+            if (err instanceof LlmBudgetExceeded) throw err;
             const normalized = asLlmError(err, spec.provider);
             lastError = normalized;
             const failed: Attempt = {
