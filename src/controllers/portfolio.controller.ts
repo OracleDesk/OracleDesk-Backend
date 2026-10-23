@@ -3,6 +3,7 @@ import { prisma } from '../lib/prisma';
 import { sendSuccess, parsePagination, buildPaginationMeta } from '../utils/response.util';
 import { getPortfolioSummary } from '../services/portfolio.service';
 import { getPortfolioCorrelations } from '../services/correlation.service';
+import { treasuryAvailableCapitalCached } from '../services/chain.service';
 import { readTreasuryBudget } from '../services/treasury-budget.service';
 import { toDisplayUsdc } from '../lib/amounts';
 import { logger } from '../lib/logger';
@@ -14,23 +15,35 @@ import { logger } from '../lib/logger';
  *   openPositions count, totalPnl, dailyPnl, builderFeesEarned,
  *   treasury (on-chain capital and caps, #76)
  */
-export async function getPortfolio(_req: Request, res: Response): Promise<void> {
+export async function getPortfolio(req: Request, res: Response): Promise<void> {
   // One read of available_capital, get_config and daily_usage (#76). A failed
   // read leaves the DB fields and reports treasury: null.
   const budget = await readTreasuryBudget().catch((err) => {
     logger.warn({ err: err instanceof Error ? err.message : err }, 'treasury budget read failed');
     return null;
   });
-  const [summary, correlations] = await Promise.all([
+  const [summary, correlations, capRes] = await Promise.all([
     getPortfolioSummary(budget),
     getPortfolioCorrelations(budget ? toDisplayUsdc(budget.availableRaw) : null),
+    treasuryAvailableCapitalCached(req.signal)
+      .then((r) => ({ raw: r.value.toString(), ledger: r.ledger }))
+      .catch((err) => {
+        logger.warn({ err: err instanceof Error ? err.message : err }, 'treasury.available_capital read failed');
+        return { raw: null, ledger: null };
+      }),
   ]);
-  const availableCapitalRaw = budget?.availableRaw.toString() ?? null;
+  const availableCapitalRaw = capRes.raw ?? budget?.availableRaw.toString() ?? null;
 
   const latestReport = await prisma.transparencyReport
     .findFirst({ orderBy: { date: 'desc' }, select: { date: true, anchorLedger: true, cid: true, hash: true, onChainTraceId: true, mode: true, consistency: true } })
     .catch(() => null);
-  sendSuccess(res, { ...summary, correlationRisk: correlations, availableCapitalRaw, latestReport });
+  sendSuccess(res, {
+    ...summary,
+    correlationRisk: correlations,
+    availableCapitalRaw,
+    availableCapitalLedger: capRes.ledger,
+    latestReport,
+  });
 }
 
 /**

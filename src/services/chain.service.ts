@@ -19,6 +19,7 @@
 import type { AssembledTransaction } from '@stellar/stellar-sdk/contract';
 import type { rpc } from '@stellar/stellar-sdk';
 import { config } from '../config';
+import { CONTRACTS } from '../config/contracts';
 import { logger } from '../lib/logger';
 import { agentClients, agentSigner, readClients } from './stellar/clients';
 import { ChainError, ChainPendingError, TransactionError, contractErrorName, ArchivedEntryError } from './stellar/errors';
@@ -42,6 +43,14 @@ import type { Category, Config as MarketCoreConfig, Market as OnChainMarket, Out
 import type { Trace } from '../generated/reasoning-registry';
 import type { DailyUsage, RiskConfig } from '../generated/treasury';
 import type { PriceConfig, ResolutionState, SignerConfig } from '../generated/resolver';
+import { getRedis } from '../lib/redis';
+import {
+  chainKey,
+  memoryChainCache,
+  redisChainCache,
+  type ChainCache,
+  type CacheEntry,
+} from '../lib/chain-cache';
 import { agentScopeForTraceAction } from '../lib/trace-actions';
 import {
   AgentPausedError,
@@ -50,6 +59,8 @@ import {
   recordChainWriteOutcome,
   type AgentScope,
 } from './agent-controls.service';
+
+export { memoryChainCache };
 
 import { Keypair, scValToNative } from '@stellar/stellar-sdk';
 import { prisma } from '../lib/prisma';
@@ -101,6 +112,29 @@ export const Outcomes = {
   Yes: { tag: 'Yes', values: undefined } as Outcome,
   No: { tag: 'No', values: undefined } as Outcome,
 };
+
+// ─── Cache Management ───────────────────────────────────────────────────────
+
+let activeChainCache: ChainCache | null = null;
+
+export function getChainCache(): ChainCache {
+  if (!activeChainCache) {
+    try {
+      activeChainCache = redisChainCache(getRedis());
+    } catch {
+      activeChainCache = memoryChainCache();
+    }
+  }
+  return activeChainCache;
+}
+
+export function setChainCache(cache: ChainCache | null): void {
+  activeChainCache = cache;
+}
+
+export function chainCacheStats() {
+  return getChainCache().stats();
+}
 
 /** Value from a simulated call, unwrapping contract `Result`s into ChainErrors. */
 export function simulatedValue<T>(contract: ContractKey, method: string, tx: AssembledTransaction<unknown>): T {
@@ -163,7 +197,21 @@ async function readTx<T>(
   );
 }
 
-async function read<T>(
+export async function readWithLedger<T>(
+  contract: ContractKey,
+  method: string,
+  call: () => Promise<AssembledTransaction<unknown>>,
+  signal?: AbortSignal,
+): Promise<{ value: T; ledger: number }> {
+  const { value, tx } = await readTx<T>(contract, method, call, signal);
+  const ledger =
+    typeof (tx.simulation as any)?.latestLedger === 'number'
+      ? (tx.simulation as any).latestLedger
+      : 0;
+  return { value, ledger };
+}
+
+export async function read<T>(
   contract: ContractKey,
   method: string,
   call: () => Promise<AssembledTransaction<unknown>>,
@@ -991,6 +1039,18 @@ async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> 
     );
   }
 
+  // Write-through cache invalidation after live submission
+  try {
+    const cache = getChainCache();
+    if (method === 'agent_create_market') {
+      cache.invalidateTag('treasury:capital').catch(() => {});
+    } else if (method === 'agent_buy' || method === 'agent_sell') {
+      const mId = args.market_id !== undefined ? String(args.market_id) : null;
+      if (mId) cache.invalidateTag(`market:${mId}`).catch(() => {});
+      cache.invalidateTag('treasury:capital').catch(() => {});
+    }
+  } catch {}
+
   logger.info({ method, txHash: finalHash, outboxId: outboxRow.id }, 'submitted and confirmed');
   return { mode: 'live', method, value, txHash: finalHash, fee: liveFeeDetails, outboxId: outboxRow.id };
 }
@@ -1041,6 +1101,25 @@ export async function getOnChainMarketWithLedger(
   if (!Number.isFinite(ledger)) throw new ChainError('get_market simulation returned no ledger', null, { method: 'get_market' });
   return { market: value, ledger };
 }
+
+export const getOnChainMarketCached = async (
+  marketId: bigint,
+  signal?: AbortSignal,
+): Promise<CacheEntry<OnChainMarket> & { cached: boolean }> => {
+  const fetchEntry = () =>
+    readWithLedger<OnChainMarket>('marketCore', 'get_market', async () =>
+      readClients.marketCore().get_market({ market_id: marketId }), signal);
+  if (!config.CHAIN_CACHE_ENABLED) {
+    const res = await fetchEntry();
+    return { ...res, readAt: Date.now(), gen: 0, cached: false };
+  }
+  const key = chainKey(CONTRACTS.marketCore, 'get_market', { id: marketId.toString() });
+  return getChainCache().get(
+    key,
+    { ttlMs: config.CHAIN_CACHE_TTL_MS, tags: [`market:${marketId}`] },
+    fetchEntry,
+  );
+};
 
 const getPriceImpl = (marketId: bigint, outcome: Outcome, signal?: AbortSignal) =>
   read<number>('marketCore', 'get_price', async () => readClients.marketCore().get_price({ market_id: marketId, outcome }), signal);
@@ -1093,8 +1172,47 @@ export const marketTraceAt = (marketId: bigint, index: bigint, signal?: AbortSig
 export const resolverState = (marketId: bigint, signal?: AbortSignal) =>
   read<ResolutionState>('resolver', 'state', async () => readClients.resolver().state({ market_id: marketId }), signal);
 
+export const resolverStateWithLedger = (marketId: bigint, signal?: AbortSignal) =>
+  readWithLedger<ResolutionState>('resolver', 'state', async () =>
+    readClients.resolver().state({ market_id: marketId }), signal);
+
+export const resolverStateCached = async (
+  marketId: bigint,
+  signal?: AbortSignal,
+): Promise<CacheEntry<ResolutionState> & { cached: boolean }> => {
+  if (!config.CHAIN_CACHE_ENABLED) {
+    const res = await resolverStateWithLedger(marketId, signal);
+    return { ...res, readAt: Date.now(), gen: 0, cached: false };
+  }
+  const key = chainKey(CONTRACTS.resolver, 'state', { id: marketId.toString() });
+  return getChainCache().get(
+    key,
+    { ttlMs: config.CHAIN_CACHE_TTL_MS, tags: [`resolver:${marketId}`, `market:${marketId}`] },
+    () => resolverStateWithLedger(marketId, signal),
+  );
+};
+
 const treasuryAvailableCapitalImpl = (signal?: AbortSignal) =>
   read<bigint>('treasury', 'available_capital', async () => readClients.treasury().available_capital(), signal);
+
+export const treasuryAvailableCapitalWithLedger = (signal?: AbortSignal) =>
+  readWithLedger<bigint>('treasury', 'available_capital', async () =>
+    readClients.treasury().available_capital(), signal);
+
+export const treasuryAvailableCapitalCached = async (
+  signal?: AbortSignal,
+): Promise<CacheEntry<bigint> & { cached: boolean }> => {
+  if (!config.CHAIN_CACHE_ENABLED) {
+    const res = await treasuryAvailableCapitalWithLedger(signal);
+    return { ...res, readAt: Date.now(), gen: 0, cached: false };
+  }
+  const key = chainKey(CONTRACTS.treasury, 'available_capital', {});
+  return getChainCache().get(
+    key,
+    { ttlMs: config.CHAIN_CACHE_TTL_MS, tags: ['treasury:capital'] },
+    () => treasuryAvailableCapitalWithLedger(signal),
+  );
+};
 
 const treasuryRiskConfigImpl = (signal?: AbortSignal) =>
   read<RiskConfig>('treasury', 'get_config', async () => readClients.treasury().get_config(), signal);

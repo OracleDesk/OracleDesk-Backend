@@ -27,11 +27,38 @@ import { startFanout, startLocalFanout } from './lib/fanout';
 import { setControlEmitter } from './services/agent-controls.service';
 import { attachSessionLifecycle, setRealtime, socketAuthMiddleware } from './lib/socket-auth';
 import { health } from './services/health.service';
+import {
+  clientIp,
+  isAllowedOrigin,
+  redisConnectionLimiter,
+  inboundEventLimiter,
+  recordSocketRejection,
+} from './lib/socket-limits';
+import { SocketThrottle, attachSlowConsumerGuard } from './lib/socket-throttle';
 
 let stopEventListener: (() => void) | null = null;
 let stopFanout: (() => Promise<void>) | null = null;
 let stopSecretRefresh: (() => void) | null = null;
+let throttle: SocketThrottle | null = null;
+let stopSlowGuard: (() => void) | null = null;
 let stopOutboxWorker: (() => void) | null = null;
+
+const rejectionLogState = new Map<string, { count: number; lastLog: number }>();
+function logSocketRejection(reason: string, details: Record<string, unknown> = {}): void {
+  recordSocketRejection(reason);
+  const now = Date.now();
+  let state = rejectionLogState.get(reason);
+  if (!state) {
+    state = { count: 0, lastLog: 0 };
+    rejectionLogState.set(reason, state);
+  }
+  state.count++;
+  if (now - state.lastLog >= 10_000) {
+    logger.warn({ reason, count: state.count, ...details }, `Socket connection rejected (${reason})`);
+    state.count = 0;
+    state.lastLog = now;
+  }
+}
 
 async function bootstrap(): Promise<void> {
   // 0. Resolve secrets (mounted files or the configured remote provider).
@@ -106,19 +133,73 @@ async function bootstrap(): Promise<void> {
   // keep recovering on an interval (one instance at a time via a Redis lock).
   stopOutboxWorker = startOutboxWorker();
 
-  // 2. Start HTTP server with Socket.io
+  // 2. Start HTTP server with hardened Socket.io
   const server = http.createServer(app);
   const io = new Server(server, {
+    transports: config.SOCKET_TRANSPORTS as any,
+    maxHttpBufferSize: config.SOCKET_MAX_BUFFER_BYTES,
+    pingInterval: 25_000,
+    pingTimeout: 20_000,
+    connectTimeout: 10_000,
+    perMessageDeflate: false,
     cors: {
-      origin: config.CORS_ORIGINS,
+      origin: (origin, callback) => callback(null, isAllowedOrigin(origin)),
       methods: ['GET', 'POST'],
+      credentials: true,
+    },
+    allowRequest: (req, callback) => {
+      const origin = req.headers.origin;
+      if (origin && !isAllowedOrigin(origin)) {
+        logSocketRejection('ORIGIN', { origin });
+        return callback('ORIGIN_NOT_ALLOWED', false);
+      }
+      callback(null, true);
     },
   });
 
-  // Authenticated sockets (#94) and cluster-wide broadcast (#93). The Redis
-  // adapter makes one io.emit / io.to(room).emit reach every instance. Redis
-  // being down at boot is not fatal: the adapter and the bus reconnect, and the
-  // indexer keeps events unpublished until the bus accepts them.
+  const limiter = redisConnectionLimiter(getRedis(), {
+    maxConnections: config.SOCKET_MAX_CONNECTIONS,
+    maxPerIp: config.SOCKET_MAX_PER_IP,
+    connectRatePerMin: config.SOCKET_CONNECT_RATE_PER_MIN,
+    exemptCidrs: config.SOCKET_IP_EXEMPT_CIDRS,
+  });
+
+  io.engine.on('connection_error', (err: any) => {
+    const origin = err.req?.headers?.origin;
+    if (origin && !isAllowedOrigin(origin)) {
+      logSocketRejection('ORIGIN', { origin });
+    } else {
+      logSocketRejection(err.message || 'HANDSHAKE_ERROR', { code: err.code });
+    }
+  });
+
+  io.use(async (socket, next) => {
+    const ip = clientIp(socket.request, config.TRUSTED_PROXIES);
+    const result = await limiter.acquire(ip, socket.id);
+    if (!result.ok) {
+      logSocketRejection(result.reason, { ip, socketId: socket.id });
+      return next(Object.assign(new Error('CONNECTION_LIMIT'), { data: { reason: result.reason } }));
+    }
+
+    socket.on('disconnect', () => {
+      limiter.release(ip, socket.id).catch((err) => {
+        logger.error({ err, socketId: socket.id }, 'Error releasing socket connection limit');
+      });
+      if (Math.random() < config.SOCKET_LOG_SAMPLE_RATE) {
+        logger.info({ socketId: socket.id }, 'Client disconnected from socket.io');
+      } else {
+        logger.debug({ socketId: socket.id }, 'Client disconnected from socket.io');
+      }
+    });
+
+    inboundEventLimiter(socket, {
+      eventsPer10s: config.SOCKET_INBOUND_EVENTS_PER_10S,
+    });
+
+    next();
+  });
+
+  // Authenticated sockets (#94) and cluster-wide broadcast (#93).
   io.use(socketAuthMiddleware());
   attachSessionLifecycle(io);
   setRealtime(io);
@@ -128,11 +209,41 @@ async function bootstrap(): Promise<void> {
     logger.warn('EVENT_BUS_ENABLED=false: in-process event bus; socket events reach this instance only');
   }
 
+  // Slow consumer guard (Issue #96)
+  const slowGuard = attachSlowConsumerGuard(io, {
+    warnBytes: config.SOCKET_SLOW_WARN_BYTES,
+    dropBytes: config.SOCKET_SLOW_DROP_BYTES,
+    checkMs: config.SOCKET_SLOW_CHECK_MS,
+  });
+  stopSlowGuard = slowGuard.stop;
+
+  // Socket throttle (Issue #96)
+  throttle = new SocketThrottle(
+    {
+      emit: (event, payload, opts) => {
+        if (opts.room) {
+          const target = io.to(opts.room);
+          if (opts.volatile) target.volatile.emit(event, payload);
+          else target.emit(event, payload);
+        } else {
+          if (opts.volatile) io.volatile.emit(event, payload);
+          else io.emit(event, payload);
+        }
+      },
+    },
+    {
+      priceTickMs: config.SOCKET_PRICE_TICK_MS,
+      tradeVolatile: config.SOCKET_TRADE_VOLATILE,
+      dropHistorical: true,
+    },
+  );
+
   // 3. Index Stellar events (resumes from the stored ledger cursor). The
   // indexer publishes to the bus; one elected instance fans out to sockets.
   const bus = config.EVENT_BUS_ENABLED ? redisEventBus() : memoryEventBus();
   stopFanout = config.EVENT_BUS_ENABLED ? startFanout(bus, io) : startLocalFanout(bus, io);
   stopEventListener = startEventListener(async (type, payload, meta) => {
+    throttle?.handle(type, payload, meta);
     await bus.publish({ ...meta, type, payload });
   });
 
@@ -150,13 +261,16 @@ async function bootstrap(): Promise<void> {
   // Price-mode reveal + resolve loop (#90).
   startPriceResolutionCron();
 
+  // Make io accessible via app
+  app.set('io', io);
+
   io.on('connection', async (socket) => {
-    logger.info({ socketId: socket.id }, 'New client connected to socket.io');
+    if (Math.random() < config.SOCKET_LOG_SAMPLE_RATE) {
+      logger.info({ socketId: socket.id }, 'New client connected to socket.io');
+    } else {
+      logger.debug({ socketId: socket.id }, 'New client connected to socket.io');
+    }
     if (await isAdminToken(socket.handshake.auth?.token)) void socket.join('admins');
-    
-    socket.on('disconnect', () => {
-      logger.info({ socketId: socket.id }, 'Client disconnected from socket.io');
-    });
   });
 
   server.listen(config.PORT, () => {
@@ -180,6 +294,11 @@ async function bootstrap(): Promise<void> {
     const { triggerShutdown } = await import('./lib/shutdown');
     triggerShutdown();
 
+    if (throttle) {
+      throttle.flush();
+      throttle.stop();
+    }
+    if (stopSlowGuard) stopSlowGuard();
     // Stop producing and consuming first, then close sockets and the HTTP
     // server (io.close also closes `server`), then the shared connections.
     if (stopEventListener) stopEventListener();

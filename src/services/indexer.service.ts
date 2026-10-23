@@ -155,6 +155,35 @@ const outcomeTag = (o: unknown): 'Yes' | 'No' | null =>
 async function applySideEffects(event: DecodedEvent): Promise<void> {
   const p = event.params;
 
+  // ── Pre-step: Event-driven cache invalidation (Issue #98) ──
+  try {
+    const { getChainCache } = await import('./chain.service');
+    const cache = getChainCache();
+    const marketIdStr = p.market_id !== undefined ? String(p.market_id) : null;
+
+    if (event.contractName === 'marketCore') {
+      if (['Trade', 'MarketResolved', 'Redeemed', 'FeesSwept', 'MarketCreated'].includes(event.eventName)) {
+        if (marketIdStr) await cache.invalidateTag(`market:${marketIdStr}`, event.ledger);
+      }
+      if (event.eventName === 'Trade' && p.trader === CONTRACTS.treasury) {
+        await cache.invalidateTag('treasury:capital', event.ledger);
+      }
+    } else if (event.contractName === 'resolver') {
+      if (['ResolutionProposed', 'ResolutionFinalized', 'PriceResolution'].includes(event.eventName)) {
+        if (marketIdStr) {
+          await cache.invalidateTag(`resolver:${marketIdStr}`, event.ledger);
+          await cache.invalidateTag(`market:${marketIdStr}`, event.ledger);
+        }
+      }
+    } else if (event.contractName === 'treasury') {
+      if (['TradeAuthorized', 'PositionClosed', 'FeesCollected'].includes(event.eventName)) {
+        await cache.invalidateTag('treasury:capital', event.ledger);
+      }
+    }
+  } catch (err) {
+    logger.warn({ err, eventId: event.id }, 'Indexer: chain cache invalidation failed');
+  }
+
   if (event.contractName === 'marketCore' && event.eventName === 'Trade') {
     const onChainMarketId = BigInt(p.market_id);
     const yesBps = Number(priceYesBps(BigInt(p.reserve_yes), BigInt(p.reserve_no)));
@@ -175,7 +204,6 @@ async function applySideEffects(event: DecodedEvent): Promise<void> {
         logger.error({ err, eventId: event.id }, 'Indexer: copy trade reconciliation failed');
       }
     }
-
     return;
   }
 

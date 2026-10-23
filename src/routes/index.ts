@@ -8,8 +8,17 @@ import oracleRoutes    from './oracle.routes';
 import adminRoutes     from './admin.routes';
 import reportRoutes    from './reports.routes';
 import agentsRoutes    from './agents.routes';
+import { noStore } from '../middlewares/cache.middleware';
 
 const router = Router();
+
+// All non-GET routes get no-store (Issue #99)
+router.use((req, res, next) => {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    return noStore()(req, res, next);
+  }
+  next();
+});
 
 router.use('/auth',      authRoutes);
 router.use('/markets',   marketRoutes);

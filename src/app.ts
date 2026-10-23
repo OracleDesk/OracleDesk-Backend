@@ -14,8 +14,12 @@ import { abortMiddleware } from './middlewares/abort.middleware';
 import router from './routes';
 import { createHealthRouter } from './routes/health.routes';
 import { health } from './services/health.service';
+import { isAllowedOrigin, socketMetrics } from './lib/socket-limits';
 
 const app = express();
+
+// Disable Express default weak ETag (Issue #99: custom canonical ETags and validators).
+app.set('etag', false);
 
 // #50: behind a proxy, `req.ip` must be the client, not the load balancer.
 // TRUST_PROXY is an Express `trust proxy` value ("true", a hop count, or a
@@ -39,9 +43,7 @@ app.use(hpp());
 app.use(cors({
   // Explicit allowlist from CORS_ORIGINS; never "*" with credentials.
   origin: (origin, callback) => {
-    // Requests without an Origin header (curl, server-to-server) carry no
-    // browser credentials, so CORS doesn't apply to them.
-    if (!origin || config.CORS_ORIGINS.includes(origin)) {
+    if (isAllowedOrigin(origin)) {
       callback(null, true);
       return;
     }
@@ -49,8 +51,8 @@ app.use(cors({
   },
   credentials: true,
   // #123: let browsers send Idempotency-Key and read Idempotent-Replayed.
-  allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
-  exposedHeaders: ['Idempotent-Replayed', 'Retry-After', 'X-Request-Id'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'If-None-Match'],
+  exposedHeaders: ['Idempotent-Replayed', 'Retry-After', 'X-Request-Id', 'ETag'],
 }));
 
 // ─── Rate Limiting ───
@@ -96,7 +98,12 @@ app.use(abortMiddleware);
 app.get('/health', (_req, res) => {
   res.setHeader('Deprecation', 'true');
   res.setHeader('Link', '</readyz>; rel="successor-version"');
-  res.json({ ok: true, data: { status: 'healthy', uptime: process.uptime() }, error: null });
+  res.setHeader('Cache-Control', 'no-store');
+  const data: Record<string, unknown> = { status: 'healthy', uptime: process.uptime() };
+  if (config.NODE_ENV !== 'production') {
+    data.sockets = socketMetrics();
+  }
+  res.json({ ok: true, data, error: null });
 });
 
 // ─── API Routes ───

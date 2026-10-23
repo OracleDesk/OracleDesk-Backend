@@ -107,8 +107,8 @@ async function setup(events = FIXTURES.map(toEventResponse)) {
       return { events, cursor: 'end', latestLedger: this.latest, oldestLedger: this.oldest } as any;
     },
   };
-  const emitted: Array<[string, any]> = [];
-  const emit = (e: string, p: any) => emitted.push([e, p]);
+  const emitted: Array<[string, any, any?]> = [];
+  const emit = (e: string, p: any, meta?: any) => emitted.push([e, p, meta]);
   const { backfillEvents } = await import('../src/services/indexer.service');
   return { db, source, calls, emitted, emit, backfillEvents };
 }
@@ -207,6 +207,32 @@ test('Trade event confirms a CONFIRMING copy trade with matching txHash', async 
   await backfillEvents(undefined, { source, emit });
   assert.equal(db.copyTrades[0].status, 'EXECUTED');
   assert.equal(db.copyTrades[0].collateralRaw, '100000000');
+});
+
+test('Trade event invalidates market tag before TRADE_EXECUTED is emitted', async () => {
+  const { setChainCache, memoryChainCache } = await import('../src/services/chain.service');
+  const cache = memoryChainCache();
+  const invalidations: Array<{ tag: string; atLedger?: number }> = [];
+  const origInvalidate = cache.invalidateTag.bind(cache);
+  cache.invalidateTag = async (tag: string, atLedger?: number) => {
+    invalidations.push({ tag, atLedger });
+    return origInvalidate(tag, atLedger);
+  };
+  setChainCache(cache);
+
+  const { source, emit, backfillEvents } = await setup();
+  let invalidatedBeforeEmit = false;
+  const wrappedEmit = (e: string, p: any, meta?: any) => {
+    if (e === 'TRADE_EXECUTED') {
+      if (invalidations.some((inv) => inv.tag === 'market:0')) {
+        invalidatedBeforeEmit = true;
+      }
+    }
+    emit(e, p, meta);
+  };
+
+  await backfillEvents(undefined, { source, emit: wrappedEmit });
+  assert.ok(invalidatedBeforeEmit, 'market:0 tag must be invalidated before TRADE_EXECUTED is emitted');
 });
 
 test('an older Trade event does not overwrite a newer observation, and a resolved market stays resolved (#83)', async () => {

@@ -450,7 +450,9 @@ string; `404 MARKET_NOT_FOUND`.
   "sets_minted": "1599000000",
   "status": { "tag": "Resolved", "outcome": "Yes" },
   "yesBps": 5319,
-  "source": "chain"
+  "source": "chain",
+  "ledger": 123456,
+  "cached": true
 }
 ```
 
@@ -840,7 +842,7 @@ Not verified: the contracts repo has no known x402-on-Stellar facilitator URL
 #### `GET /portfolio`
 
 The agent's (treasury's) portfolio. Response:
-`{ totalUsdc, deployedCapital, availableCapital, openPositions, totalPnl, dailyPnl, builderFeesEarned, treasury, correlationRisk, availableCapitalRaw, latestReport }`.
+`{ totalUsdc, deployedCapital, availableCapital, openPositions, totalPnl, dailyPnl, builderFeesEarned, treasury, correlationRisk, availableCapitalRaw, availableCapitalLedger, latestReport }`.
 
 Capital comes from the treasury contract, read live on every request (#76):
 
@@ -868,7 +870,7 @@ The float fields are derived from it: `availableCapital` = `availableRaw` in
 USDC, `totalUsdc` = `availableCapital + deployedCapital`. If the chain read
 fails, `treasury`, `availableCapital`, `totalUsdc` and
 `correlationRisk.isOverExposed` are `null` and the database fields are still
-returned. `availableCapitalRaw` (= `treasury.availableRaw`) is kept for
+returned. `availableCapitalRaw` (= `treasury.availableRaw`) and `availableCapitalLedger` are kept for
 compatibility.
 
 `correlationRisk` (#80): `{ pairs, totalExposure, isOverExposed, matrix, method, snapshotId }`.
@@ -1362,14 +1364,44 @@ The response now includes `contentSource: "cache" | "gateway"`: `cache` means
 the bytes came from the local verified content store and both gateways could
 be down. The on-chain `trace_hash` remains the authority.
 
+### Oracle resolution
+
+#### `GET /oracle/markets/:marketId/resolution`
+
+Returns resolution status directly from the resolver contract and market-core:
+`{ marketId, onChainMarketId, resolverState, marketStatus, resolutionHash, resolutionSpec, dbStatus, ledger, cached }`.
+`ledger` is the minimum ledger of the live contract reads; `cached` indicates whether values were served from the Redis chain cache.
+
 ## Realtime (socket.io)
 
-Same origin as the API without `/api/v1`. The frontend listens to these
-events; event names are unchanged.
+Same origin as the API without `/api/v1`. The frontend listens to these events.
 
-**Finding:** before this port the backend never emitted either event (there
-is no `io.emit` anywhere in `src/`), so these listeners received nothing. The
-indexer now emits them.
+### Realtime limits & security
+
+- **Allowed origins:** Checked via the shared CORS allowlist (`CORS_ORIGINS`). Websocket upgrades from disallowed origins are rejected (`ORIGIN_NOT_ALLOWED`). Requests without an `Origin` header (non-browser clients) are accepted.
+- **Connection limits:**
+  - `SOCKET_MAX_CONNECTIONS` (default 5000): global connection cap across instances.
+  - `SOCKET_MAX_PER_IP` (default 20): maximum concurrent connections per client IP.
+  - `SOCKET_CONNECT_RATE_PER_MIN` (default 60): maximum new connections per IP per minute.
+  - Rejections emit `CONNECTION_LIMIT` error with reason (`GLOBAL`, `PER_IP`, `RATE`).
+- **Buffers & frames:** `maxHttpBufferSize` is set to `SOCKET_MAX_BUFFER_BYTES` (default 16 KB). Oversized frames close the connection.
+- **Inbound events:** Clients send no application events. Inbound events not in the allowlist are rejected, and more than 3 violations within 60 s trigger immediate disconnection for abuse.
+- **Slow consumers:** Sockets buffering more than `SOCKET_SLOW_WARN_BYTES` (default 256 KB) are degraded (removed from `realtime:full` room, receiving only `MARKET_PRICE` ticks). Sockets buffering more than `SOCKET_SLOW_DROP_BYTES` (default 2 MB) are disconnected.
+
+### `MARKET_PRICE`
+
+Emitted for price updates, coalesced latest-wins per market and emitted at most once per `SOCKET_PRICE_TICK_MS` (default 1000 ms). Delivered reliably (non-volatile) to all connected clients.
+
+```json
+{
+  "onChainMarketId": "0",
+  "marketId": "uuid or null",
+  "priceYesBps": 6421,
+  "ledger": 123456,
+  "eventId": "0000…-0000000001",
+  "ts": 1700000000000
+}
+```
 
 Public events are published by the indexer to an internal event bus and
 delivered by one elected instance, so every client gets each event once
@@ -1453,7 +1485,7 @@ this today).
 
 ### `TRADE_EXECUTED`
 
-Emitted when the indexer stores a market-core `trade` event.
+Emitted when the indexer processes a live trade event. Delivered as **volatile** (`SOCKET_TRADE_VOLATILE=true`) to clients in the `realtime:full` room. Clients that cannot take it skip it without building unbounded server buffers. Historical events during indexer catch-up are suppressed.
 
 ```json
 {
@@ -1473,13 +1505,7 @@ Emitted when the indexer stores a market-core `trade` event.
 }
 ```
 
-The old payload had `amount` (float USDC), `price` (0–1) and `probChange`
-(string). Frontends derive display values from `collateralRaw` and
-`priceYesBps`.
-
-> A trace's `verified` flag means its `trace_hash` was confirmed on-chain: set
-> by the indexer when it sees the matching `TracePublished` event (or by
-> `POST /traces/verify`), never from a write result alone and never in dry-run.
+> **Note:** Clients requiring complete, reliable trade histories must query the REST API (`GET /markets/:id` or indexed history) rather than relying on the volatile socket stream.
 
 ### `MARKET_DRIFT`
 
@@ -1491,10 +1517,6 @@ never auto-repaired (`HASH_MISMATCH`, `STATUS_REGRESSION`, `NOT_FOUND_ON_CHAIN`)
 ### `REASONING_PUBLISHED`
 
 Emitted when the indexer stores a reasoning-registry publish event.
-`action` is one of the backend's `create_market`, `buy_yes`, `buy_no`
-(`src/lib/trace-actions.ts`); traces published by other agents may use other
-strings, such as `buy` from the contracts repo's TypeScript agents.
-
 ```json
 {
   "onChainTraceId": "3",
@@ -1509,6 +1531,18 @@ strings, such as `buy` from the contracts repo's TypeScript agents.
 }
 ```
 
+### `CATCHUP_COMPLETE`
+
+Emitted once when the indexer finishes catching up from an older ledger cursor:
+```json
+{
+  "fromLedger": 123000,
+  "toLedger": 123456,
+  "events": 42
+}
+```
+Clients should use this event as a signal to refetch REST state.
+
 ### `AGENT_CONTROL_CHANGED`
 
 Emitted when a pause is set, a pause is lifted or a timed pause expires.
@@ -1518,6 +1552,48 @@ Emitted when a pause is set, a pause is lifted or a timed pause expires.
 ```
 
 `until` is `null` for indefinite pauses and for resumes.
+
+## Caching & Conditional Requests
+
+Every endpoint defines an explicit cache policy and strong ETag derivation. Express's default weak ETags are disabled.
+
+### Policy Table
+
+| Route | Policy | Cache-Control | Validator / ETag source |
+|---|---|---|---|
+| `GET /markets` | `shared` | `public, max-age=5, stale-while-revalidate=30` | `max(updatedAt)`, count, pagination |
+| `GET /markets/:id` (active) | `shared` | `public, max-age=5, stale-while-revalidate=30` | `market.updatedAt`, latest trace `updatedAt`, counts |
+| `GET /markets/:id` (resolved/cancelled) | `immutable` | `public, max-age=86400, immutable` | `market.updatedAt`, status, counts |
+| `GET /markets/on-chain/:id` | `shared` / `immutable` | same as `GET /markets/:id` | same as `GET /markets/:id` |
+| `GET /markets/on-chain/:id/state` | `shared` | `public, max-age=5, stale-while-revalidate=10` | Canonical body ETag (live simulation) |
+| `GET /traces` | `shared` | `public, max-age=10, stale-while-revalidate=60` | `max(updatedAt)`, count, pagination |
+| `GET /traces/:id` (anon published) | `shared` | `public, max-age=300` | `trace.updatedAt`, verified, onChainTraceId |
+| `GET /traces/:id` (authenticated) | `personalised` | `private, max-age=0, must-revalidate, Vary: Authorization` | `authClass`, `trace.updatedAt` |
+| `GET /portfolio` | `shared` | `public, max-age=15, stale-while-revalidate=60` | Canonical body ETag |
+| `GET /portfolio/positions` | `shared` | `public, max-age=15, stale-while-revalidate=60` | `max(updatedAt)`, count |
+| `GET /portfolio/stats` | `shared` | `public, max-age=15, stale-while-revalidate=60` | `max(updatedAt)`, counts |
+| `GET /oracle/markets/:id/resolution` (active) | `shared` | `public, max-age=5, stale-while-revalidate=10` | Canonical body ETag |
+| `GET /oracle/markets/:id/resolution` (resolved) | `immutable` | `public, max-age=86400, immutable` | Canonical body ETag |
+| `GET /traces/access/allowance` | `no-store` | `private, no-store` | None |
+| `GET /traces/payments` | `no-store` | `private, no-store` | None |
+| `GET /markets/generation-status/:jobId` | `no-store` | `private, no-store` | None |
+| `GET /health`, `/livez`, `/readyz` | `no-store` | `private, no-store` | None |
+| All non-GET routes | `no-store` | `private, no-store` | None |
+
+### Conditional Requests & ETags
+
+- **Cheap Validators:** Validator-backed endpoints compute stable hashes from row versions and counts before invoking expensive queries. When `If-None-Match` matches, the server returns `304 Not Modified` with an empty body immediately, skipping controller execution.
+- **Canonical Fallback:** When no cheap validator exists, `sendSuccess` computes a strong sha256 ETag from canonical JSON (`canonicalJson(body)`) and evaluates `If-None-Match`.
+- **Authorization Isolation:** Any request with an `Authorization` header is never cached with `public`. ETags include `authClass` (`anon`, `user:<id>`, `pass`), ensuring daily pass holders never receive a cached 304 for an anonymous preview.
+- **Compression Safety:** Strong ETags describe identity representation; compressed responses append `-gzip` (or respective encoding) with `Vary: Accept-Encoding`.
+- **CORS Exposure:** `ETag` is listed in `access-control-expose-headers` and `If-None-Match` in `access-control-allow-headers`.
+
+### React Query Guidance
+
+Frontends using React Query should set `staleTime` matching the route's `max-age` (in ms) to avoid unnecessary round-trips:
+- Market lists: `staleTime: 5000`
+- Trace previews: `staleTime: 10000`
+- Resolved markets: `staleTime: 86400000`
 
 ## Frontend call map
 
