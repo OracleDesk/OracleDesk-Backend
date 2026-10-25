@@ -94,6 +94,10 @@ export function canonicalBytes(value: unknown): Buffer {
   return Buffer.from(canonicalJson(value), 'utf8');
 }
 
+export function canonicalBytesStrict(value: unknown): Buffer {
+  return Buffer.from(canonicalJsonStrict(value), 'utf8');
+}
+
 export function sha256Hex(bytes: Uint8Array | string): string {
   return crypto.createHash('sha256').update(bytes).digest('hex');
 }

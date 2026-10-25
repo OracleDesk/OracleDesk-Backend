@@ -5,6 +5,7 @@ import {
   getMyPaymentEvents,
   getMySpendingAllowance,
   getTrace,
+  getTraceKey,
   listTraces,
   preauthorizeAccess,
   setSpendingAllowance,

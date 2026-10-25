@@ -244,6 +244,7 @@ model Market {
   updatedAt          DateTime           @updatedAt
 
   generationJob MarketGenerationJob? @relation("MarketGenerationJobMarket")
+  generationRun MarketGenerationRun?
 
   trades         Trade[]
   positions      Position[]

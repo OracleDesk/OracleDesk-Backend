@@ -7,6 +7,7 @@
  */
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
+import { config } from '../config';
 import { AppError } from '../middlewares/error.middleware';
 import { verifyTraceHash, sha256Hex } from '../utils/hash.util';
 import { Prisma } from '@prisma/client';
@@ -20,6 +21,15 @@ import { publishTrace } from './chain.service';
 import type { AgentScope } from './agent-controls.service';
 import { agentSigner } from './stellar/clients';
 import type { TraceVerification } from '../types';
+import { TraceDocV1 } from '../schemas/trace';
+import {
+  sealTrace,
+  openTrace,
+  loadKeks,
+  TracePublicPart,
+  createKek,
+} from './trace-crypto.service';
+import crypto from 'node:crypto';
 
 /**
  * Completion handler for `trace.publish` outbox rows (#35): links the landed
@@ -79,16 +89,28 @@ export async function enqueueTracePublication(
 
 /**
  * Fetches the content at the on-chain CID, hashes the exact bytes and
- * compares them with the on-chain trace_hash (x402/trace-verification.ts).
+ * compares them with the on-chain trace_hash.
  */
-export async function verifyTraceOnChain(traceId: string): Promise<TraceVerification> {
+export async function verifyTraceOnChain(
+  traceId: string,
+): Promise<TraceVerification & { contentMode?: string; plaintextHash?: string | null }> {
   const trace = await prisma.reasoningTrace.findUnique({
     where: { id: traceId },
-    select: { id: true, onChainTraceId: true, traceHash: true },
+    select: {
+      id: true,
+      onChainTraceId: true,
+      traceHash: true,
+      contentMode: true,
+      plaintextHash: true,
+    },
   });
   if (!trace) throw new AppError(404, 'TRACE_NOT_FOUND', 'Reasoning trace not found');
   if (trace.onChainTraceId === null) {
-    throw new AppError(409, 'TRACE_NOT_PUBLISHED', 'This trace has not been published on-chain yet');
+    throw new AppError(
+      409,
+      'TRACE_NOT_PUBLISHED',
+      'This trace has not been published on-chain yet',
+    );
   }
 
   const onChain = await getOnChainTrace(trace.onChainTraceId);
@@ -119,6 +141,8 @@ export async function verifyTraceOnChain(traceId: string): Promise<TraceVerifica
     verified,
     contentSource: source,
     verifiedAt: new Date(),
+    contentMode,
+    plaintextHash,
   };
 }
 

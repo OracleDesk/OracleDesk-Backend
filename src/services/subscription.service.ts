@@ -507,6 +507,8 @@ export async function getTracWithAccessControl(
     audit,
     ipfsCid:             trace.ipfsCid,
     traceHash:           trace.traceHash,
+    contentMode:         trace.contentMode,
+    plaintextHash:       trace.plaintextHash,
     onChainTraceId:      trace.onChainTraceId,
     createdAt:           trace.createdAt,
     accessLevel:         'FREE_PREVIEW',

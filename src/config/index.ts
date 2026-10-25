@@ -558,6 +558,20 @@ const envSchema = z
     IPFS_TRANSPORT: z.enum(['pinata', 'local']).default('pinata'),
     IPFS_LOCAL_DIR: z.string().default('.ipfs-local'),
 
+    // ── Public API Base URL & Schema ──────────────────────────────────────
+    PUBLIC_API_BASE_URL: z.string().url().default('http://localhost:8000'),
+    QUESTION_DOC_VERSION: z.string().default('2').transform(Number),
+
+    // ── Confidential Traces ──────────────────────────────────────────────
+    TRACE_CONFIDENTIAL: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
+    TRACE_KEKS: optionalString,
+    TRACE_KEK_ACTIVE: z.string().default('kek-2026-10'),
+    X402_KEY_RELEASE_SECRET: optionalString,
+
+    // ── Saga ─────────────────────────────────────────────────────────────
+    SAGA_RECOVERY_SCAN: z.string().default('50').transform(Number),
+    SAGA_MAX_ATTEMPTS: z.string().default('8').transform(Number),
+
     // ── Data sources ──────────────────────────────────────────────────────
     NEWSAPI_KEY: optionalString,
     FRED_API_KEY: optionalString,

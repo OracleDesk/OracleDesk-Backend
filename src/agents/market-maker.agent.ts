@@ -34,13 +34,7 @@ export interface MarketCycleResult {
 
 /**
  * Market Maker Agent — main execution loop.
- *
- * Called by the ingestion cron every 15 minutes AND manually via
- * POST /markets/generate. Returns market details on success so the
- * job tracker can surface them in GET /markets/generation-status/:jobId.
- *
- * Returns null when the cycle is intentionally skipped (no signals,
- * duplicate detected, etc.) — not an error condition.
+ * Runs via the market-maker saga state machine.
  */
 export async function runMarketMakerCycle(
   opts?: { signal?: AbortSignal; priority?: Priority },

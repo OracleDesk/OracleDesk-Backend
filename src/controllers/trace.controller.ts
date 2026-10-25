@@ -1,9 +1,12 @@
 import type { Request, Response } from 'express';
+import crypto from 'node:crypto';
 import { z } from 'zod';
+import { config } from '../config';
 import { prisma } from '../lib/prisma';
 import { sendSuccess, sendError, parsePagination, buildPaginationMeta } from '../utils/response.util';
 import { summarizeProvenance } from '../lib/llm/provenance';
 import { verifyTraceOnChain } from '../services/trace-publish.service';
+import { unwrapKey } from '../services/trace-crypto.service';
 import {
   DAILY_PASS_PRICE_RAW,
   getTracWithAccessControl,

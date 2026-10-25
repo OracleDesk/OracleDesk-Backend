@@ -82,9 +82,10 @@ export async function handleMarketCreateOutcome(row: ChainTransactionRow, outcom
 registerHandler('market.create', handleMarketCreateOutcome);
 
 export function defaultResolutionSpec(): ResolutionSpecJson {
-  const signers = config.RESOLUTION_SIGNERS.length > 0
-    ? config.RESOLUTION_SIGNERS
-    : [agentSigner().publicKey as string];
+  const signers =
+    config.RESOLUTION_SIGNERS.length > 0
+      ? config.RESOLUTION_SIGNERS
+      : [agentSigner().publicKey as string];
   return {
     kind: 'signers',
     signers,
@@ -328,8 +329,8 @@ export async function createMarketOnChain(
     data: {
       resolutionSpec: spec as object,
       resolutionHash: resolutionHashHex,
-      questionHash: pinned.hash,
-      metaUri: `ipfs://${pinned.cid}`,
+      questionHash,
+      metaUri,
       seedAmountRaw: seed.toString(),
     },
   });
@@ -451,4 +452,12 @@ export async function createMarketOnChain(
     );
   }
   return result;
+}
+
+export async function createMarketOnChain(
+  market: Market,
+  spec: ResolutionSpecJson = defaultResolutionSpec(),
+): Promise<WriteResult<bigint>> {
+  const prep = await prepareMarketCommitment(market, spec);
+  return submitMarketCreation(market, prep);
 }

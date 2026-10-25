@@ -51,13 +51,15 @@ export async function generateReasoningTrace(
   // canonicalJson would encode differently from the contracts repo.
   const provenance = buildTraceProvenance([...(opts.upstreamProvenance ?? []), hedgeConditions.provenance]);
 
-  const tracePayload: Record<string, unknown> = {
-    agentType:           input.agentType,
-    decisionType:        input.decisionType,
-    marketId:            input.marketId,
-    sourcesUsed:         input.sourcesUsed,
+  const traceDoc: TraceDocV1 = buildTraceDoc({
+    traceId,
+    agentType: input.agentType,
+    decisionType: input.decisionType,
+    action: input.decisionType.toLowerCase(),
+    backendMarketId: input.marketId,
+    onChainMarketId,
     probabilityEstimate: input.probabilityEstimate,
-    marketProbability:   input.marketProbability,
+    marketProbability: input.marketProbability,
     edge,
     confidenceInterval:  ci,
     betFraction:         input.betFraction,
@@ -80,8 +82,10 @@ export async function generateReasoningTrace(
     signal: s.signal,
   }));
 
-  const trace = await prisma.reasoningTrace.create({
-    data: {
+  const trace = await prisma.reasoningTrace.upsert({
+    where: { id: traceId },
+    create: {
+      id: traceId,
       marketId:            input.marketId,
       agentType:           input.agentType,
       decisionType:        input.decisionType,
@@ -90,8 +94,8 @@ export async function generateReasoningTrace(
       marketProbability:   input.marketProbability,
       edge,
       confidenceInterval:  ci as Prisma.InputJsonValue,
-      betFraction:         input.betFraction,
-      betSizeUsdc:         input.betSizeUsdc,
+      betFraction:         input.betFraction ?? null,
+      betSizeUsdc:         input.betSizeUsdc ?? null,
       hedgeConditions:     hedgeConditions.conditions as any,
       provenance:          provenance as unknown as Prisma.InputJsonValue,
       agentWallet:         input.agentWallet,
@@ -99,10 +103,11 @@ export async function generateReasoningTrace(
       verified:            false,
       isPublic:            false,
     },
+    update: {},
   });
 
   logger.info({ traceId: trace.id, edge, marketId: input.marketId }, 'Reasoning trace generated');
-  return { trace, tracePayload: { ...tracePayload, traceId: trace.id } };
+  return { trace, tracePayload: traceDoc };
 }
 
 /**

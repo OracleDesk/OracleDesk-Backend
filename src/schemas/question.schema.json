@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://api.oracledesk.io/api/v1/schemas/question/v2.json",
+  "title": "OracleDesk Question Document v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "kind",
+    "question",
+    "category",
+    "contractCategory",
+    "closeTime",
+    "resolutionSource",
+    "resolutionSpecHash",
+    "backendMarketId"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 2
+    },
+    "kind": {
+      "const": "oracledesk.question"
+    },
+    "question": {
+      "type": "string",
+      "minLength": 1
+    },
+    "category": {
+      "type": "string",
+      "enum": [
+        "FED",
+        "ECB",
+        "MACRO",
+        "GEOPOLITICAL",
+        "ELECTION",
+        "POLITICS",
+        "CRYPTO",
+        "SPORTS",
+        "ENTERTAINMENT"
+      ]
+    },
+    "contractCategory": {
+      "type": "string",
+      "enum": ["Macro", "Geopolitics", "Crypto", "Sports", "Culture", "Other"]
+    },
+    "closeTime": {
+      "type": "integer"
+    },
+    "resolutionSource": {
+      "type": ["string", "null"]
+    },
+    "resolutionSpecHash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "backendMarketId": {
+      "type": "string",
+      "format": "uuid"
+    }
+  }
+}
