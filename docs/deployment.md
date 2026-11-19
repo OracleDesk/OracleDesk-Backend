@@ -69,3 +69,25 @@ DIGEST=<sha256> ./scripts/post-deploy-checks.sh
 ```
 
 Checks are read-only. `SKIP_KUBE=1` omits the digest check in local tests.
+
+## IPFS pin garbage collection (#328)
+
+Pins are tracked in `ipfs_pins` / `ipfs_pin_refs` (see `docs/trace-format.md`). A GC job (`src/jobs/pin-gc.job.ts`)
+runs hourly from the monitor cron on every instance; it is safe to run concurrently because it claims pins with
+`FOR UPDATE SKIP LOCKED`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PIN_GC_ENABLED` | `false` | Turn the job on. Leave off until the reconciliation below has run. |
+| `PIN_GC_GRACE_HOURS` | `72` | How long an owner that never reached the chain is kept before its pin is released. |
+| `PIN_GC_BATCH` | `50` | Maximum pins claimed per run. |
+| `PIN_GC_RATE_PER_MIN` | `30` | Provider unpin calls per minute. Repeated HTTP 429 stops the run; nothing is lost. |
+
+Roll-out:
+
+1. Deploy and run `npx prisma migrate deploy`.
+2. Import the pins that already exist: `npm run pins:reconcile` (dry run), then `npm run pins:reconcile -- --execute`.
+   Pins with no known owner are only collected after the grace period; review them first.
+3. Set `PIN_GC_ENABLED=true`.
+
+`scripts/unpin-legacy-traces.ts` was removed: the reconciliation plus the GC replace it.
