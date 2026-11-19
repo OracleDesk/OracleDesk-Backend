@@ -818,6 +818,7 @@ model PaymentEvent {
   allowanceOverageRaw Decimal?     @db.Decimal(39, 0)
   /// Server-issued intent that settled this payment (#52).
   paymentIntentId String?          @unique
+  priceScheduleVersion Int?
   metadata      Json?
   createdAt     DateTime           @default(now())
   confirmedAt   DateTime?
@@ -873,6 +874,7 @@ model PriceSchedule {
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
   @@map("price_schedules")
+  @@unique([effectiveAt])
 }
 
 /// Exact bytes of IPFS documents the backend pinned or verified (#100).
@@ -1314,6 +1316,7 @@ model PaymentIntent {
   status          PaymentIntentStatus @default(OPEN)
   type            SubscriptionType    @default(DAILY_PASS)
   amountRaw       Decimal             @db.Decimal(39, 0)
+  priceScheduleVersion Int?
   currency        SettlementCurrency  @default(USDC)
   recipient       String
   token           String
