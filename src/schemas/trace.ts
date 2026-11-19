@@ -48,10 +48,42 @@ export const TraceDocV1 = z
 
 export type TraceDocV1 = z.infer<typeof TraceDocV1>;
 
+export const ExitTraceDocV1 = z
+  .object({
+    schemaVersion: z.literal(1),
+    kind: z.literal('oracledesk.trace.exit'),
+    traceId: z.string().uuid(),
+    agentType: z.literal('TRADER'),
+    action: z.enum(['sell_yes', 'sell_no']),
+    market: z.object({ backendId: z.string().uuid(), onChainId: z.string().regex(/^\d+$/) }).strict(),
+    entry: z.object({ traceId: z.string().uuid().nullable(), onChainTraceId: z.string().regex(/^\d+$/).nullable() }).strict(),
+    reason: z.string().min(1).max(64),
+    mark: z.object({
+      source: z.enum(['indexed', 'rpc', 'estimated']),
+      ledger: z.number().int().nonnegative().nullable(),
+      priceBps: z.number().int().min(0).max(10_000).nullable(),
+      liquidationValueRaw: z.string().regex(/^\d+$/).nullable(),
+    }).strict(),
+    fill: z.object({
+      sharesSoldRaw: z.string().regex(/^\d+$/),
+      collateralOutRaw: z.string().regex(/^\d+$/),
+      txHash: z.string().length(64).nullable(),
+      estimated: z.boolean(),
+    }).strict(),
+    realisedPnlRaw: z.string().regex(/^-?\d+$/),
+    positionClosed: z.boolean(),
+    narrative: z.string().max(2000).nullable(),
+    agentWallet: z.string().nullable(),
+    createdAt: z.string().datetime(),
+  })
+  .strict();
+
+export type ExitTraceDocV1 = z.infer<typeof ExitTraceDocV1>;
+
 export const LegacyTraceDoc = z.record(z.string(), z.unknown());
 export type LegacyTraceDoc = z.infer<typeof LegacyTraceDoc>;
 
-export const TraceDocAny = z.union([TraceDocV1, LegacyTraceDoc]);
+export const TraceDocAny = z.union([TraceDocV1, ExitTraceDocV1, LegacyTraceDoc]);
 export type TraceDocAny = z.infer<typeof TraceDocAny>;
 
 export interface ContractsReasoningTrace {

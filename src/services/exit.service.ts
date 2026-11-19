@@ -39,6 +39,9 @@ import {
 import { ChainError, ChainPendingError } from './stellar/errors';
 import { registerHandler, type ChainTransactionRow, type CompletionOutcome } from './stellar/outbox';
 import { AgentPausedError } from './agent-controls.service';
+import crypto from 'node:crypto';
+import { ExitTraceDocV1 } from '../schemas/trace';
+import { exitTraceAction } from '../lib/trace-actions';
 
 /** Remaining shares at or below this are dust: the position counts as closed. */
 export const DUST_SHARES = 1_000n;
@@ -135,6 +138,11 @@ interface LoadedPosition {
   costBasisRaw: any;
   realisedCollateralRaw: any;
   realisedPnlRaw: any;
+  entryTraceId: string | null;
+  markPriceBps: number | null;
+  liquidationValueRaw: any;
+  valuationSource: string | null;
+  markedAt: Date | null;
   trade: { amount: number } | null;
   market: { id: string; onChainMarketId: bigint | null; expiryTimestamp: Date };
 }
@@ -218,7 +226,7 @@ async function recordFailure(
 async function applyConfirmedExit(
   position: LoadedPosition,
   exitId: string,
-  p: { sold: bigint; collateralOut: bigint; txHash: string | null; reason: string; note?: string },
+  p: { sold: bigint; collateralOut: bigint; txHash: string | null; reason: string; note?: string; estimated?: boolean },
 ): Promise<{ closed: boolean; applied: boolean }> {
   const sharesBefore = decimalToBigint(position.sharesRaw);
   const costBefore = position.costBasisRaw == null
@@ -230,6 +238,42 @@ async function applyConfirmedExit(
   const costSold = closed || sharesBefore === 0n ? costBefore : (costBefore * sold) / sharesBefore;
   const realisedPnlRaw = decimalToBigint(position.realisedPnlRaw) + (p.collateralOut - costSold);
   const effectivePrice = sold > 0n ? Math.min(1, Number(p.collateralOut) / Number(sold)) : null;
+  const traceId = crypto.randomUUID();
+  const action = exitTraceAction(position.direction);
+  const traceReason = p.reason.trim().slice(0, 64) || 'EXIT';
+  const entry = position.entryTraceId
+    ? await prisma.reasoningTrace.findUnique({ where: { id: position.entryTraceId }, select: { onChainTraceId: true } })
+    : null;
+  const markSource = position.valuationSource === 'indexed' || position.valuationSource === 'rpc'
+    ? position.valuationSource
+    : 'estimated';
+  const traceDoc = ExitTraceDocV1.parse({
+    schemaVersion: 1,
+    kind: 'oracledesk.trace.exit',
+    traceId,
+    agentType: 'TRADER',
+    action,
+    market: { backendId: position.marketId, onChainId: String(position.market.onChainMarketId) },
+    entry: { traceId: position.entryTraceId, onChainTraceId: entry?.onChainTraceId?.toString() ?? null },
+    reason: traceReason,
+    mark: {
+      source: markSource,
+      ledger: null,
+      priceBps: position.markPriceBps,
+      liquidationValueRaw: position.liquidationValueRaw == null ? null : decimalToBigint(position.liquidationValueRaw).toString(),
+    },
+    fill: {
+      sharesSoldRaw: sold.toString(),
+      collateralOutRaw: p.collateralOut.toString(),
+      txHash: p.txHash,
+      estimated: p.estimated ?? false,
+    },
+    realisedPnlRaw: (p.collateralOut - costSold).toString(),
+    positionClosed: closed,
+    narrative: null,
+    agentWallet: null,
+    createdAt: new Date().toISOString(),
+  });
 
   const applied = await prisma.$transaction(async (tx) => {
     const won = await tx.positionExit.updateMany({
@@ -241,6 +285,7 @@ async function applyConfirmedExit(
         effectivePrice,
         txHash: p.txHash,
         error: p.note ?? null,
+        traceId,
       },
     });
     if (won.count === 0) return false;
@@ -265,6 +310,22 @@ async function applyConfirmedExit(
           : {}),
       } as any,
     });
+    const probability = (position.markPriceBps ?? Math.round((effectivePrice ?? 0.5) * 10_000)) / 10_000;
+    await tx.reasoningTrace.create({
+      data: {
+        id: traceId,
+        marketId: position.marketId,
+        agentType: 'TRADER',
+        decisionType: 'EXIT',
+        sourcesUsed: [{ source: 'position_exit', weight: 1, signal: traceReason }],
+        probabilityEstimate: probability,
+        marketProbability: probability,
+        edge: 0,
+        confidenceInterval: { lower: probability, upper: probability },
+        previewSources: [{ source: 'position_exit', signal: traceReason }],
+      },
+    });
+    await tx.tracePublication.create({ data: { traceId, action, payload: traceDoc as any } });
     return true;
   });
   if (!applied) {
@@ -326,6 +387,7 @@ async function reconcileStuckExit(position: LoadedPosition, stuck: any): Promise
       txHash: stuck.txHash ?? null,
       reason: stuck.reason,
       note: 'Reconciled from the on-chain balance; collateral is the planned collateral_out',
+      estimated: true,
     });
     return true;
   } catch (err) {
@@ -419,6 +481,20 @@ export async function exitPosition(
         status: 'SUBMITTED',
         collateralOutRaw: bigintToDecimalString(plan.collateralOut),
         maxSharesInRaw: bigintToDecimalString(plan.maxSharesIn),
+        context: {
+          reason: opts.reason,
+          mark: {
+            source: position.valuationSource ?? 'estimated',
+            ledger: null,
+            priceBps: position.markPriceBps,
+            liquidationValueRaw: position.liquidationValueRaw == null ? null : decimalToBigint(position.liquidationValueRaw).toString(),
+          },
+          costBasisRaw: decimalToBigint(position.costBasisRaw).toString(),
+          sharesHeldRaw: recorded.toString(),
+          plannedCollateralOutRaw: plan.collateralOut.toString(),
+          entryTraceId: position.entryTraceId,
+          decidedAt: new Date().toISOString(),
+        },
       },
     });
 
