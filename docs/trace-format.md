@@ -135,3 +135,27 @@ JSON Schema URL: `https://api.oracledesk.io/api/v1/schemas/question/v2.json`
   "backendMarketId": "22222222-2222-2222-2222-222222222222"
 }
 ```
+
+## Pin lifecycle (#328)
+
+Every document pinned to the provider is recorded in `ipfs_pins`, and every use of it by a market question or a
+reasoning trace in `ipfs_pin_refs`.
+
+| Reference state | Meaning |
+|---|---|
+| `CANDIDATE` | Pinned for an owner that is not on chain yet. |
+| `ANCHORED` | The owner is on chain (`onChainMarketId` / `onChainTraceId` set). The CID is never unpinned. |
+| `RELEASED` | The owner never reached the chain and is past the grace period. |
+
+- `pinJson(doc, name, { owner })` computes the canonical bytes and CID, records the pin and a reference, and calls
+  the provider only if the CID is not already `PINNED`. Identical bytes pinned twice add a second reference.
+- Dry-run never pins: `prepareMarketCommitment` computes the CID locally (`cidForBytes`). A live creation pins once,
+  after the creation attempt has been claimed and discovery found nothing on chain.
+- References become `ANCHORED` in `linkLandedMarket`, `handleTracePublishOutcome`, the trace publication worker and
+  the indexer's `TracePublished` projection. The GC job repeats this for any owner already on chain, so a missed hook
+  cannot cause an unpin.
+- Published documents without a trace row (transparency reports) use the `DOCUMENT` owner kind: anchored when
+  published, never released automatically.
+- The GC job unpins a CID only when all of its references are `RELEASED` (or it has none and is older than the grace
+  period). A pin requested again while an unpin is in flight sets `repinRequested`; the GC restores it from the content
+  store after the unpin completes.

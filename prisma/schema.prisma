@@ -1413,3 +1413,47 @@ model AlertDelivery {
   @@index([reviewId])
   @@map("alert_deliveries")
 }
+
+/// Remote IPFS pin ledger (#328): one row per CID pinned at the provider.
+/// A pin is only unpinned by the GC job when it has no live owner reference.
+model IpfsPin {
+  cid            String    @id
+  sha256         String
+  size           Int
+  /// pinata | local
+  provider       String
+  /// PINNING | PINNED | UNPIN_PENDING | UNPINNED | FAILED
+  status         String
+  /// Set when a new pin of the CID arrives while an unpin is in flight.
+  repinRequested Boolean   @default(false)
+  pinnedAt       DateTime?
+  unpinnedAt     DateTime?
+  lastError      String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  refs           IpfsPinRef[]
+
+  @@index([status])
+  @@map("ipfs_pins")
+}
+
+/// One use of a pinned CID by a market question or a reasoning trace (#328).
+model IpfsPinRef {
+  id         String    @id @default(uuid())
+  cid        String
+  /// MARKET_QUESTION | TRACE
+  ownerKind  String
+  ownerId    String
+  /// CANDIDATE | ANCHORED | RELEASED
+  state      String    @default("CANDIDATE")
+  anchoredAt DateTime?
+  /// e.g. "market:42", "trace:17".
+  anchor     String?
+  createdAt  DateTime  @default(now())
+  pin        IpfsPin   @relation(fields: [cid], references: [cid])
+
+  @@unique([cid, ownerKind, ownerId])
+  @@index([ownerKind, ownerId])
+  @@index([state])
+  @@map("ipfs_pin_refs")
+}

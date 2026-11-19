@@ -10,6 +10,7 @@ import { purgeExpiredIdempotencyKeys } from '../middlewares/idempotency.middlewa
 import { computeAndStoreSnapshots } from '../services/calibration.service';
 import { purgeSignalStore } from '../services/signal-store.service';
 import { recordCronRun } from './registry';
+import { runPinGc } from '../jobs/pin-gc.job';
 
 let runningTraderCycleId: string | null = null;
 let correlationSnapshotRunning = false;
@@ -93,6 +94,20 @@ export function startMonitorCron(): void {
     } catch (err) {
       recordCronRun('signal-retention', 'failure', startedAt, new Date(), err);
       logger.error({ err }, 'Monitor cron: signal store retention failed');
+    }
+  }));
+
+  // IPFS pin garbage collection (#328) — hourly at :25. Runs on every instance;
+  // the unpin claim uses FOR UPDATE SKIP LOCKED so instances never share a pin.
+  cron.schedule('25 * * * *', () => tick('pin-gc', async () => {
+    if (!config.PIN_GC_ENABLED) return;
+    const startedAt = new Date();
+    try {
+      await runPinGc();
+      recordCronRun('pin-gc', 'success', startedAt, new Date());
+    } catch (err) {
+      recordCronRun('pin-gc', 'failure', startedAt, new Date(), err);
+      logger.error({ err }, 'Monitor cron: pin GC failed');
     }
   }));
 

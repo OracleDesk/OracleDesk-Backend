@@ -8,6 +8,7 @@ import { logger } from '../lib/logger';
 import { AppError } from '../middlewares/error.middleware';
 import { assertPlainJson, canonicalBytes, NonPlainJsonError, sha256Hex } from '../utils/hash.util';
 import { getContentStore } from './content-store.service';
+import { getPinLedger, type PinOwner } from './pin-ledger.service';
 import { bulkheads, deadline, sleep, TimeoutError } from '../lib/resilience';
 
 const PINATA_BASE = 'https://api.pinata.cloud';
@@ -51,6 +52,28 @@ export interface IpfsTransport {
   pin(bytes: Buffer, name: string, signal?: AbortSignal): Promise<string>;
   /** Returns the exact bytes stored under `cid`. */
   fetch(cid: string, signal?: AbortSignal): Promise<Buffer>;
+  /** Removes the pin (#328). Optional: transports that cannot unpin are never garbage-collected. */
+  unpin?(cid: string, signal?: AbortSignal): Promise<void>;
+  /** Lists pins whose name starts with `namePrefix` (#328). */
+  list?(opts: { namePrefix?: string; pageLimit?: number; pageOffset?: number }): Promise<PinListPage>;
+}
+
+export interface ProviderPin {
+  cid: string;
+  name: string;
+  size: number;
+  pinnedAt: Date | null;
+}
+
+export interface PinListPage {
+  pins: ProviderPin[];
+  /** Total pins matching the filter at the provider. */
+  total: number;
+}
+
+/** HTTP status of a failed provider call, so the GC can back off on 429. */
+export function providerStatus(err: unknown): number | undefined {
+  return (err as { response?: { status?: number } })?.response?.status ?? (err as { status?: number })?.status;
 }
 
 export const pinataTransport: IpfsTransport = {
@@ -75,6 +98,46 @@ export const pinataTransport: IpfsTransport = {
       signal,
     });
     return data.IpfsHash;
+  },
+
+  async unpin(cid, signal) {
+    const apiKey = secret('PINATA_API_KEY');
+    const secretKey = secret('PINATA_SECRET_API_KEY');
+    if (!apiKey || !secretKey) {
+      throw new AppError(503, 'IPFS_NOT_CONFIGURED', 'PINATA_API_KEY and PINATA_SECRET_API_KEY are not set');
+    }
+    await axios.delete(`${PINATA_BASE}/pinning/unpin/${encodeURIComponent(cid)}`, {
+      headers: { pinata_api_key: apiKey, pinata_secret_api_key: secretKey },
+      timeout: config.TIMEOUT_IPFS_PIN_MS,
+      signal,
+    });
+  },
+
+  async list({ namePrefix, pageLimit = 100, pageOffset = 0 }) {
+    const apiKey = secret('PINATA_API_KEY');
+    const secretKey = secret('PINATA_SECRET_API_KEY');
+    if (!apiKey || !secretKey) {
+      throw new AppError(503, 'IPFS_NOT_CONFIGURED', 'PINATA_API_KEY and PINATA_SECRET_API_KEY are not set');
+    }
+    const params: Record<string, string | number> = { status: 'pinned', pageLimit, pageOffset };
+    if (namePrefix) params['metadata[name]'] = namePrefix;
+    const { data } = await axios.get<{
+      count: number;
+      rows: Array<{ ipfs_pin_hash: string; size: number; date_pinned: string; metadata?: { name?: string | null } }>;
+    }>(`${PINATA_BASE}/data/pinList`, {
+      headers: { pinata_api_key: apiKey, pinata_secret_api_key: secretKey },
+      params,
+      timeout: config.TIMEOUT_IPFS_PIN_MS,
+    });
+    return {
+      total: data.count,
+      pins: data.rows.map((r) => ({
+        cid: r.ipfs_pin_hash,
+        name: r.metadata?.name ?? '',
+        size: r.size,
+        pinnedAt: r.date_pinned ? new Date(r.date_pinned) : null,
+      })),
+    };
   },
 
   async fetch(cid, signal) {
@@ -128,11 +191,30 @@ export function localIpfsTransport(dir: string): IpfsTransport {
         throw new AppError(404, 'IPFS_NOT_FOUND', 'Content is not in the local IPFS store', { cid });
       }
     },
+    async unpin(cid) {
+      fs.rmSync(path.join(dir, cid), { force: true });
+    },
+    async list({ pageLimit = 100, pageOffset = 0 }) {
+      const names = fs.existsSync(dir) ? fs.readdirSync(dir) : [];
+      return {
+        total: names.length,
+        pins: names.slice(pageOffset, pageOffset + pageLimit).map((cid) => ({
+          cid,
+          name: '',
+          size: fs.statSync(path.join(dir, cid)).size,
+          pinnedAt: null,
+        })),
+      };
+    },
   };
 }
 
 let transport: IpfsTransport =
   config.IPFS_TRANSPORT === 'local' ? localIpfsTransport(config.IPFS_LOCAL_DIR) : pinataTransport;
+
+export function getIpfsTransport(): IpfsTransport {
+  return transport;
+}
 
 /** Test seam. Returns the previous transport. */
 export function setIpfsTransport(next: IpfsTransport): IpfsTransport {
@@ -148,12 +230,11 @@ export interface PinnedDocument {
   bytes: Buffer;
 }
 
-/** Canonicalises `document`, pins those bytes and returns their hash. Retries once. */
-export async function pinJson(
-  document: unknown,
-  name: string,
-  opts?: { signal?: AbortSignal },
-): Promise<PinnedDocument> {
+/**
+ * Canonicalises `document` without pinning it. Shares its rules with
+ * `pinJson`, so a dry-run can compute the CID a live pin would return (#328).
+ */
+export function prepareDocument(document: unknown, name: string): PinnedDocument {
   try {
     assertPlainJson(document);
   } catch (err) {
@@ -163,8 +244,55 @@ export async function pinJson(
     throw err;
   }
   const bytes = canonicalBytes(document);
-  const hash = sha256Hex(bytes);
+  return { cid: cidForBytes(bytes), hash: sha256Hex(bytes), bytes };
+}
+
+const providerName = () => (config.IPFS_TRANSPORT === 'local' ? 'local' : 'pinata');
+
+/**
+ * Canonicalises `document`, pins those bytes and returns their hash. Retries once.
+ *
+ * With `opts.owner` the pin is recorded in the pin ledger (#328): identical
+ * bytes pinned twice call the provider once and add a second reference. The
+ * owner is optional only so ad-hoc callers keep working; every production call
+ * site passes one, otherwise the pin is invisible to the garbage collector.
+ */
+export async function pinJson(
+  document: unknown,
+  name: string,
+  opts?: { signal?: AbortSignal; owner?: PinOwner },
+): Promise<PinnedDocument> {
+  const { bytes, hash, cid: localCid } = prepareDocument(document, name);
+  const ledger = getPinLedger();
   let lastError: unknown;
+
+  // Ledger bookkeeping must not fail a pin that would otherwise succeed. A
+  // failed acquire leaves the document untracked, so say so loudly.
+  let decision: 'PIN' | 'SKIP' = 'PIN';
+  let tracked = false;
+  if (opts?.owner) {
+    try {
+      decision = await ledger.acquire({
+        cid: localCid,
+        sha256: hash,
+        size: bytes.length,
+        provider: providerName(),
+        owner: opts.owner,
+      });
+      tracked = true;
+    } catch (err) {
+      logger.error({ err, cid: localCid, name }, 'Pin ledger acquire failed; pinning untracked');
+    }
+  }
+
+  if (decision === 'SKIP') {
+    // Already pinned (or an in-flight unpin will restore it): no provider call.
+    await getContentStore()
+      .put({ cid: localCid, sha256: hash, bytes, origin: 'PINNED', verifiedBy: 'pin' })
+      .catch(() => undefined);
+    logger.info({ name, cid: localCid }, 'IPFS document already pinned; recorded reference only');
+    return { cid: localCid, hash, bytes };
+  }
 
   const handle = deadline('ipfs-pin', opts?.signal);
 
@@ -177,6 +305,19 @@ export async function pinJson(
 
         try {
           const cid = await transport.pin(bytes, name, handle.signal);
+          if (cid !== localCid) {
+            // The provider CID wins (it is what gets published), but a
+            // mismatch means dry-run CIDs would not match live ones.
+            logger.warn({ name, providerCid: cid, localCid }, 'Provider CID differs from cidForBytes');
+            if (tracked) {
+              await ledger
+                .acquire({ cid, sha256: hash, size: bytes.length, provider: providerName(), owner: opts?.owner })
+                .catch(() => undefined);
+            }
+          }
+          if (tracked) {
+            await ledger.markPinned(cid).catch((err) => logger.warn({ err, cid }, 'Pin ledger markPinned failed'));
+          }
           // Write-through: the pin succeeded, so a cache failure must not fail
           // the caller (the CID/hash are still returned and persisted).
           await getContentStore()
@@ -199,6 +340,11 @@ export async function pinJson(
         }
       }
 
+      if (tracked) {
+        await ledger
+          .markFailed(localCid, lastError instanceof Error ? lastError.message : String(lastError))
+          .catch(() => undefined);
+      }
       if (lastError instanceof AppError) throw lastError;
       logger.error({ err: lastError, name }, 'IPFS pin failed after retry');
       throw new AppError(502, 'IPFS_UPLOAD_FAILED', 'Failed to pin document to IPFS', { name });

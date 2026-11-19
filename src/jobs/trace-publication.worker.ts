@@ -23,6 +23,7 @@ import { logger } from '../lib/logger';
 import { config } from '../config';
 import { AppError } from '../middlewares/error.middleware';
 import { pinJson } from '../services/ipfs.service';
+import { anchorRefs } from '../services/pin-ledger.service';
 import { publishTrace, ExpiredError, ChainPendingError } from '../services/chain.service';
 import { ChainError } from '../services/stellar/errors';
 import { AgentPausedError } from '../services/agent-controls.service';
@@ -100,7 +101,8 @@ function ctxFrom(deps: WorkerDeps, now: Date): Ctx {
     prisma: deps.prisma ?? defaultPrisma,
     publisher: deps.publisher ?? defaultPublisher,
     reader: deps.reader ?? defaultRegistryReader,
-    pin: deps.pin ?? ((payload, name) => pinJson(payload, name)),
+    pin: deps.pin ?? ((payload, name) =>
+      pinJson(payload, name, { owner: { kind: 'TRACE', id: name.replace(/^oracledesk-trace-/, '') } })),
     dryRun: deps.dryRun ?? config.CHAIN_EXECUTION_MODE === 'dry-run',
     maxAttempts: deps.maxAttempts ?? config.TRACE_PUBLISH_MAX_ATTEMPTS,
     confirmTimeoutMs: deps.confirmTimeoutMs ?? config.TRACE_CONFIRM_TIMEOUT_MS,
@@ -203,6 +205,7 @@ async function confirm(ctx: Ctx, row: PublicationRow, onChainTraceId: bigint | n
     });
   }
   await update(ctx, row.id, { status: S.CONFIRMED, confirmedAt: ctx.now, lastError: null });
+  if (onChainTraceId !== null) await anchorRefs('TRACE', row.traceId, `trace:${onChainTraceId.toString()}`);
   return { row: { status: S.CONFIRMED }, park: true };
 }
 

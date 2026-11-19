@@ -18,6 +18,7 @@
  * - Event shapes come from each binding's contract spec (Spec.parseEvent),
  *   never hand-written XDR decoding.
  */
+import { anchorRefs } from './pin-ledger.service';
 import { rpc, xdr } from '@stellar/stellar-sdk';
 import type { Spec } from '@stellar/stellar-sdk/contract';
 import { Prisma } from '@prisma/client';
@@ -272,6 +273,7 @@ async function applySideEffects(event: DecodedEvent): Promise<void> {
         where: { traceId: trace.id, status: { in: ['AWAITING_MARKET', 'READY', 'SUBMITTED'] } },
         data: { status: 'CONFIRMED', confirmedAt: new Date(), lastError: null },
       });
+      await anchorRefs('TRACE', trace.id, `trace:${onChainTraceId.toString()}`);
     }
   }
 }

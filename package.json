@@ -24,6 +24,7 @@
     "db:seed": "tsx prisma/seed.ts",
     "db:reset": "prisma migrate reset --force --skip-seed && npm run db:seed",
     "snapshot:export": "tsx scripts/snapshot-export.ts",
+    "pins:reconcile": "tsx scripts/reconcile-pins.ts",
     "reconcile:post-restore": "tsx scripts/post-restore-reconcile.ts"
   },
   "keywords": [],
