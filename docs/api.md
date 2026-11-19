@@ -1481,6 +1481,14 @@ this today).
 { "copyTradeId": "uuid", "txHash": "64-hex", "status": "EXECUTED", "verified": true }
 ```
 
+#### `POSITION_EXITED`
+When an exit reasoning trace is confirmed on-chain. Sent to users whose
+confirmed copy trade references the position's entry trace.
+
+```json
+{ "exitTraceId": "uuid", "positionId": "uuid", "marketId": "uuid", "reason": "STOP_LOSS" }
+```
+
 ### Public events
 
 ### `TRADE_EXECUTED`

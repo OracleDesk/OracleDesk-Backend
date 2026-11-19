@@ -104,7 +104,7 @@ pin as soon as the hashes appear.
 
 ## Note: `publish_trace` action strings differ between repos
 
-The backend publishes traces with `create_market`, `buy_yes` and `buy_no`
+The backend publishes traces with `create_market`, `buy_yes`, `buy_no`, `sell_yes` and `sell_no`
 (`src/lib/trace-actions.ts`). The contracts repo's TypeScript agents use
 `create_market` and `buy`. Consumers that group traces by action should treat
 `buy` as either direction, or the two sides should agree on one vocabulary.

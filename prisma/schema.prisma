@@ -343,6 +343,8 @@ model Position {
   /// The pool could not absorb a sale of all shares, so liquidation value is 0.
   illiquid           Boolean   @default(false)
   hedgeMarketId String?
+  /// Reasoning trace that led to the confirmed buy.
+  entryTraceId  String?
   closedAt     DateTime?
   closeReason  String?
   createdAt    DateTime       @default(now())
@@ -374,6 +376,9 @@ model PositionExit {
   /// SUBMITTED | CONFIRMED | FAILED | SIMULATED
   status           String
   error            String?
+  /// Deterministic decision inputs captured before submission.
+  context          Json?
+  traceId          String?  @unique
   createdAt        DateTime @default(now())
 
   position Position @relation(fields: [positionId], references: [id], onDelete: Cascade)

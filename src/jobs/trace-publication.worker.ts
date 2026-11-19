@@ -236,6 +236,19 @@ async function advance(row: PublicationRow, ctx: Ctx): Promise<Advance> {
         await update(ctx, row.id, { status: S.FAILED, lastError: 'NO_PAYLOAD' });
         return { row: { status: S.FAILED }, park: true };
       }
+      if (row.action === 'sell_yes' || row.action === 'sell_no') {
+        const payload = row.payload as { entry?: { traceId?: string | null; onChainTraceId?: string | null } };
+        const entryTraceId = payload.entry?.traceId;
+        if (entryTraceId && !payload.entry?.onChainTraceId) {
+          const entry = await ctx.prisma.reasoningTrace.findUnique({ where: { id: entryTraceId }, select: { onChainTraceId: true } });
+          if (entry?.onChainTraceId == null) {
+            await update(ctx, row.id, { lastError: 'AWAITING_ENTRY_TRACE', nextAttemptAt: after(ctx.now, MARKET_WAIT_MS) });
+            return { row: {}, park: true };
+          }
+          row.payload = { ...payload, entry: { ...payload.entry, onChainTraceId: entry.onChainTraceId.toString() } };
+          await update(ctx, row.id, { payload: row.payload });
+        }
+      }
       try {
         const pinned = await ctx.pin(row.payload as Record<string, unknown>, `oracledesk-trace-${row.traceId}`);
         await ctx.prisma.reasoningTrace.update({

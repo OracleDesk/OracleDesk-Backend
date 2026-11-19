@@ -3,13 +3,36 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { setupTestEnv } from './helpers/env';
-import { TraceDocV1, LegacyTraceDoc, buildTraceDoc, fromContractsTrace } from '../src/schemas/trace';
+import { TraceDocV1, ExitTraceDocV1, LegacyTraceDoc, buildTraceDoc, fromContractsTrace } from '../src/schemas/trace';
 import { QuestionDocV1, QuestionDocV2, questionDocument } from '../src/schemas/question';
 import { canonicalJson, canonicalJsonStrict, verifyTraceHash } from '../src/utils/hash.util';
 import { pinDocument, setIpfsTransportForTests } from '../src/services/ipfs.service';
 import { generateSchemas } from '../scripts/gen-schemas';
 
 setupTestEnv();
+
+test('exit trace validates base-unit fills and rejects floating-point money', () => {
+  const doc = {
+    schemaVersion: 1,
+    kind: 'oracledesk.trace.exit',
+    traceId: '11111111-1111-4111-8111-111111111111',
+    agentType: 'TRADER',
+    action: 'sell_yes',
+    market: { backendId: '22222222-2222-4222-8222-222222222222', onChainId: '7' },
+    entry: { traceId: '33333333-3333-4333-8333-333333333333', onChainTraceId: '9' },
+    reason: 'STOP_LOSS',
+    mark: { source: 'indexed', ledger: 123, priceBps: 4100, liquidationValueRaw: '4100000' },
+    fill: { sharesSoldRaw: '10000000', collateralOutRaw: '4000000', txHash: 'a'.repeat(64), estimated: false },
+    realisedPnlRaw: '-1000000',
+    positionClosed: true,
+    narrative: null,
+    agentWallet: null,
+    createdAt: '2026-11-19T12:00:00.000Z',
+  } as const;
+
+  assert.doesNotThrow(() => ExitTraceDocV1.parse(doc));
+  assert.throws(() => ExitTraceDocV1.parse({ ...doc, fill: { ...doc.fill, collateralOutRaw: '0.4' } }));
+});
 
 test('buildTraceDoc output validates against TraceDocV1 for market-maker and trader inputs', () => {
   const mmDoc = buildTraceDoc({
