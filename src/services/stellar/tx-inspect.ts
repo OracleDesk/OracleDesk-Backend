@@ -1,7 +1,8 @@
-import { Address, rpc, StrKey, xdr } from '@stellar/stellar-sdk';
-import { AppError } from '../../middlewares/error.middleware';
+import { rpc, xdr } from '@stellar/stellar-sdk';
+import { AppError } from '../../lib/app-error';
 import { readClients } from './clients';
 import { CONTRACTS } from '../../config/contracts';
+import { extractContractEvents } from './tx-events';
 
 /**
  * Unwraps fee-bump envelopes to get the inner Transaction.
@@ -55,100 +56,37 @@ export function setTransactionSender(next: TransactionSender): TransactionSender
 
 export interface ContractEventParsed {
   contractId: string;
-  name: string;
+  name: string | null;
   data: Record<string, any>;
-  rawEvent?: any;
+  opIndex: number;
 }
 
 /**
  * Extracts and decodes Soroban events from a transaction response's resultMetaXdr.
  */
 export function readContractEvents(response: rpc.Api.GetTransactionResponse): ContractEventParsed[] {
-  const results: ContractEventParsed[] = [];
-  let meta = (response as any).resultMetaXdr as any;
-  if (!meta) return results;
+  const input = response as any;
+  const extraction = extractContractEvents({
+    resultMetaXdr: input.resultMetaXdr,
+    contractEventsXdr: input.events?.contractEventsXdr,
+  });
+  if (extraction.skipped) throw new AppError(502, 'CHAIN_EVENT_UNDECODABLE', 'Stellar RPC returned an undecodable contract event', { skipped: extraction.skipped });
 
-  if (typeof meta === 'string') {
+  const specs = new Map([
+    [CONTRACTS.marketCore, readClients.marketCore().spec],
+    [CONTRACTS.treasury, readClients.treasury().spec],
+    [CONTRACTS.resolver, readClients.resolver().spec],
+    [CONTRACTS.reasoningRegistry, readClients.reasoningRegistry().spec],
+  ]);
+  return extraction.events.map((event) => {
+    const spec = specs.get(event.contractId);
+    if (!spec) return { contractId: event.contractId, name: null, data: {}, opIndex: event.opIndex };
     try {
-      meta = xdr.TransactionMeta.fromXDR(meta, 'base64');
-    } catch {}
-  }
-
-  let rawEvents: any[] = [];
-  if (Array.isArray(meta.events)) {
-    rawEvents = meta.events;
-  } else {
-    try {
-      if (typeof meta.v3 === 'function') {
-        const sm = meta.v3().sorobanMeta?.();
-        if (sm && typeof sm.events === 'function') {
-          rawEvents = sm.events() ?? [];
-        }
-      }
-    } catch {}
-    if (rawEvents.length === 0) {
-      try {
-        if (typeof meta.v4 === 'function') {
-          const sm = meta.v4().sorobanMeta?.();
-          if (sm && typeof sm.events === 'function') {
-            rawEvents = sm.events() ?? [];
-          }
-        }
-      } catch {}
+      const parsed = spec.parseEvent(event.topics, event.data);
+      if (!parsed) throw new Error('No matching event in contract spec');
+      return { contractId: event.contractId, name: parsed.name, data: parsed.data, opIndex: event.opIndex };
+    } catch {
+      throw new AppError(502, 'CHAIN_EVENT_UNDECODABLE', 'Contract event does not match its deployed spec', { contractId: event.contractId });
     }
-  }
-
-  const marketCoreSpec = readClients.marketCore().spec;
-
-  for (const ev of rawEvents) {
-    try {
-      let contractId = '';
-      if (ev.contractId) {
-        if (typeof ev.contractId === 'string') {
-          contractId = ev.contractId;
-        } else if (typeof ev.contractId.contractId === 'function') {
-          const cid = ev.contractId.contractId();
-          contractId = typeof cid === 'string' ? cid : StrKey.encodeContract(cid);
-        } else if (typeof ev.contractId === 'function') {
-          const scAddr = ev.contractId();
-          if (scAddr) {
-            contractId = Address.fromScAddress(scAddr).toString();
-          }
-        } else if (Buffer.isBuffer(ev.contractId)) {
-          contractId = StrKey.encodeContract(ev.contractId);
-        }
-      }
-
-      let topics: xdr.ScVal[] = [];
-      let data: xdr.ScVal | undefined;
-
-      if (ev.body && typeof ev.body.v0 === 'function') {
-        const v0 = ev.body.v0();
-        topics = v0.topics?.() ?? [];
-        data = v0.data?.();
-      } else if (ev.body && ev.body.topics) {
-        topics = ev.body.topics;
-        data = ev.body.data;
-      } else if (ev.topic) {
-        topics = Array.isArray(ev.topic)
-          ? ev.topic.map((t: any) => (typeof t === 'string' ? xdr.ScVal.fromXDR(t, 'base64') : t))
-          : [];
-        data = typeof ev.value === 'string' ? xdr.ScVal.fromXDR(ev.value, 'base64') : ev.value;
-      }
-
-      if (topics.length > 0 && data) {
-        const parsed = marketCoreSpec.parseEvent(topics, data);
-        if (parsed) {
-          results.push({
-            contractId: contractId || CONTRACTS.marketCore,
-            name: parsed.name,
-            data: parsed.data,
-            rawEvent: ev,
-          });
-        }
-      }
-    } catch {}
-  }
-
-  return results;
+  });
 }

@@ -1435,3 +1435,12 @@ The API sets declarative cache policies and strong ETags across all endpoints vi
 | I4 | An idempotent re-call never double-counts money or events |
 | I5 | EXPIRED is derived from ledger sequence, not a wall-clock guess |
 | I6 | A SUCCESS response is only trusted once it passes envelope validation |
+# Reading transaction events
+
+Transaction verification uses one version-aware extractor for Stellar RPC responses. It reads
+contract events from transaction meta v3, per-operation meta v4, or
+`events.contractEventsXdr`, and converts raw contract hashes to `C…` strkeys. Diagnostic and
+transaction-level events are never treated as contract events. When both meta and the RPC event
+field are present they must match exactly; disagreement fails closed with
+`CHAIN_READ_INCONSISTENT`, while an unknown future meta arm fails with
+`CHAIN_META_UNSUPPORTED`.

@@ -6,6 +6,7 @@ import { getTransactionReader } from './stellar/tx-inspect';
 import { getOnChainMarket, marketCount } from './chain.service';
 import type { Market as OnChainMarket } from '../generated/market-core';
 import { readContractEvents } from './stellar/tx-inspect';
+import { AppError } from '../lib/app-error';
 
 export interface MarketCreationAttemptRow {
   id: string;
@@ -158,6 +159,7 @@ export async function discoverLandedMarket(params: {
         }
       }
     } catch (err: any) {
+      if (err instanceof AppError && err.code.startsWith('CHAIN_')) throw err;
       logger.debug({ err: err?.message, txHash: params.txHash }, 'txHash discovery check missed');
     }
   }
