@@ -67,12 +67,15 @@ async function setup(api: TraceApiModule): Promise<Fixture> {
   // keys configured the hedge-condition call fails and the service applies its
   // deterministic defaults (no network is attempted).
   const originalCreate = prisma.reasoningTrace.create;
-  (prisma.reasoningTrace.create as any) = async ({ data }: any) => ({ id: 'trace-uuid-1', ...data });
+  const originalFindMarket = prisma.market.findUnique;
+  (prisma.reasoningTrace.create as any) = async ({ data }: any) => ({ ...data });
+  // A market-creation trace: the market has no on-chain id yet (#227).
+  (prisma.market.findUnique as any) = async () => ({ onChainMarketId: null });
 
   let payload: Record<string, unknown>;
   try {
     const generated = await generateReasoningTrace({
-      marketId: 'market-uuid-1',
+      marketId: '22222222-2222-4222-8222-222222222222',
       agentType: 'MARKET_MAKER',
       decisionType: 'MARKET_CREATION',
       sourcesUsed: [
@@ -84,9 +87,11 @@ async function setup(api: TraceApiModule): Promise<Fixture> {
       edge: 0.12,
       confidenceInterval: { lower: 0.5, upper: 0.7 },
     });
-    payload = { ...generated.tracePayload, onChainMarketId: null };
+    // Pinned exactly as generated: no caller adds keys to the document (#227).
+    payload = generated.tracePayload;
   } finally {
     (prisma.reasoningTrace.create as any) = originalCreate;
+    (prisma.market.findUnique as any) = originalFindMarket;
   }
 
   const pinned = await pinAndPublishDocument(

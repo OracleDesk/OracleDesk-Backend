@@ -16,12 +16,14 @@ import {
 import { setupTestEnv } from './helpers/env';
 import {
   verifyCopyTradeTx,
+  verifyCopyTradeEvidence,
   confirmCopyTrade,
   CopyTradePendingError,
   CopyTradeStatus,
+  transitionCopyTrade,
 } from '../src/services/copy-trade.service';
 import { CONTRACTS } from '../src/config/contracts';
-import { setTransactionReader, TransactionReader } from '../src/services/stellar/tx-inspect';
+import { readContractEvents, setTransactionReader, TransactionReader } from '../src/services/stellar/tx-inspect';
 
 setupTestEnv();
 
@@ -116,6 +118,49 @@ test('confirms a valid buy and records collateral, shares and fee from the event
   assert.equal(result.collateral, 100_000_000n);
   assert.equal(result.shares, 768854n);
   assert.equal(result.fee, 3874n);
+  assert.equal(result.eventId, null);
+});
+
+test('stored and RPC events share the collateral limit and preserve indexed event ids', async () => {
+  const txHash = '12'.repeat(32);
+  const response = await makeReader(rpc.Api.GetTransactionStatus.SUCCESS).getTransaction(txHash);
+  const [event] = readContractEvents(response);
+
+  assert.throws(
+    () => verifyCopyTradeEvidence(
+      {
+        txHash,
+        trader: TRADER_ADDR,
+        onChainMarketId: 0n,
+        outcome: 'Yes',
+        maxCollateral: 0n,
+      },
+      {
+        txHash,
+        ledger: 4951600,
+        eventId: 'indexed-event-id',
+        events: [{ ...event, id: 'indexed-event-id' }],
+      },
+    ),
+    (err: any) => err.code === 'COPY_TRADE_AMOUNT_EXCEEDED',
+  );
+
+  const verified = verifyCopyTradeEvidence(
+    {
+      txHash,
+      trader: TRADER_ADDR,
+      onChainMarketId: 0n,
+      outcome: 'Yes',
+      maxCollateral: 200_000_000n,
+    },
+    {
+      txHash,
+      ledger: 4951600,
+      eventId: 'indexed-event-id',
+      events: [{ ...event, id: 'indexed-event-id' }],
+    },
+  );
+  assert.equal(verified.eventId, 'indexed-event-id');
 });
 
 test('returns CONFIRMING when getTransaction is NOT_FOUND', async () => {
@@ -316,7 +361,7 @@ test('rejects reuse of a txHash across two copy trades and confirm is idempotent
           id: copyTradeId1,
           userId,
           followerWallet: TRADER_ADDR,
-          outcome: 'YES',
+          direction: 'YES',
           amountRaw: '200000000',
           status: CopyTradeStatus.PENDING,
           txHash: null,
@@ -329,7 +374,7 @@ test('rejects reuse of a txHash across two copy trades and confirm is idempotent
           id: copyTradeId2,
           userId,
           followerWallet: TRADER_ADDR,
-          outcome: 'YES',
+          direction: 'YES',
           amountRaw: '200000000',
           status: CopyTradeStatus.PENDING,
           txHash: null,
@@ -355,8 +400,20 @@ test('rejects reuse of a txHash across two copy trades and confirm is idempotent
         if (ct) Object.assign(ct, data);
         return ct;
       },
+      updateMany: async ({ where, data }: any) => {
+        const ct = mockDb.copyTrades.get(where.id);
+        const validStatus = where.status.in.includes(ct?.status);
+        const validHash = where.OR.some((condition: any) =>
+          condition.txHash === null ? ct?.txHash == null : condition.txHash === ct?.txHash,
+        );
+        if (!ct || !validStatus || !validHash) return { count: 0 };
+        Object.assign(ct, data);
+        return { count: 1 };
+      },
+      findUnique: async ({ where }: any) => mockDb.copyTrades.get(where.id) ?? null,
     },
   };
+  (mockPrisma as any).$transaction = async (callback: any) => callback(mockPrisma);
 
   const envelope = buyEnvelope({ trader: TRADER_ADDR });
   const reader = makeReader(rpc.Api.GetTransactionStatus.SUCCESS, [BASE_TRADE_EVENT], envelope);
@@ -382,4 +439,46 @@ test('rejects reuse of a txHash across two copy trades and confirm is idempotent
       return true;
     },
   );
+});
+
+test('copy-trade transition refuses to overwrite a row that already left an open state', async () => {
+  const row: any = {
+    id: 'ct-guarded',
+    userId: 'u-test',
+    status: CopyTradeStatus.PENDING,
+    txHash: null,
+  };
+  const mockPrisma = {
+    copyTrade: {
+      updateMany: async ({ where, data }: any) => {
+        const statusMatches = where.status.in.includes(row.status);
+        const hashMatches = where.OR.some((condition: any) =>
+          condition.txHash === null ? row.txHash === null : condition.txHash === row.txHash,
+        );
+        if (row.id !== where.id || !statusMatches || !hashMatches) return { count: 0 };
+        Object.assign(row, data);
+        return { count: 1 };
+      },
+      findUnique: async () => row,
+    },
+  };
+  (mockPrisma as any).$transaction = async (callback: any) => callback(mockPrisma);
+
+  const first = await transitionCopyTrade(
+    mockPrisma as any,
+    row,
+    '77'.repeat(32),
+    { status: CopyTradeStatus.FAILED, failureCode: 'COPY_TRADE_WRONG_SIDE' },
+  );
+  const second = await transitionCopyTrade(
+    mockPrisma as any,
+    row,
+    '88'.repeat(32),
+    { status: CopyTradeStatus.EXECUTED },
+  );
+
+  assert.equal(first?.status, CopyTradeStatus.FAILED);
+  assert.equal(second, null);
+  assert.equal(row.status, CopyTradeStatus.FAILED);
+  assert.equal(row.txHash, '77'.repeat(32));
 });

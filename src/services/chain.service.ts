@@ -113,6 +113,25 @@ export const Outcomes = {
   No: { tag: 'No', values: undefined } as Outcome,
 };
 
+// ─── Crash injection (test only) ─────────────────────────────────────────────
+// The outbox crash matrix (tests/integration/outbox-recovery.int.test.ts) stops
+// the live write at each named point. A hook that never settles freezes the
+// write there without running any catch/finally, as a real process death
+// would. Inert unless NODE_ENV=test.
+
+export type CrashPoint = 'after-built' | 'after-signed' | 'after-send-accepted' | 'after-send-timeout' | 'after-advance';
+
+let crashHook: ((p: CrashPoint) => Promise<void>) | null = null;
+
+export function setCrashHookForTest(fn: typeof crashHook): void {
+  if (config.NODE_ENV !== 'test') throw new Error('setCrashHookForTest is test only');
+  crashHook = fn;
+}
+
+async function crashPoint(p: CrashPoint): Promise<void> {
+  if (crashHook && config.NODE_ENV === 'test') await crashHook(p);
+}
+
 // ─── Cache Management ───────────────────────────────────────────────────────
 
 let activeChainCache: ChainCache | null = null;
@@ -278,7 +297,7 @@ async function write<T>(
     return result;
   } catch (err) {
     // A refused write never reached the chain; it is not a chain failure.
-    if (!(err instanceof AgentPausedError)) {
+    if (!(err instanceof AgentPausedError) && (err as { name?: string } | null)?.name !== 'TradeBoundError') {
       await recordChainWriteOutcome(scope, false, err instanceof ChainError ? err.contractError : null);
     }
     throw err;
@@ -321,6 +340,9 @@ async function submitWrite<T>(
     try {
       tx = await call({ fee: inclusionFee, timeoutInSeconds }, signer);
     } catch (err) {
+      // A bounded trade's local limit/deadline check (#245) refused to build:
+      // nothing was sent, and the caller needs the original decision code.
+      if ((err as { name?: string } | null)?.name === 'TradeBoundError') throw err;
       throw new ChainError(`${method} could not be built`, contractErrorName(contract, err), {
         method,
         cause: err instanceof Error ? err.message : String(err),
@@ -566,6 +588,7 @@ async function liveWriteWithRetry<T>(
       return await attemptWrite<T>(scope, seenVersion, opClass, contract, method, args, call, signal, ref);
     } catch (err) {
       if (err instanceof AgentPausedError) throw err;
+      if ((err as { name?: string } | null)?.name === 'TradeBoundError') throw err;
       // Expiry has its own recovery (#42) and a pending submission belongs to
       // the outbox worker (#35): neither is retried blindly here.
       if (err instanceof ExpiredError) throw err;
@@ -658,6 +681,7 @@ async function attemptWrite<T>(
           innerFee: inclusionFee.toString(),
           resourceFee: minResourceFee.toString(),
         });
+        await crashPoint('after-built');
 
         // The binding built and simulated against the RPC's account; rewrite the
         // built transaction with the sequence allocated from the cached counter.
@@ -689,6 +713,7 @@ async function attemptWrite<T>(
           sequence: rawTx?.built?.sequence != null ? String(rawTx.built.sequence) : null,
         });
         if (signedRow) outboxRow = signedRow;
+        await crashPoint('after-signed');
 
         const sender = getTransactionSender();
         try {
@@ -705,8 +730,10 @@ async function attemptWrite<T>(
             { signal },
           );
           outboxRow = await acceptSend(store, outboxRow, contract, txHash, sendRes);
+          await crashPoint('after-send-accepted');
           // The network accepted the envelope: reserve the sequence.
           await ctx.advanceSequence();
+          await crashPoint('after-advance');
           return { tx, simulated, txHash, sendRes, maxTime, minTime, minResourceFee };
         } catch (err: any) {
           if (err instanceof SequenceLockLost) {
@@ -718,6 +745,7 @@ async function attemptWrite<T>(
             );
           }
           if (err instanceof TimeoutError || err?.code === 'UPSTREAM_TIMEOUT') {
+            await crashPoint('after-send-timeout');
             // The submission may have been applied: re-read and never rebuild it.
             await ctx.resync().catch(() => undefined);
             throw new ChainWriteFailure(
@@ -1139,6 +1167,28 @@ const getPositionImpl = (marketId: bigint, holder: string, signal?: AbortSignal)
     readClients.marketCore().get_position({ market_id: marketId, holder }), signal,
   );
 
+/**
+ * get_position plus the ledger the simulation ran against, so the money audit
+ * (#222) can line the balance up with indexed events. Throws when the
+ * simulation carries no ledger: an untagged balance cannot be compared safely.
+ */
+const getPositionWithLedgerImpl = async (
+  marketId: bigint,
+  holder: string,
+  signal?: AbortSignal,
+): Promise<{ position: Position; ledger: number }> => {
+  const { value, tx } = await readTx<Position>(
+    'marketCore',
+    'get_position',
+    async () => readClients.marketCore().get_position({ market_id: marketId, holder }),
+    signal,
+  );
+  const raw = (tx.simulation as { latestLedger?: number | string } | undefined)?.latestLedger;
+  const ledger = raw == null ? NaN : Number(raw);
+  if (!Number.isFinite(ledger)) throw new ChainError('get_position simulation returned no ledger', null, { method: 'get_position' });
+  return { position: value, ledger };
+};
+
 export const getOnChainTrace = (traceId: bigint, signal?: AbortSignal) =>
   read<Trace>('reasoningRegistry', 'get_trace', async () => readClients.reasoningRegistry().get_trace({ trace_id: traceId }), signal);
 
@@ -1325,6 +1375,7 @@ const finalizeSignersImpl = (marketId: bigint, signal?: AbortSignal) =>
 
 const IMPLS = {
   getPosition: getPositionImpl,
+  getPositionWithLedger: getPositionWithLedgerImpl,
   marketCoreConfig: marketCoreConfigImpl,
   marketCount: marketCountImpl,
   getOnChainMarket: getOnChainMarketImpl,
@@ -1372,6 +1423,7 @@ export const agentSell = overridable('agentSell');
 export const publishTrace = overridable('publishTrace');
 export const marketCoreConfig = overridable('marketCoreConfig');
 export const getPosition = overridable('getPosition');
+export const getPositionWithLedger = overridable('getPositionWithLedger');
 export const registerSignerSpec = overridable('registerSignerSpec');
 export const attest = overridable('attest');
 export const finalizeSigners = overridable('finalizeSigners');

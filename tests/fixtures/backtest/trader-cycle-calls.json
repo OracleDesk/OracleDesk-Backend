@@ -130,7 +130,10 @@
           "direction": "NO",
           "status": "PENDING",
           "amount": 50,
+          "amountRaw": "500000000",
+          "priceBps": 5000,
           "price": 0.5,
+          "edgeBps": 0,
           "edgeDetected": 0,
           "kellyFraction": 0
         }
@@ -369,7 +372,10 @@
           "direction": "YES",
           "status": "PENDING",
           "amount": 250,
+          "amountRaw": "2500000000",
+          "priceBps": 4000,
           "price": 0.4,
+          "edgeBps": 3000,
           "edgeDetected": 0.29999999999999993,
           "kellyFraction": 0.025
         }
@@ -431,7 +437,11 @@
           "status": "EXECUTED",
           "txHash": "abababababababababababababababababababababababababababababababab",
           "innerTxHash": "abababababababababababababababababababababababababababababababab",
-          "executedAt": "<iso>"
+          "executedAt": "<iso>",
+          "collateralRaw": "2500000000",
+          "sharesRaw": "1",
+          "feeRaw": "25000000",
+          "fillPriceBps": 10000
         }
       }
     },
@@ -448,6 +458,7 @@
           "size": 250,
           "pnl": 0,
           "sharesRaw": "1",
+          "entryPriceBps": 10000,
           "costBasisRaw": "2500000000",
           "feesPaidRaw": "25000000"
         }

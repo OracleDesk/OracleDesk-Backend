@@ -29,6 +29,7 @@ const HELP = `Usage: backtest [options]
   --max-market-raw <n>      treasury max_market                           default 1000 USDC
   --max-daily-raw <n>       treasury max_daily (rolling 24 h)             default 2000 USDC
   --impact <mode>           reset | propagate | both                      default both
+  --sizing <model>          impact (FPMM curve) | mid (closed-form Kelly)  default impact
   --forecaster <spec>       prior | oracle-noise:<sigma> | recorded       default prior
   --seed <n>                PRNG seed                                     default 1
   --fee-bps <n>             pool fee (default: inferred from history)
@@ -103,7 +104,7 @@ async function main(): Promise<void> {
     options: {
       from: { type: 'string' }, to: { type: 'string' }, 'bankroll-raw': { type: 'string' }, 'max-trade-raw': { type: 'string' },
       'max-market-raw': { type: 'string' }, 'max-daily-raw': { type: 'string' }, impact: { type: 'string' }, forecaster: { type: 'string' },
-      seed: { type: 'string' }, 'fee-bps': { type: 'string' }, 'events-file': { type: 'string' }, out: { type: 'string' }, help: { type: 'boolean' },
+      seed: { type: 'string' }, sizing: { type: 'string' }, 'fee-bps': { type: 'string' }, 'events-file': { type: 'string' }, out: { type: 'string' }, help: { type: 'boolean' },
     },
   });
   if (values.help) { process.stdout.write(HELP); return; }
@@ -118,6 +119,9 @@ async function main(): Promise<void> {
   if (!['reset', 'propagate', 'both'].includes(impactArg)) throw new Error('--impact must be reset, propagate or both');
   const impacts: ImpactMode[] = impactArg === 'both' ? ['reset', 'propagate'] : [impactArg as ImpactMode];
 
+  const sizing = values.sizing ?? 'impact';
+  if (sizing !== 'impact' && sizing !== 'mid') throw new Error('--sizing must be impact or mid');
+
   const bankrollRaw = raw(values['bankroll-raw'], 10_000);
   const cfg: BacktestConfig = {
     from, to, stepMinutes: 15, bankrollRaw,
@@ -127,8 +131,9 @@ async function main(): Promise<void> {
     forecaster: values.forecaster ?? 'prior',
     seed: Number(values.seed ?? 1),
     feeBps: values['fee-bps'] === undefined ? undefined : Number(values['fee-bps']),
-    // The policy sizes from the simulated treasury's cash and caps (#76).
-    params: DEFAULT_PARAMS,
+    // The policy sizes from the simulated treasury's cash and caps (#76),
+    // on the pool's curve or at the mid (#225).
+    params: { ...DEFAULT_PARAMS, sizing },
   };
   if (!Number.isInteger(cfg.seed)) throw new Error('--seed must be an integer');
 

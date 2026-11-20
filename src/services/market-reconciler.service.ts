@@ -199,7 +199,7 @@ async function selectMarkets(max: number): Promise<MarketRow[]> {
 }
 
 /** Runs `worker` over `items` with at most `limit` in flight. */
-async function pool<T>(items: T[], limit: number, worker: (item: T) => Promise<void>): Promise<void> {
+export async function pool<T>(items: T[], limit: number, worker: (item: T) => Promise<void>): Promise<void> {
   let next = 0;
   const lanes = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
     while (next < items.length) await worker(items[next++]);

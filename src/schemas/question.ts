@@ -1,42 +1,82 @@
 import { z } from 'zod';
-import { MarketCategory, ContractCategoryTag } from '../lib/categories';
+import { MarketCategory } from '../lib/categories';
 
+/**
+ * A single resolution-spec block, as emitted by `resolvability.service.ts`
+ * `QuestionResolutionBlock`. Kept intentionally permissive (passthrough)
+ * so document validation does not reject fields added by the resolver as
+ * the spec evolves — the hash of the spec is what is pinned on chain, not
+ * its individual fields.
+ */
+const ResolutionBlock = z.object({}).passthrough();
+
+/**
+ * Optional price-market block (#90) carried on v1 and v2 question docs for
+ * markets whose resolution is driven by a reflector/price oracle.
+ */
+const PriceResolutionBlock = z
+  .object({
+    kind: z.literal('price'),
+    reflector: z.string(),
+    asset: z.string(),
+    assetKind: z.enum(['stellar', 'other']).or(z.string()),
+    threshold: z.union([z.number(), z.string()]),
+    direction: z.enum(['above', 'below', 'at_or_above', 'at_or_below']).or(z.string()),
+    maxStaleness: z.number().int().nonnegative(),
+  })
+  .passthrough();
+
+const MarketCategoryEnum = z.enum(
+  Object.values(MarketCategory) as [MarketCategory, ...MarketCategory[]],
+);
+const ContractCategoryEnum = z.enum([
+  'Macro',
+  'Geopolitics',
+  'Crypto',
+  'Sports',
+  'Culture',
+  'Other',
+]);
+
+/**
+ * Question document v1 — the shape produced by `questionDocument()` in
+ * `market-chain.service.ts` for markets without resolution details. A v1
+ * document may still carry a `priceResolution` block when the spec is a
+ * reflector-backed price market (#90).
+ */
 export const QuestionDocV1 = z
   .object({
     version: z.literal(1),
-    question: z.string(),
-    category: z.string(),
-    contractCategory: z.string(),
-    closeTime: z.number(),
-    resolutionSource: z.string().nullable().optional(),
-    resolutionHash: z.string(),
-    backendMarketId: z.string(),
+    question: z.string().min(1),
+    category: MarketCategoryEnum,
+    contractCategory: ContractCategoryEnum,
+    closeTime: z.number().int(),
+    resolutionSource: z.string().nullable(),
+    resolutionHash: z.string().regex(/^[0-9a-f]{64}$/),
+    backendMarketId: z.string().uuid(),
+    priceResolution: PriceResolutionBlock.optional(),
   })
   .strict();
 
 export type QuestionDocV1 = z.infer<typeof QuestionDocV1>;
 
+/**
+ * Question document v2 — same core shape as v1 plus the `resolution` block
+ * from #74. The version key is `version` (not `schemaVersion`), matching the
+ * actual pinned bytes.
+ */
 export const QuestionDocV2 = z
   .object({
-    schemaVersion: z.literal(2),
-    kind: z.literal('oracledesk.question'),
+    version: z.literal(2),
     question: z.string().min(1),
-    category: z.enum([
-      'FED',
-      'ECB',
-      'MACRO',
-      'GEOPOLITICAL',
-      'ELECTION',
-      'POLITICS',
-      'CRYPTO',
-      'SPORTS',
-      'ENTERTAINMENT',
-    ]),
-    contractCategory: z.enum(['Macro', 'Geopolitics', 'Crypto', 'Sports', 'Culture', 'Other']),
+    category: MarketCategoryEnum,
+    contractCategory: ContractCategoryEnum,
     closeTime: z.number().int(),
     resolutionSource: z.string().nullable(),
-    resolutionSpecHash: z.string().regex(/^[0-9a-f]{64}$/),
+    resolutionHash: z.string().regex(/^[0-9a-f]{64}$/),
     backendMarketId: z.string().uuid(),
+    resolution: ResolutionBlock,
+    priceResolution: PriceResolutionBlock.optional(),
   })
   .strict();
 
@@ -45,46 +85,11 @@ export type QuestionDocV2 = z.infer<typeof QuestionDocV2>;
 export type QuestionDocAny = QuestionDocV1 | QuestionDocV2;
 
 /**
- * Builds a canonical question document according to version (v1 or v2).
+ * Discriminated union over the version literal, used by `pinDocument` and by
+ * the published JSON Schema `/schemas/question/v2.json` so validators can
+ * accept either version from the same endpoint.
  */
-export function questionDocument(
-  market: {
-    id: string;
-    question: string;
-    category: string;
-    expiryTimestamp: Date | string | number;
-  },
-  resolution: {
-    specHash: string;
-    source?: string | null;
-  },
-  contractCategory: string,
-  version: 1 | 2 = 2,
-): QuestionDocV1 | QuestionDocV2 {
-  const closeTime = Math.floor(new Date(market.expiryTimestamp).getTime() / 1000);
-
-  if (version === 1) {
-    return QuestionDocV1.parse({
-      version: 1,
-      question: market.question,
-      category: market.category,
-      contractCategory,
-      closeTime,
-      resolutionSource: resolution.source ?? null,
-      resolutionHash: resolution.specHash,
-      backendMarketId: market.id,
-    });
-  }
-
-  return QuestionDocV2.parse({
-    schemaVersion: 2,
-    kind: 'oracledesk.question',
-    question: market.question,
-    category: market.category as any,
-    contractCategory: contractCategory as any,
-    closeTime,
-    resolutionSource: resolution.source ?? null,
-    resolutionSpecHash: resolution.specHash,
-    backendMarketId: market.id,
-  });
-}
+export const QuestionDocAny = z.discriminatedUnion('version', [
+  QuestionDocV1,
+  QuestionDocV2,
+]);

@@ -174,3 +174,58 @@ test('LLM_POLICY validation names the bad task (#157)', async () => {
   }));
   assert.equal(parsed.market_generation[0].provider, 'gemini');
 });
+
+test('ProviderHealthBook transitions match the router and are shared through router.healthBook (#218)', async () => {
+  const { createRouter, LlmError } = await modules();
+  const { ProviderHealthBook } = await import('../src/lib/llm/router');
+  let now = 10_000;
+  const book = new ProviderHealthBook({ clock: () => now, quotaCooldownMs: 3_600_000, failureCooldownMs: 60_000, failureThreshold: 3 });
+
+  assert.deepEqual(book.isSkippable('anthropic'), { skip: false, state: 'healthy' });
+
+  // Server failures cool only at the threshold.
+  book.recordFailure('anthropic', new LlmError('server', 'anthropic', '500'));
+  book.recordFailure('anthropic', new LlmError('timeout', 'anthropic', 'slow'));
+  assert.deepEqual(book.stateOf('anthropic'), { state: 'healthy', consecutiveFailures: 2, until: undefined, lastError: 'timeout' });
+  book.recordFailure('anthropic', new LlmError('server', 'anthropic', '503'));
+  assert.deepEqual(book.isSkippable('anthropic'), { skip: true, state: 'cooling' });
+  assert.equal(book.stateOf('anthropic').until, 70_000);
+
+  // The window passes: healthy again, failures remembered until a success.
+  now = 70_000;
+  assert.deepEqual(book.isSkippable('anthropic'), { skip: false, state: 'healthy' });
+  assert.equal(book.stateOf('anthropic').consecutiveFailures, 3);
+  book.recordSuccess('anthropic');
+  assert.deepEqual(book.stateOf('anthropic'), { state: 'healthy', consecutiveFailures: 0 });
+
+  // Rate limits cool for their retry-after (at least 1s, 30s when unknown).
+  book.recordFailure('gemini', new LlmError('rate_limited', 'gemini', '429', 200));
+  assert.equal(book.stateOf('gemini').until, now + 1_000);
+  book.recordFailure('gemini', new LlmError('rate_limited', 'gemini', '429'));
+  assert.equal(book.stateOf('gemini').until, now + 30_000);
+
+  // Quota exhaustion opens the provider.
+  book.recordFailure('openai', new LlmError('quota_exhausted', 'openai', 'quota'));
+  assert.deepEqual(book.isSkippable('openai'), { skip: true, state: 'open' });
+
+  // Auth / parse failures count but never change the state.
+  book.recordFailure('other', new LlmError('auth', 'other', '401'));
+  book.recordFailure('other', new LlmError('parse', 'other', 'bad json'));
+  assert.deepEqual(book.stateOf('other'), { state: 'healthy', consecutiveFailures: 2, until: undefined, lastError: 'parse' });
+
+  book.reset();
+  assert.deepEqual(book.stateOf('openai'), { state: 'healthy', consecutiveFailures: 0 });
+
+  // The router's own book: health() and complete() read what another caller recorded.
+  const anthropic = fakeProvider('anthropic', ['{"ok":true}']);
+  const gemini = fakeProvider('gemini', ['{"ok":true}']);
+  const router = createRouter({ generic_json: [spec('anthropic'), spec('gemini')] } as any, {
+    anthropic: anthropic as any,
+    gemini: gemini as any,
+  }, { clock: () => now });
+  router.healthBook.recordFailure('anthropic', new LlmError('rate_limited', 'anthropic', 'wait', 10_000));
+  assert.equal(router.health().anthropic.state, 'cooling');
+  const result = await router.complete(request('generic_json'));
+  assert.equal(result.provenance.provider, 'gemini');
+  assert.equal(anthropic.calls.length, 0);
+});

@@ -422,7 +422,7 @@ test('a voided market settles at half value per share', async () => {
     if (bought) return;
     bought = true;
     const [m] = await env.candidateMarkets(env.clock.now(), { minLiquidity: 0, horizonDays: 30 });
-    await env.buy({ marketId: m.id, direction: 'YES', amount: 100, price: 0.5, marketProb: 0.5, edge: 0.2, kelly: 0.01, forecast: { p: 0.7, ci: { lower: 0.6, upper: 0.8 }, sources: [] }, correlation: {} });
+    await env.buy({ marketId: m.id, direction: 'YES', amount: 100, amountRaw: 100n * USDC, price: 0.5, marketProb: 0.5, edge: 0.2, kelly: 0.01, forecast: { p: 0.7, ci: { lower: 0.6, upper: 0.8 }, sources: [] }, correlation: {} });
   };
   const report = await runBacktest({ events: h.events, signals: [], forecasts: [] }, await baseConfig({ from: iso(T0 + 15 * MIN), to: iso(T0 + 3 * DAY) }), { impacts: ['reset'], policy });
   const run = report.runs.reset!;
@@ -443,7 +443,7 @@ test('propagating the agent\'s impact earns less than resetting it when it buys 
 
   const policy = async (env: any) => {
     for (const m of await env.candidateMarkets(env.clock.now(), { minLiquidity: 0, horizonDays: 30 })) {
-      await env.buy({ marketId: m.id, direction: 'YES', amount: 100, price: 0.5, marketProb: 0.5, edge: 0.2, kelly: 0.01, forecast: { p: 0.7, ci: { lower: 0.6, upper: 0.8 }, sources: [] }, correlation: {} });
+      await env.buy({ marketId: m.id, direction: 'YES', amount: 100, amountRaw: 100n * USDC, price: 0.5, marketProb: 0.5, edge: 0.2, kelly: 0.01, forecast: { p: 0.7, ci: { lower: 0.6, upper: 0.8 }, sources: [] }, correlation: {} });
     }
   };
   const cfg = await baseConfig({ from: iso(T0 + 15 * MIN), to: iso(T0 + 90 * MIN) });
@@ -465,7 +465,7 @@ test('treasury caps refuse oversized buys and the hits are counted', async () =>
   const policy = async (env: any) => {
     const [m] = await env.candidateMarkets(env.clock.now(), { minLiquidity: 0, horizonDays: 30 });
     for (const amount of [600, 90, 90]) {
-      const r = await env.buy({ marketId: m.id, direction: 'YES', amount, price: 0.5, marketProb: 0.5, edge: 0.2, kelly: 0.01, forecast: { p: 0.7, ci: { lower: 0.6, upper: 0.8 }, sources: [] }, correlation: {} });
+      const r = await env.buy({ marketId: m.id, direction: 'YES', amount, amountRaw: BigInt(amount) * USDC, price: 0.5, marketProb: 0.5, edge: 0.2, kelly: 0.01, forecast: { p: 0.7, ci: { lower: 0.6, upper: 0.8 }, sources: [] }, correlation: {} });
       results.push(r.ok ? 'ok' : r.reason);
     }
   };
@@ -504,4 +504,86 @@ test('the backtest script is read-only against the database and runs offline fro
   assert.equal(readFileSync(join(out, 'report.json'), 'utf8'), first, 'identical across processes');
   const report = JSON.parse(first);
   assert.ok(BigInt(report.runs.reset.summary.pnlRaw) > 0n);
+});
+
+// ─── Impact-aware sizing (#225) ──────────────────────────────────────────────
+
+/** One thin market (2 000 USDC seed) that a NO burst takes from 55% to ~30%, then resolves Yes. */
+async function thinHistory() {
+  const { History } = await import('./helpers/backtest-fixture');
+  const h = new History().create(1, T0, { seedUsdc: 2_000n, yesBps: 5500, category: 'Crypto', closeMs: T0 + 3 * DAY });
+  for (let i = 0; h.price(1) > 3000 && i < 60; i++) h.buy(1, T0 + 20 * MIN + i * 5_000, 'No', 100n);
+  h.resolve(1, T0 + 2 * DAY, 'Yes');
+  return { events: h.events, signals: [], forecasts: [] };
+}
+
+test('impact sizing never records a fill whose average price reaches the conservative probability', async () => {
+  const { runBacktest } = await import('../src/backtest/engine');
+  const { DEFAULT_PARAMS } = await import('../src/agents/trader-policy');
+  for (const inputs of [await fixtureInputs(), await thinHistory()]) {
+    // The prior forecaster: p = opening price, CI ± 0.1; YES sizes on ci.lower, NO on 1 − ci.upper.
+    const opening = new Map<string, number>(
+      inputs.events.filter((e: any) => e.eventName === 'MarketCreated').map((e: any) => [e.params.market_id, Number(e.params.initial_yes_bps) / 10_000]),
+    );
+    const report = await runBacktest(inputs, await baseConfig({ to: iso(T0 + 8 * DAY), params: { ...DEFAULT_PARAMS, sizing: 'impact' } }));
+    let fills = 0;
+    for (const run of Object.values(report.runs)) {
+      for (const t of run!.trades.filter((x) => x.kind === 'trade')) {
+        const p = t.direction === 'YES' ? opening.get(t.marketId)! - 0.1 : 1 - (opening.get(t.marketId)! + 0.1);
+        const avgBps = Number((BigInt(t.collateralRaw) * 10_000n) / BigInt(t.sharesRaw));
+        assert.ok(avgBps < p * 10_000, `${t.marketId} ${t.direction}: average ${avgBps} bps ≥ p ${p}`);
+        fills++;
+      }
+    }
+    assert.ok(fills > 0, 'the policy traded');
+  }
+});
+
+test('--sizing mid sizes larger than impact on a thin pool, and is part of the config hash', async () => {
+  const { runBacktest } = await import('../src/backtest/engine');
+  const { DEFAULT_PARAMS } = await import('../src/agents/trader-policy');
+  const inputs = await thinHistory();
+  const run = async (sizing: 'mid' | 'impact') =>
+    runBacktest(inputs, await baseConfig({ to: iso(T0 + 3 * DAY), params: { ...DEFAULT_PARAMS, sizing } }), { impacts: ['reset'] });
+  const [mid, impact] = [await run('mid'), await run('impact')];
+  assert.notEqual(mid.configHash, impact.configHash);
+  const first = (r: typeof mid) => BigInt(r.runs.reset!.trades.find((t) => t.kind === 'trade')!.collateralRaw);
+  assert.ok(first(impact) < first(mid), `impact ${first(impact)} < mid ${first(mid)}`);
+
+  const source = readFileSync(join(ROOT, 'scripts', 'backtest.ts'), 'utf8');
+  assert.match(source, /--sizing <model>/);
+  assert.match(source, /sizing: \{ type: 'string' \}/);
+});
+
+test('the replay fills exactly amountRaw, never a float round trip of amount', async () => {
+  const { runBacktest } = await import('../src/backtest/engine');
+  const { History } = await import('./helpers/backtest-fixture');
+  const h = new History().create(1, T0, { seedUsdc: 500n, yesBps: 5000, category: 'Crypto', closeMs: T0 + 3 * DAY });
+  let bought = false;
+  const policy = async (env: any) => {
+    if (bought) return;
+    bought = true;
+    const [m] = await env.candidateMarkets(env.clock.now(), { minLiquidity: 0, horizonDays: 30 });
+    // 123456789 base units is 12.3456789 USDC; the float says 12.35 on purpose.
+    await env.buy({ marketId: m.id, direction: 'YES', amount: 12.35, amountRaw: 123_456_789n, price: 0.5, marketProb: 0.5, edge: 0.2, kelly: 0.01, forecast: { p: 0.7, ci: { lower: 0.6, upper: 0.8 }, sources: [] }, correlation: {} });
+  };
+  const report = await runBacktest({ events: h.events, signals: [], forecasts: [] }, await baseConfig({ from: iso(T0 + 15 * MIN), to: iso(T0 + 30 * MIN) }), { impacts: ['reset'], policy });
+  assert.equal(report.runs.reset!.trades[0].collateralRaw, '123456789');
+});
+
+test('the replay env serves the pool the sizer reads: reserves, fee and source sim', async () => {
+  const { runBacktest } = await import('../src/backtest/engine');
+  const { History } = await import('./helpers/backtest-fixture');
+  const { priceYesBps, seedReserves } = await import('../src/generated/fpmm');
+  const h = new History().create(1, T0, { seedUsdc: 500n, yesBps: 4000, category: 'Crypto', closeMs: T0 + 3 * DAY });
+  const seen: any[] = [];
+  const policy = async (env: any) => {
+    const [m] = await env.candidateMarkets(env.clock.now(), { minLiquidity: 0, horizonDays: 30 });
+    seen.push({ onChainMarketId: m.onChainMarketId, pool: await env.pool(m.id), price: await env.price(m) });
+  };
+  await runBacktest({ events: h.events, signals: [], forecasts: [] }, await baseConfig({ from: iso(T0 + 15 * MIN), to: iso(T0 + 15 * MIN), feeBps: 150 }), { impacts: ['reset'], policy });
+  const r = seedReserves(500n * USDC, 4000n);
+  assert.equal(seen[0].onChainMarketId, 1n);
+  assert.deepEqual(seen[0].pool, { reserveYes: r.reserveYes, reserveNo: r.reserveNo, feeBps: 150n, asOfLedger: h.events[0].ledger, source: 'sim', lagLedgers: 0 });
+  assert.equal(seen[0].price.yesBps, priceYesBps(r.reserveYes, r.reserveNo));
 });

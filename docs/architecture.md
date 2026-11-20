@@ -242,6 +242,58 @@ event deadline ──► source publishes ──► close_time ──► attesta
 - If only the close time is off and the deadline is unambiguous, it is clamped into `[max(earliestClose, now + 1 day), latestClose]` (`PROPOSAL_EXPIRY_REPAIRED`); otherwise the proposal is rejected (`PROPOSAL_UNRESOLVABLE`, with reason codes). Repair happens before `pinJson`, so the pinned document carries the final `closeTime`. The resolution hash does not cover close time and is unaffected.
 - The resolution block is stored in `Market.resolutionDetails` and pinned in question document v2 (see `docs/api.md`).
 
+## Market generation saga (#242)
+
+`src/services/market-saga.service.ts` runs market generation as a persisted
+state machine (`market_generation_runs`, model `MarketGenerationRun`). Every
+step returns `{ outputs, next }`; the merged outputs are written before the
+next step's side effect.
+
+| State | Work | Persisted output |
+|---|---|---|
+| `STARTED` | `gateCycle('MARKET_MAKER')` | `gate` (paused → `SKIPPED`) |
+| `GATED` | `aggregateSignals()` | `signalCount`, `aggregatedAt` (raw payloads stay in the signal store) |
+| `SIGNALS_READY` | `generateMarketQuestion` | `proposal`, `proposalProvenance`, `groundingSignalIds`, `evidence` |
+| `PROPOSED` | `prepareResolvableProposal`, `planPriceMarket`, `reserveProposal` | `resolutionDetails`, `marketSpec`, `reservationId` |
+| `VALIDATED` | `planMarketCreation` | `seedDecision`, `seedPolicy` (bigints as strings) |
+| `SEED_PLANNED` | `createMarketFromProposal` + `commitReservation` + `run.marketId`, one transaction | `marketId` |
+| `MARKET_PERSISTED` | `createMarketOnChain` (claim + discovery first, #41) | `onChainMarketId` / `simulated`, `chainTxHash` |
+| `CHAIN_SUBMITTED` | `market.onChainMarketId`, else `discoverLandedMarket` | `onChainMarketId` |
+| `CHAIN_CONFIRMED` | `generateReasoningTrace` | `traceId`, `tracePayload` |
+| `TRACE_PERSISTED` | `enqueueTracePublication` (upsert by `traceId`) | `publicationId` → `TRACE_ENQUEUED` → `COMPLETED` |
+
+Skips (paused, no signals, LLM budget, generation failure, unresolvable,
+duplicate, seed policy) end in `SKIPPED` with `outputs.skipReason` and keep
+the existing agent-log actions.
+
+**Idempotency.** A step whose output is already recorded returns immediately
+(no second LLM call, market insert or trace). `ChainPendingError` parks the run
+in `CHAIN_SUBMITTED` with `nextAttemptAt` = now + 30 s, not an error. Legacy
+`QUESTION_PINNED` resumes as `CHAIN_SUBMITTED` (discovery before any
+resubmission); legacy `TRACE_PINNED` / `TRACE_PUBLISHED` resume as
+`TRACE_ENQUEUED`.
+
+**Fencing and leases.** `claimRun` increments `fence`; every write is
+`updateMany({ where: { id, fence } })`, and a zero count discards the step
+result (another worker owns the run). A heartbeat extends the 300 s lease every
+60 s while a step runs.
+
+**Failures.** A failed step keeps its state, increments `attempts` and backs
+off exponentially (30 s × 2^n, max 1 h). `SAGA_MAX_ATTEMPTS`, missing IPFS or
+treasury cap errors park the run in `NEEDS_ATTENTION` with `lastError.step`;
+`POST /admin/generation-runs/:id/retry` resets it to that step.
+
+**Scheduling.** `resumeIncomplete` runs on boot (after the outbox worker) and
+every minute; due runs are selected inside `withAdvisoryLock('saga:resume')`
+and advanced outside the transaction. Aborts are honoured only before
+`MARKET_PERSISTED`.
+
+**Rollout.** The cron cycle and `POST /markets/generate` still call the linear
+`runMarketMakerCycle`; saga runs are started through
+`POST /admin/generation-runs` until the cut-over that makes
+`runMarketMakerCycle` a thin `startRun` + `advance` wrapper.
+
+
 ## Signal store (#73)
 
 Every market and trade is justified by signals (NewsAPI articles, FRED observations, GDELT events). They are stored as normalised rows with stable identities, so a pinned trace can be audited against the exact evidence long after the fetch. `src/services/ingestion.service.ts` fetches; `signal-normalize.ts` holds the pure rules; `signal-store.service.ts` holds the store (`prismaSignalStore`, and `MemorySignalStore` for tests).
@@ -267,7 +319,7 @@ relevanceScore = sourceWeight × recencyDecay × log2(1 + clusterSize)
 recencyDecay   = 0.5 ^ (ageHours / 12)
 ```
 
-`sourceWeight` is `SOURCE_WEIGHTS` (NEWSAPI 0.7, GDELT 0.6, FRED 0.9). Age is measured from `publishedAt`, except for FRED, whose observation date is the start of the reporting period: it ages from `lastSeenAt`. Syndication raises a story's score only logarithmically.
+`sourceWeight` is the active learned weight set when one is active (publisher weight, then source weight, then 0.5; see "Learned source weights (#223)"), otherwise `SOURCE_WEIGHTS` (NEWSAPI 0.7, GDELT 0.6, FRED 0.9). Age is measured from `publishedAt`, except for FRED, whose observation date is the start of the reporting period: it ages from `lastSeenAt`. Syndication raises a story's score only logarithmically.
 
 **Traces.** `sourcesUsed` entries carry `signalId`, `url`, `publisher` and `publishedAt` (built by `evidenceFromSignals`), and their `weight` is the relevance score instead of a constant. The market maker records the signals its proposal cited in `grounding_signal_ids`. The free `previewSources` keep only `{source, publisher, signal}`. Traces written before #73 have no `signalId`; readers treat these fields as optional, and pinned payloads are never rewritten.
 
@@ -360,6 +412,17 @@ A daily pass is granted only after `payment-verification.service.ts` reads the t
 - the amount is at least `DAILY_PASS_PRICE_RAW`.
 
 Each hash is usable once (unique `PaymentEvent.txHash`). There is no development bypass; tests inject a fake RPC reader. Per-trace unlocks are sold by the x402 service in the contracts repo, which the frontend calls directly.
+
+### Spending allowances: the ledger-day rule (#219)
+
+Allowances (#53) are charged per UTC day, and **the day is the UTC day of the transfer's ledger close time** (`ledgerDay(ledgerCloseAt)` in `src/lib/time.ts`), the same instant pass windows are anchored to (#54). It is never the day the claim or confirmation happens to run: a transfer that closed at 23:59:50 and is claimed (or confirmed by `confirmPendingPaymentIntents`) at 00:00:10 is charged to the previous day, and the new day's budget is untouched. When the RPC response has no `createdAt`, `chargeDayFor` falls back to the current time and the charge is marked `dayInferred`.
+
+- **Buckets.** `allowance_days` holds one row per `(userId, day)` with `spentRaw` (booked within the limit), `reservedRaw` (held by open x402 reservations) and `overageRaw`. `remaining = max(dailyLimitRaw − spentRaw − reservedRaw, 0)`. A late claim for day D only ever touches D's row, and every charge is a durable `allowance_charges` row, unique by `txHash`, so charging is idempotent and auditable per day. `spending_allowances.spentTodayRaw` / `spentToday` / `windowStartedAt` are deprecated mirrors, written only for charges whose day is the current UTC day; `spending_allowances.overageRaw` stays the lifetime total.
+- **Charging.** `settleVerifiedTransfer` calls `chargeAllowance` with `source` `PASS_CLAIM` or `PAYMENT_INTENT`. Over-limit amounts are accepted (the chain already moved the money): `min(amount, remaining)` is booked and the excess is flagged as overage on that day, in the lifetime counter and on the `PaymentEvent`.
+- **x402.** Per-trace purchases go through the HMAC-authenticated `reserve → commit | release` API (`docs/api.md`). A reservation holds budget on the day it was made; `commit` returns the hold and books the settled amount on the ledger-close day, which can be the next day. A commit for an expired, released or unknown reservation is still booked, with overage flagged. Reservations never make a pass claim fail; they only shrink the remaining budget. The payment-intent cron expires reservations past `expiresAt` in batches with `FOR UPDATE SKIP LOCKED`.
+- **Preauthorization** (`POST /traces/access/preauthorize`, `GET /traces/access/allowance`) reads today's bucket and reports `dayStart`. A payment signed just before midnight can close after it: the check is against today, the charge lands on tomorrow, which is correct.
+- **Locking.** Every writer for a user and day serialises on the bucket's row lock (`INSERT … ON CONFLICT DO NOTHING`, then `SELECT … FOR UPDATE`), because the x402 endpoints do not take the per-user advisory lock that pass claims hold. Lock order everywhere is: the `allowance_charges` row (commit, release, sweep), then buckets by ascending day, then `spending_allowances`.
+- **Backfill.** Migration `20261120120000_allowance_day_buckets` turned confirmed `DAILY_PASS`/`PER_TRACE` payment events into `COMMITTED` charges on `COALESCE(ledgerCloseTime, confirmedAt, createdAt)::date` (`dayInferred` where the close time was missing), copying stored overage without recomputing it, and summed them into buckets. Unapplied payment-intent transfers (`metadata.noCoverage`) were never charged and are not backfilled.
 
 ## Position valuation (#78)
 
@@ -467,6 +530,60 @@ indexer ──publish──▶ Redis Stream (oracledesk:events) ──▶ one fa
 
 The indexer and the reconciler (below) both write `markets.chainSyncedLedger`, the ledger a row's chain-derived state reflects. A price or status write applies only when it is not older than that, so the two can never overwrite each other with stale information, and `applyMarketFinality` (`market-finality.ts`) is the one place a market becomes `RESOLVED`/`CANCELLED` and its positions close.
 
+## Operational alerts (#226)
+
+`src/services/alerts.service.ts` serves two payloads through the same sinks
+(HMAC-signed JSON webhook, Slack): dispute alerts (`oracledesk.dispute_alert`,
+byte-for-byte as in #92, keys `reviewId:level:sink`, once per level) and
+operational incidents (`oracledesk.ops_alert`).
+
+**Subjects** (`src/services/ops-alerts/conditions.ts`), all read from Postgres
+so any instance sees the cluster:
+
+| subjectType | subjectKey | Bad when | Severity |
+|---|---|---|---|
+| `agent_pause` | `<scope>:<source>` | a scope's own pause is active | `failure_breaker`, `drawdown` CRITICAL; `chain_paused` WARN; `operator` INFO, off unless `ALERT_OPERATOR_PAUSES` |
+| `outbox_stuck` | `outbox:<kind>` | SUBMITTED/PENDING rows past `maxTime` or older than `ALERT_OUTBOX_STUCK_MS` | CRITICAL past maxTime, else WARN |
+| `outbox_unhandled` | `outbox:<kind>` | terminal rows with `handledAt IS NULL` older than `ALERT_UNHANDLED_MS` | CRITICAL when a SUCCESS row is unhandled, else WARN |
+| `cron_failing` | `cron:<job>` | `cron_runs.failureStreak ≥ ALERT_CRON_FAILURE_STREAK` | WARN; CRITICAL at twice the streak |
+| `reconcile_drift` | `drift:<class>` | the latest finished reconcile run has REPORTED drift of that class | WARN |
+
+Outbox rows are grouped by kind: a backlog of 50 is one incident, never 50.
+`recordCronRun` keeps its in-memory map and also upserts `cron_runs`
+(fire-and-forget, atomic streak increment), so failure streaks are cluster-wide.
+
+**Engine** (`src/services/ops-alerts/engine.ts`). Each tick runs under the
+`ops-alerts` advisory lock; an instance without it returns at once. Incidents
+(`alert_incidents`, unique on `(subjectType, subjectKey)`) move
+PENDING → OPEN after `ALERT_OPEN_AFTER` bad evaluations in a row, and OPEN →
+RESOLVED after `ALERT_RESOLVE_AFTER` good ones, so an operator resume does not
+resolve instantly and a breaker re-pause is absorbed. Each open starts a new
+`episode` and clears the acknowledgement. A subject missing from a successful
+evaluator's output is good; an evaluator that throws leaves its incidents as
+they are. Unacknowledged CRITICAL incidents re-notify (`escalate`, numbered)
+every `ALERT_ESCALATE_EVERY_MS`. `silencedUntil` suppresses every notification,
+and a subject's open is sent at most once per `ALERT_MIN_REOPEN_MS`.
+Notifications are collected in the lock transaction and sent after it commits.
+Their keys `inc:<incidentId>:<episode>:<open|escalate-N|resolve>:<severity>:<sink>`
+in `alert_deliveries` make a retry safe.
+
+**Routing.** `ALERT_ROUTES_JSON` maps severities to sink names: `webhook` matches
+every webhook sink, `slack` the Slack sink, or an exact `webhook-<tag>`. Without
+it, WARN and CRITICAL go to every sink and INFO to none.
+
+**Scheduling.** `startOpsAlertCron()` runs on `ALERT_EVAL_CRON` (every minute) on
+worker roles, is recorded as the `ops-alerts` cron job, and is stopped by the
+shutdown coordinator. It does not depend on the dispute cron. `pauseAgent`
+notifies `onAgentPaused` listeners after commit, and the cron's listener queues
+one debounced (2 s) burst of `ALERT_OPEN_AFTER` evaluations, 2 s apart. The
+hysteresis still needs that many consecutive bad readings, but a breaker trip
+opens its incident within seconds rather than after `ALERT_OPEN_AFTER` cron
+periods. Bursts of pauses (several scopes at once) coalesce into one.
+
+**Admin.** `GET /admin/alerts` (`admin.read`), `POST /admin/alerts/:id/ack` and
+`POST /admin/alerts/:id/silence` (`alerts.manage`, audited by
+`requirePermission`). See docs/api.md.
+
 ## Market lifecycle reconciler (#83)
 
 `market-reconciler.service.ts` runs every ten minutes (`3,13,…,53`, `RECONCILE_ENABLED`) on one instance (a Postgres advisory lock held by a transaction, so a pooled connection cannot leak it). It reads `market_core.get_market` with the ledger the simulation ran against, for linked markets in bounded batches (`RECONCILE_MAX_MARKETS`, `RECONCILE_CONCURRENCY`, `RECONCILE_MAX_RPC_CALLS`; open markets first, then never/least-recently reconciled), and classifies each difference with the pure `classifyDrift`:
@@ -480,6 +597,32 @@ The indexer and the reconciler (below) both write `markets.chainSyncedLedger`, t
 | `HASH_MISMATCH`, `STATUS_REGRESSION`, `NOT_FOUND_ON_CHAIN` | reported only: `MARKET_INTEGRITY_DRIFT` agent log at `ERROR` and a `MARKET_DRIFT` socket event to admins |
 
 Resolution-class findings are deferred while the indexer cursor trails the observation by more than `RECONCILE_INDEXER_LAG_LEDGERS` (the indexer may be about to process the event); after three deferrals in a row they are repaired and flagged `forced`. RPC errors other than `MarketNotFound` are not drift: they are counted and the market is retried first next run. The reference ledger's close time comes from `getLedgers`; if that fails the newest indexed event's time (or the wall clock) stands in. Runs and findings persist in `reconcile_runs` / `market_drift_reports` and are readable through the admin endpoints in [api.md](api.md).
+
+## Money audit (#222)
+
+`services/money-audit/` audits the agent's money records — `Trade`, `Position`, `PositionExit` and `ChainTransaction` rows — against each other and against the treasury's on-chain shares. It is distinct from the market lifecycle reconciler above (#83) and from treasury event reconciliation (#18). `cron/money-audit.cron.ts` runs it hourly at minute 27 (`MONEY_AUDIT_ENABLED`); `runMoneyAudit` takes the `money-audit` advisory lock and opens a `REPEATABLE READ` transaction, so every invariant query sees one snapshot (`snapshotAt` is the transaction time). Chain reads happen after the snapshot, through the reconciler's `pool()`, bounded by `MONEY_AUDIT_MAX_RPC_CALLS` (a candidate left unread is re-checked next run).
+
+| Invariant | Severity | Check | Chain read | Repair |
+| --- | --- | --- | --- | --- |
+| `TRADE_EXECUTED_WITHOUT_OUTBOX` | HIGH | `EXECUTED` trade with `txHash` and no `trade.buy` `SUCCESS` row (matched by `refId`, inner hash, landed hash or bump hash) | `getTransaction(txHash)` only when no row exists | — |
+| `POSITION_WITHOUT_EXECUTED_TRADE` | CRITICAL | position whose trade is not `EXECUTED` | — | — |
+| `EXECUTED_TRADE_WITHOUT_POSITION` | HIGH | `EXECUTED` trade with no position (live mode only) | — | `applyBuySuccess` from the `SUCCESS` row |
+| `OUTBOX_TERMINAL_UNHANDLED` | HIGH | domain-kind row in `SUCCESS`/`FAILED`/`EXPIRED`, `handledAt` null, older than the grace | — | `runCompletionHandler` |
+| `TRADE_STUCK_PENDING` | MEDIUM | `PENDING` trade older than `MONEY_AUDIT_PENDING_GRACE_MS` with no non-terminal outbox row | — | — |
+| `EXIT_CONFIRMED_NOT_LANDED` | CRITICAL | `CONFIRMED` live exit with `txHash` and no `trade.sell` `SUCCESS` row | `getTransaction(txHash)`; a landed sale clears it | — |
+| `SHARES_MISMATCH` | CRITICAL (chain < DB) / HIGH (chain > DB) | Σ `sharesRaw` per (on-chain market, side) vs `get_position(market, treasury)` | `getPositionWithLedger` | — |
+| `SHARES_UNKNOWN_LEGACY` | INFO | a side has a pre-#78 position with `sharesRaw` null: not compared | — | — |
+| `TRACE_WITHOUT_TRADE` | MEDIUM | `CONFIRMED` `buy_yes`/`buy_no` publication whose market has no `EXECUTED` trade on that side created before the publication | — | — |
+
+**Expected shares.** Shares leave the treasury only through a confirmed `agent_sell`, which lowers the position's `sharesRaw` to what is left. Closes that sell nothing — `applyMarketFinality` (resolution/void) and `closePosition` — leave the shares on chain, and redeem is never called, so the expected balance is Σ `sharesRaw` over every position on the side whatever its status: open, finality-closed, and exit-closed positions counted only by the shares the exits did not sell.
+
+**In flight.** A subject is recorded `SKIPPED_IN_FLIGHT` (never drift, never repaired, never read from chain) when a `chain_transactions` row for one of its domain ids is `BUILT`/`SIGNED`/`SUBMITTED`/`PENDING`, an exit on it is `SUBMITTED`, or one of its rows was updated within `MONEY_AUDIT_GRACE_MS` (default 120 s).
+
+**Ledger consistency.** `chain.service.getPositionWithLedger` returns the balance with the simulation's `latestLedger` (it throws when there is none; overridable through `setChainOverrides`). A mismatch is `DEFERRED` when treasury `Trade` events for that market were indexed in (cursor at snapshot, observed ledger], or when the indexer cursor trails the observation by more than `RECONCILE_INDEXER_LAG_LEDGERS`; after `MAX_CONSECUTIVE_DEFERRALS` such deferrals in a row it is reported with `evidence.forced = true`. Otherwise it is reported only when the previous run saw the same side with the same database and chain numbers (the same fingerprint); the first sighting is `DEFERRED` with `deferReason: UNCONFIRMED`.
+
+**Repairs** run only with `MONEY_AUDIT_AUTO_REPAIR=true` on a non-dry run, and only re-run the existing idempotent functions after re-reading the row outside the snapshot and confirming it is still eligible and not in flight. A repair that declines is recorded `REPORTED` with `evidence.repair = "SKIPPED"`.
+
+**Fingerprints and alerts.** `fingerprint = sha256(invariant | subjectId | evidence-core)` carries a finding across runs (`firstSeenRunId`). A finding whose fingerprint was acknowledged is recorded `ACKED` and not re-alerted. A `CRITICAL` finding is sent once per new fingerprint to the `sinksFromConfig()` alert sinks (level `CRITICAL`) and logged as a `MONEY_AUDIT_FINDING` agent log (`TRADER`, `ERROR`). Runs and findings persist in `money_audit_runs` / `money_audit_findings`; the admin endpoints are in [api.md](api.md).
 
 ## Market correlations (#80)
 
@@ -517,6 +660,10 @@ The treasury contract enforces `max_trade` per call, cumulative `max_market` per
 
 `GET /portfolio` reports the same budget (see `docs/api.md`).
 
+### Sizing on the FPMM curve (#225)
+
+The closed-form Kelly assumed any amount fills at the mid. The trader now sizes with `sizeAgainstPool` (`services/impact-kelly.ts`): for candidate collateral `c` it computes the exact shares out with `calcBuy` against fresh reserves and the market's own `fee_bps`, and maximises `p·ln(W − c + s(c)) + (1 − p)·ln(W − c)` (integer golden-section, then a 0.1 USDC scan) under the conservative probability. The order is half the optimum, bounded by the treasury caps above and the 2.5% single-position cap; a correlation cut re-runs the sizer under the smaller bound. `binding` gains `IMPACT` (the curve's optimum, below every cap). Reserves come from `TraderEnv.pool()`: the newest indexed `Trade` (valid up to the indexer cursor) or `get_market` tagged with its simulation ledger; reserves lagging the RPC by more than `TRADER_POOL_MAX_AGE_LEDGERS` (120) skip the market with `POOL_STALE`. `sizing.impact` records mid, average and post-trade price, impact, fee and expected shares (see `docs/trace-format.md`). At execution, a re-quote whose average price has reached the conservative probability cancels the trade (`edge consumed by price movement`). The backtester serves its simulated pools through the same `pool()` and fills exactly `amountRaw`; `--sizing mid` replays the closed-form rule for comparison.
+
 ## Seed policy (#82)
 
 `seed-policy.service.ts` (pure `decideSeed`) sizes the treasury capital a new market is seeded with and the price it opens at. `planMarketCreation` reads the budget (`treasury.get_config`, `daily_usage`, `available_capital`, market-core's default fee) and runs it **before** the market maker pins or writes anything; a read failure fails closed (`SEED_SKIPPED`, `INSUFFICIENT_CAPITAL`).
@@ -538,7 +685,7 @@ npm run backtest -- --from 2026-10-01 --to 2026-10-15 --out ./bt \
 npm run backtest -- --events-file tests/fixtures/backtest/events.json --out /tmp/bt
 ```
 
-The runner only issues `findMany` (events up to `--to`, because pools are rebuilt from `MarketCreated` and everything after it, plus `signal_cache` and the live agent's stored forecasts) and writes `report.json` and `report.md`. Options: `--from`, `--to` (required against the database; with `--events-file` they default to the file's span), `--bankroll-raw`, `--max-trade-raw`, `--max-market-raw`, `--max-daily-raw` (7-decimal base units; defaults 10 000 / 500 / 1 000 / 2 000 USDC), `--impact reset|propagate|both` (default both), `--forecaster prior|oracle-noise:<σ>|recorded`, `--seed`, `--fee-bps` (inferred from the first historical buy), `--events-file`, `--out`.
+The runner only issues `findMany` (events up to `--to`, because pools are rebuilt from `MarketCreated` and everything after it, plus `signal_cache` and the live agent's stored forecasts) and writes `report.json` and `report.md`. Options: `--from`, `--to` (required against the database; with `--events-file` they default to the file's span), `--bankroll-raw`, `--max-trade-raw`, `--max-market-raw`, `--max-daily-raw` (7-decimal base units; defaults 10 000 / 500 / 1 000 / 2 000 USDC), `--impact reset|propagate|both` (default both), `--sizing impact|mid` (default impact, #225), `--forecaster prior|oracle-noise:<σ>|recorded`, `--seed`, `--fee-bps` (inferred from the first historical buy), `--events-file`, `--out`.
 
 **How it works.** A simulated UTC clock steps every 15 minutes. Before each step every event with `ledgerClosedAt ≤ now` is applied in order (pools are seeded by `seedReserves`; external trades move them; `MarketResolved` settles positions with `settleValue`, void at half a share's value), then the policy runs against a `BacktestEnv` built only from that state: it never reads a live row, so it cannot see the future. Agent orders fill against the simulated pool with `calcBuy`/`calcSell`, update its reserves, and spend through a `SimTreasury` that enforces `max_trade`, cumulative `max_market` and a rolling 24-hour `max_daily` whose window starts at the first spend after the previous one expired (selling is uncapped). Trading after `close_time` is refused like market-core's `MarketClosed`. Floats exist only in the policy; `usdcFromNumber` converts at the buy boundary and everything else is base-unit bigint.
 
@@ -553,6 +700,16 @@ The runner only issues `findMany` (events up to `--to`, because pools are rebuil
 ## Health and degraded mode (#111)
 
 `/livez` checks only the process; `/readyz` probes Postgres, Redis, RPC and the indexer lag. `HEALTH_CRITICAL` decides which failures return 503. By default Redis and Postgres are critical (login and every data endpoint need them) and RPC is not: an instance without RPC stays ready and keeps serving database reads, while on-chain state, resolution, trace and payment endpoints return 502. The indexer fails when it is more than `INDEXER_MAX_LAG_LEDGERS` behind or its cursor is older than `INDEXER_MAX_STALENESS_MS`; with no cursor yet it reports `initialising`. On SIGTERM `/readyz` returns 503 `draining` for `SHUTDOWN_DRAIN_MS` before the server stops accepting connections.
+
+### Chain-write readiness (#220)
+
+None of the dependency probes says whether an instance can still land chain writes, so three more probes exist: `outbox` (backlog by status, oldest in-flight age, rows past `maxTime`, oldest unhandled terminal row, per-kind completion-handler failure streaks), `signers` (agent and, with `FEE_BUMP_ENABLED`, fee-payer native balance and runway) and `channels` (channel-pool health). They can be listed in `HEALTH_CRITICAL`, but they only count on a **writer**: `HEALTH_CHAIN_WRITER=auto` resolves to live mode and the outbox worker running in this process (`PROCESS_ROLE` `all` or `worker`, #272). On API-only pods and in dry-run they report `{ writer: false }` without querying and are never critical, so a dry fee payer cannot take the API out of rotation.
+
+Results are tri-state. Degraded (half a backlog/age threshold, runway under `HEALTH_BALANCE_MIN_RUNWAY_HOURS`, some channels unhealthy) keeps the pod ready and turns `/readyz` into `200 degraded`; failing on a critical probe returns 503.
+
+Cost: `/readyz` is polled every `HEALTH_CACHE_TTL_MS`. The outbox probe is one grouped query over `chain_transactions WHERE "handledAt" IS NULL`, an index-only scan of the partial covering index `chain_transactions_unhandled_idx` (probe timeouts do not cancel a Prisma query, so it must stay cheap). Balances come from `getAccountEntry` (bigint stroops, never floats) through a snapshot cached for `HEALTH_BALANCE_TTL_MS` with a single-flight refresh; while the `rpc` probe is failing the last snapshot is returned `stale` and no RPC call is made. Agent spend is `sum(COALESCE(fee_charged, total_fee))` from `chain_fees` over 24 h (channel-sourced writes are included, so the agent runway is conservative when channels are configured); fee-payer spend is the bid fee of every bump built in the window. Channel balances are read by the pool's balance monitor (`ChannelPool.checkBalances`, started in live mode wherever the outbox worker runs), which takes channels under `CHANNEL_MIN_BALANCE_XLM` out of rotation; an unchecked channel counts as healthy. Handler streaks are per instance; the oldest-unhandled age is the cluster-wide signal.
+
+**Restart-loop safety.** `/livez` never runs any of these probes. A writer pod that becomes unready (dry fee payer, stuck backlog) is taken out of traffic but is not restarted: restarting cannot fund an account, and the outbox worker keeps resolving rows meanwhile. Full detail is in `GET /admin/status` under `chainWrites`.
 
 ## Generated code
 
@@ -602,6 +759,25 @@ OpenAI-compatible). They normalise SDK errors into `LlmError.kind`
 
 Text mode never sets a JSON response format; only `mode: "json"` does.
 
+**Structured calls follow the same policy (#218).** `callLLMStructured` walks
+`policies[task]` in order and uses each spec's provider, model, temperature and
+`maxTokens` (the request is capped at `min(opts.maxTokens ?? 2048,
+spec.maxTokens)`, as in the router). Provider health lives in one
+`ProviderHealthBook` (`router.healthBook`) shared by both paths: a provider the
+router has cooling or open is skipped by structured calls, and structured
+transport failures (5xx, timeouts, rate limits, quotas) cool providers for
+free-form calls too. Validation failures fall back to the next spec but never
+touch provider health. With the default policies the request bodies for
+`market_generation`, `hedge_conditions` and `forecasting` are unchanged.
+`dispute_review` structured calls now honour the policy's **Gemini-first**
+order (#92) at temperature 0; before #218 they went to Anthropic first at 0.2.
+If every configured spec is cooling or open, the call fails with `503
+LLM_UNAVAILABLE` saying so.
+
+OpenAI-compatible specs (`provider: "openai"`) are supported on both paths and
+take a lease on the shared guards like the other providers
+(`LLM_OPENAI_RPM`, default 15).
+
 ## Structured LLM output (#65)
 
 Output that must fit a shape (market proposals, hedge conditions) is never
@@ -619,26 +795,53 @@ must contain the probability, expiry must be in the future) are `postValidate`
 functions whose message goes into the repair turn.
 
 `callLLMStructured(spec, { system, user }, { maxTokens, ctx, task })` returns
-`{ value, provider, model, attempts }`:
+`{ value, provider, model, attempts }`. Providers are tried in the task's
+policy order (see "LLM router" above); each is a structured adapter in
+`src/lib/llm/structured/`:
 
 1. **Anthropic**: `tools: [{ name, description, input_schema }]` with a forced
    `tool_choice`; the `tool_use` block is searched for (a text block may come
    first). `stop_reason: "max_tokens"` is never repaired at the same budget: the
-   budget is doubled once, then the call fails with a specific reason.
-2. **Gemini**: `responseMimeType: "application/json"` plus `responseSchema`;
-   the text is `JSON.parse`d with no fence stripping.
-3. Each provider gets **one repair round**: the zod issues (or the `postValidate`
+   budget is doubled once (never past 16 384 or twice the spec's `maxTokens`),
+   then the call fails with a specific reason.
+2. **Gemini**: `responseMimeType: "application/json"` plus `responseSchema`,
+   with the spec's model (not the `GEMINI_MODEL` constant); the text is
+   `JSON.parse`d with no fence stripping.
+3. **OpenAI** (#218): `response_format: { type: "json_schema", json_schema: {
+   name, schema: spec.openaiSchema, strict: true } }`. `toOpenAIStrictSchema`
+   closes every object (`additionalProperties: false`), lists every property in
+   `required` and turns optional ones into `anyOf: [X, { type: "null" }]`; the
+   adapter deletes those nulls again before zod, so `price_asset: null` means
+   "absent". Only a small keyword allowlist reaches OpenAI (`type`,
+   `description`, `properties`, `required`, `additionalProperties`, `items`,
+   `enum`, `anyOf`; `const` becomes a one-value `enum`): bounds such as
+   `minimum`, `maxItems` or `pattern` are dropped because strict-mode support
+   for them varies by model, and zod re-checks them. A schema strict mode
+   cannot express (a free-form map, a non-object root) throws at module load.
+   For servers that reject `response_format`, `jsonMode: "prompt"` sends no
+   response format and appends the JSON Schema to the system prompt instead. A
+   `message.refusal` is a validation failure (`model refused`), and
+   `finish_reason: "length"` raises the budget once like Anthropic.
+4. Each provider gets **one repair round**: the zod issues (or the `postValidate`
    message) go back as an `is_error` `tool_result` (Anthropic) or a correction
-   turn (Gemini). Anthropic that still fails falls back to Gemini.
-4. Failure is `AppError(422, "LLM_STRUCTURED_OUTPUT_FAILED", { provider, issues })`
-   when output never validated, otherwise the last transport/guard error.
+   turn (Gemini, OpenAI). A provider that still fails falls back to the next
+   spec in the policy.
+5. Failure is `AppError(422, "LLM_STRUCTURED_OUTPUT_FAILED", { provider, issues })`
+   when output never validated, otherwise the last transport/guard error,
+   otherwise `503 LLM_UNAVAILABLE` (nothing configured, or everything cooling).
+   Provenance records the evaluated chain in `route: { task, chain: [{ provider,
+   model, decision }] }`, where `decision` is `served`, an error class
+   (`validation`, `server_error`, ...), `unconfigured`, `cooling` or `open`;
+   categories only, never provider messages. `fallbackFrom` is the first chain
+   entry that was attempted and failed.
    `INVALID_LLM_JSON`, `SCHEMA_VALIDATION_FAILED` and
    `INVALID_CONFIDENCE_INTERVAL` remain on the `validateMarketQuestion()` wrapper.
 
 Every attempt, repairs included, takes a lease on the shared guards below. Prompts
 and outputs are not logged at info; counts and provider/model are. `callLLMText`
 falls back to a plain-text Gemini call (never a JSON one). Tests replace the
-providers through `setAnthropicClient()` / `setGeminiModelFactory()` and replay the
+providers through `setAnthropicClient()` / `setGeminiModelFactory()` /
+`setOpenAIClient()` and replay the
 shapes in `tests/fixtures/llm/` (hand-built examples of the API shapes, not
 captures from a live account).
 
@@ -748,6 +951,113 @@ policy and the exclusions are in `docs/api.md` ("Agent calibration").
   its probability still equals the market price (`rawValue: marketProb`), and
   `MARKET_CREATION` has no meaningful market baseline.
 
+## Recalibration (#244)
+
+`src/services/recalibration.service.ts` closes the loop between calibration
+(#68) and the forecaster (#75).
+
+- **What is fitted.** Per TRADER category, a Platt map
+  `logit(p') = a + b·logit(p)`: weighted logistic regression of the outcome on
+  the raw forecast's log-odds (the `buildSamples` weights), MAP-estimated by
+  Newton–Raphson (≤ 25 iterations, identity if it does not converge) under a
+  Gaussian prior centred on the identity with precision
+  `RECALIBRATION_PRIOR_STRENGTH / max(1, nEff)` (default 20).
+- **Never more confident.** `b` is clamped to `[0, 1]` and `|a|` to
+  `RECALIBRATION_MAX_INTERCEPT` (default 0.5), so a map can only pull toward
+  0.5. An underconfident slice keeps slope 1.
+- **Thin data.** A category with fewer than `MIN_SHRINKAGE_MARKETS` (50)
+  resolved markets gets no map; lookup falls back to the agent-wide map
+  (`category = '*'`), then to the identity.
+- **No feedback loop.** Traces store `rawProbabilityEstimate` (the ensemble
+  before recalibration) and `extractRows` selects
+  `COALESCE(rawProbabilityEstimate, probabilityEstimate)`, so a fit never sees
+  its own output.
+- **Storage.** `recalibration_maps` (model `RecalibrationMapRow`). The daily
+  calibration cron refits after `computeAndStoreSnapshots`, under an advisory
+  lock, and writes a new version only when `a` or `b` moves by more than
+  `1e-3`; the previous version is kept inactive. A map's `id` is the hash of
+  its parameters and `fittedFrom` (including a digest of the input rows).
+- **Application.** `forecastMarket` applies the active map to `p` and both
+  interval endpoints (monotone, so `lower ≤ p ≤ upper` holds) and scales
+  `sigmaLogit` by `b`. The ensemble keeps `raw: { p, ci }` and
+  `calibration: { mapId, version, category, applied }`. With
+  `CALIBRATION_SHRINKAGE_ENABLED=false` (default) nothing changes and the
+  identity is recorded with `applied: false`. The map id is part of the
+  forecast cache key, so a refit invalidates cached forecasts.
+- **API.** `GET /agents/calibration?include=maps` adds the active maps.
+
+
+## Learned source weights (#223)
+
+`src/services/source-weights.service.ts` replaces the hand-written
+`SOURCE_WEIGHTS` with versioned, outcome-fitted weight sets, behind a second
+admin's approval. `ALLOWED_ORACLES` and the dedup entity list still derive
+from the compiled table and do not change.
+
+- **Samples.** `extractRows()`'s filters (resolved, non-void, on-chain
+  markets; traces strictly before resolution) joined to
+  `trace_publications.payload.forecast.members[llm:*].detail` (`baseRate`,
+  `adjustments[].signalId/delta`) and to `signals` (`source`, `publisher`,
+  `clusterId`). Traces without adjustments (pre-#75, `MARKET_CREATION`) are
+  skipped; adjustments whose `signalId` is null or no longer in the store are
+  dropped. Both are counted in `method.counts`. Each market's weight of 1 is
+  split over its traces with the calibration `'time'` scheme
+  (`marketTraceWeights`).
+- **Model.** Penalised logistic regression with hierarchical shrinkage:
+  `logit P(o=1) = α_category + γ_version + logit(baseRate) + Σ_k β_k x_k`,
+  `x_k = Σ_{adjustments of key k} [logit(clampP(base + δ)) − logit(base)]`.
+  Priors: `β_source ~ N(1, τ_s²)`, `β_publisher = β_source + u`,
+  `u ~ N(0, τ_p²)` (τ = 0.5 by default), `α, γ ~ N(0, 1)`. β = 1 means the
+  forecaster used the signal at the right strength, 0 that it is noise, > 1
+  that it is under-weighted.
+- **Assumptions and their guards.** Sources are not assigned to topics at
+  random (FRED only appears on FED/MACRO questions), so `α_category` absorbs
+  each category's base rate; a naive per-source hit rate would credit FRED
+  with it. Evidence sets overlap: adjustments sharing a `clusterId` are
+  averaged into one contribution (FRED rows are cluster size 1). Data scored
+  under different weight sets is not exchangeable, so traces are pooled only
+  with a per-version fixed effect `γ_version` (from
+  `reasoning_traces.sourceWeightSetVersion`, null = v0). With
+  `FORECAST_LLM_SAMPLES > 1` only the first sample's adjustments are recorded,
+  so the fit sees one sample per trace. `base + δ` is clamped to
+  `[0.02, 0.98]` before logits.
+- **Fit.** MAP by Newton/IRLS (≤ 50 iterations, step halving, tolerance
+  `1e-10` on the largest step), dense Cholesky on a (categories + versions +
+  keys)-sized Hessian; 90 % intervals from its inverse (Laplace). Proposed
+  `w_k = clamp(w_parent_k · β̂_k, 0.05, 1)`; a new publisher's parent weight
+  is its source's. Keys with `nEff < WEIGHTS_MIN_NEFF` (default 30) keep the
+  parent weight and are flagged `insufficient` (an insufficient new
+  publisher gets no key, so it follows its source). Inputs are sorted by
+  `(marketId, traceId, signalId)` and `inputDigest = sha256(canonicalJson(samples))`,
+  so the output is deterministic.
+- **Held out.** `npm run weights:estimate -- --window 180d [--cutoff …] [--save --created-by G…]`
+  fits on markets resolved before the cutoff (default: the last fifth of the
+  window) and scores the rest: log loss with the fitted fixed effects and the
+  parent's weights versus the proposed ones. A set worse than its parent is
+  saved with `method.regression: true` and cannot be approved. The CLI prints
+  key, current and proposed weight, 90 % interval, nEff, nMarkets, and the
+  ranking change on the latest 24 h aggregation.
+- **Lifecycle.** `source_weight_sets` rows go DRAFT → APPROVED → ACTIVE →
+  RETIRED. Approval needs `agents.weights.approve` (super_admin only),
+  step-up, and an admin other than `createdBy`. Activation and rollback each
+  run in one transaction under an advisory lock (retire the old set, activate
+  the new one, write an `admin_audit_logs` row); a partial unique index
+  (`WHERE status = 'ACTIVE'`) guarantees one ACTIVE row. Rollback reactivates
+  the RETIRED set with the latest `activatedAt` before the current one, or
+  falls back to the compiled table.
+- **Runtime.** `getActiveWeightTable()` caches the ACTIVE row for 60 s and
+  falls back to `SOURCE_WEIGHTS` as `{ id: null, version: 0 }`.
+  `aggregateSignals()` loads it once and stamps `weightSet: { id, version }`
+  on its result, so one cycle never mixes tables and an activation does not
+  affect a cycle already running. `sourceWeight(source, publisher?, table?)`
+  and `relevanceScore(…, table?, publisher?)` take the table explicitly;
+  without one they behave exactly as before.
+- **Stamping.** Traces carry `sourceWeightSet: { id, version }` in the pinned
+  document and `reasoning_traces.sourceWeightSetVersion`; calibration can
+  group by `sourceWeightSet` (`v0` for older traces).
+- **Not learned.** `RECENCY_HALF_LIFE_HOURS`, cluster weighting and ensemble
+  recalibration stay as they are; there is no online learning.
+
 ## Evaluating market generation (#67)
 
 `npm run eval:markets` measures whether a prompt, model or schema change makes
@@ -844,13 +1154,74 @@ raw titles. `tests/fixtures/injection/*.json` holds 28 attack and 18 benign case
 with recorded model outputs; `tests/llm-injection.test.ts` replays them through
 `generateMarketQuestion` (model replaced by `setLlmJsonCaller`).
 
+## Cross-source corroboration (#228)
+
+The injection guard above checks that a proposal cites signals that were really
+sent. It cannot tell a real story from a planted, mistaken or satirical one: one
+article in NewsAPI or GDELT is enough to pass it, and the market that follows
+gets treasury seed liquidity, a pinned question document and an on-chain trace
+that cites the lone article. The corroboration gate sits between resolvability
+(step 2b/2c) and the dedup reservation in `runMarketMakerCycle` (step 2d).
+
+**Policy** (`checkCorroboration` in `src/services/llm-guard.service.ts`, pure and
+deterministic; `assessCorroboration` in `src/services/corroboration.service.ts`
+does the one signal-store read per cycle):
+
+1. **Claim matching.** Entities come from `extractEntities` run on the
+   *sanitised* question. A candidate store row matches when its title and
+   summary cover every gazetteer entity of the question (or at least two
+   `NAME:` entities when there are none), share at least two meaningful tokens
+   with it, and were published within `CORROBORATION_WINDOW_HOURS` (72) before
+   now. The window is wider than the aggregator's 24 h on purpose. The
+   grounding signals are candidates too. FRED rows never match: they have no
+   URL and cluster per series.
+2. **Independence.** Matching rows are grouped by near-duplicate cluster
+   (`clusterId`, else the row). Each group's publishers are registrable domains
+   (`src/lib/domains.ts`: URL host without `www.`, folded to eTLD+1 with a small
+   multi-label suffix table, falling back to the lower-cased publisher only
+   when there is no URL, since GDELT reports a domain and NewsAPI a display
+   name). Groups that share a domain, or whose texts are within
+   `CORROBORATION_SIMHASH_REWRITE` (10, looser than clustering) bits of each
+   other, merge into one unit (union-find, so candidate order never matters).
+   `CORROBORATED` needs `CORROBORATION_MIN_PUBLISHERS` (2) units spanning two
+   domains. Twelve syndicated copies under twelve mastheads are one cluster and
+   one unit. A URL count is never used.
+3. **Authoritative exemption.** `AUTHORITATIVE` when FRED resolves the question
+   and a grounding FRED signal is the series that measures it (`fredSeriesFor`,
+   the resolvability FRED table, with FEDFUNDS accepted for fed-funds
+   questions), or when FRED/ECB resolves a question whose extracted deadline is
+   exactly a scheduled FOMC/ECB announcement (`meetingAt`) and at least one
+   news candidate matches. There is no category-wide bypass. "Will the Fed cut
+   by December 31" names no meeting and needs ordinary corroboration.
+
+**Modes** (`CORROBORATION_MODE`): `off`; `observe` (default for the first
+release) logs `PROPOSAL_UNCORROBORATED` and creates the market anyway, and
+fails open if the store read fails; `enforce` returns before the reservation,
+so an uncorroborated proposal produces no DB row, IPFS pin, seed or trace, and
+a failed check fails closed. Config validation requires `enforce` in live mode
+unless `CORROBORATION_ALLOW_OBSERVE_LIVE=true`.
+
+**Recording.** `Market.corroboration` holds `{ kind, corroborators: [{ signalId,
+clusterId, domain, source, publishedAt }], policy, checkedAt }`. The creation
+trace's `sourcesUsed` is the grounding evidence plus the corroborating rows
+(deduped by `signalId`, so retention keeps them), and TraceDocV2 carries
+`corroboration: { kind, units, domains }`. `PROPOSAL_UNCORROBORATED` logs carry
+unit and domain counts, the domains, and `sha256(signalId)` hashes, never
+signal text.
+
+**Residual risk.** An attacker who publishes two *different* fabricated texts on
+two domains they control is counted as two units: rewrite-distance merging
+catches near-copies only. The logged domains let operators find and blocklist
+such pairs. Credibility weighting of publishers is out of scope here and belongs
+to source-weight learning.
+
 ## LLM budgets and shared guards (#71)
 
 `src/lib/llm-budget.ts` (state in Redis, atomic Lua in `llm-budget-store.ts`)
 replaces the per-process interval guards and circuit breaker. Every provider
 attempt is `acquire()` → call → `record()`:
 
-- **Token bucket** per provider (`LLM_ANTHROPIC_RPM`, `LLM_GEMINI_RPM`, capacity =
+- **Token bucket** per provider (`LLM_ANTHROPIC_RPM`, `LLM_GEMINI_RPM`, `LLM_OPENAI_RPM`, capacity =
   RPM). An empty bucket makes `acquire` wait with jitter for up to 30 s.
 - **Circuit breaker** per provider: `closed → open → half-open`. A daily quota error
   opens it (Gemini: until at least the next UTC midnight); `LLM_BREAKER_FAILURE_THRESHOLD`
@@ -1012,3 +1383,55 @@ The API sets declarative cache policies and strong ETags across all endpoints vi
 - Requests with matching `If-None-Match` are terminated with `304 Not Modified` and skip controller execution.
 - Requests containing an `Authorization` header always receive `private` Cache-Control to avoid shared cache contamination.
 
+
+## Fault-injection testing
+
+`tests/fault-injection.test.ts` covers two value-moving flows with deterministic, in-process doubles — no network, Postgres or Redis required.
+
+### Seams
+
+| Seam | File | Used for |
+|------|------|----------|
+| `setTransactionReader` | `src/services/stellar/tx-inspect.ts` | Scripted per-hash RPC poll timelines |
+| `setTransactionSender` | `src/services/stellar/tx-inspect.ts` | Scripted send results |
+| `setChainOverrides` | `src/services/chain.service.ts` | Replacing submitWrite / acceptSend / confirmSubmitted |
+| `OutboxStore` | `src/services/stellar/outbox.ts` | In-memory store; no DB |
+| `RecoverDeps` | `src/services/chain.service.ts` | Injecting store + server into recovery paths |
+
+### Scenarios
+
+**Payment verification (P1-P8)**
+
+| ID | Description |
+|----|-------------|
+| P1 | NOT_FOUND then SUCCESS — verification converges |
+| P2 | Persistent NOT_FOUND — never marks permanently failed |
+| P3 | Timeout then SUCCESS — transient error surfaces, then resolves |
+| P4 | FAILED status — not accepted as SUCCESS |
+| P5 | SUCCESS with missing envelopeXdr — surfaced, not silently trusted |
+| P6 | Idempotent re-call — same transaction, never double-counted |
+| P7 | Ledger field present — EXPIRED uses ledger sequence, not wall clock |
+| P8 | Reader restored after test — seam invariant verified |
+
+**Chain writes (C1-C7)**
+
+| ID | Description |
+|----|-------------|
+| C1 | New outbox row starts as PENDING |
+| C2 | PENDING → SUBMITTED transition persisted |
+| C3 | Transient send failure — row stays PENDING, not FAILED |
+| C4 | NOT_FOUND after send — row stays SUBMITTED until confirmation |
+| C5 | SUCCESS confirmation — row moves to CONFIRMED |
+| C6 | findPending filters by status correctly |
+| C7 | Virtual clock advances deterministically |
+
+### Invariants
+
+| ID | Description |
+|----|-------------|
+| I1 | No unhandled rejection after a scenario |
+| I2 | Reader / sender / chain overrides restored after every test |
+| I3 | A transient RPC failure never permanently marks a payment or write failed |
+| I4 | An idempotent re-call never double-counts money or events |
+| I5 | EXPIRED is derived from ledger sequence, not a wall-clock guess |
+| I6 | A SUCCESS response is only trusted once it passes envelope validation |

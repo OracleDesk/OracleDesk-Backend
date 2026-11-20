@@ -111,6 +111,23 @@ function reader(opts: ReaderOpts) {
 }
 
 const HASH = 'ab'.repeat(32);
+
+/**
+ * Transaction-client pieces the claim path needs besides the maps each test
+ * keeps: advisory locks and an empty allowance_days bucket (#219).
+ */
+function allowanceTxStub() {
+  return {
+    $queryRaw: async (sql: TemplateStringsArray) =>
+      sql.join('?').includes('allowance_days') ? [{ spentRaw: '0', reservedRaw: '0', overageRaw: '0' }] : [{ locked: true }],
+    $executeRaw: async () => 1,
+    allowanceDay: { update: async () => ({}) },
+    allowanceCharge: {
+      findUnique: async () => null,
+      create: async ({ data }: any) => ({ id: `charge-${data.txHash}`, ...data }),
+    },
+  };
+}
 const code = (p: Promise<unknown>) => p.then(() => 'ok', (e: any) => e.code ?? e.message);
 
 test('payment verification: success and every failure mode', async () => {
@@ -376,7 +393,7 @@ test('recordPayment: grants a pass once per hash and never without verification'
     subs.find((s) => (where.txHash === undefined || s.txHash === where.txHash)) ?? null;
   (prisma.spendingAllowance.findUnique as any) = async () => null;
   (prisma.$transaction as any) = async (fn: any) => fn({
-    $queryRaw: async () => [{ locked: true }],
+    ...allowanceTxStub(),
     paymentEvent: {
       findUnique: async ({ where }: any) => used.get(where.txHash) ?? null,
       create: async ({ data }: any) => { used.set(data.txHash, { userId: data.userId }); return data; },
@@ -398,6 +415,7 @@ test('recordPayment: grants a pass once per hash and never without verification'
     const sub = await recordPayment({ userId: 'u1', walletAddress: user, type: 'DAILY_PASS', txHash: HASH });
     assert.equal(sub.status, 'ACTIVE');
     assert.equal(sub.amountPaid, 0.5);
+    assert.equal(sub.amountPaidRaw, '5000000');
 
     // Same user, same hash: idempotent, returns the existing pass.
     const again = await recordPayment({ userId: 'u1', walletAddress: user, type: 'DAILY_PASS', txHash: HASH });
@@ -435,9 +453,16 @@ test('C… session can claim a daily pass paid from that contract (#47)', async 
   (prisma.subscription.findFirst as any) = async ({ where }: any) => subs.find((s) => s.txHash === where.txHash) ?? null;
   (prisma.spendingAllowance.findUnique as any) = async () => null;
   (prisma.$transaction as any) = async (fn: any) => fn({
-    subscription: { create: async ({ data }: any) => { const s = { id: `sub-${subs.length}`, ...data }; subs.push(s); return s; } },
-    paymentEvent: { create: async ({ data }: any) => { used.set(data.txHash, { userId: data.userId }); return data; } },
-    spendingAllowance: { updateMany: async () => ({ count: 0 }) },
+    ...allowanceTxStub(),
+    subscription: {
+      findFirst: async ({ where }: any) => subs.find((s) => s.txHash === where.txHash) ?? null,
+      create: async ({ data }: any) => { const s = { id: `sub-${subs.length}`, ...data }; subs.push(s); return s; },
+    },
+    paymentEvent: {
+      findUnique: async ({ where }: any) => used.get(where.txHash) ?? null,
+      create: async ({ data }: any) => { used.set(data.txHash, { userId: data.userId }); return data; },
+    },
+    spendingAllowance: { findUnique: async () => null, updateMany: async () => ({ count: 0 }) },
   });
 
   const envelope = transferEnvelope({
@@ -458,5 +483,37 @@ test('C… session can claim a daily pass paid from that contract (#47)', async 
     assert.equal(sub.status, 'ACTIVE');
   } finally {
     verification.setTransactionReader(prev);
+  }
+});
+
+test('settleVerifiedTransfer charges ledgerDay(ledgerCloseAt), not the claim day (#219)', async () => {
+  const { prisma } = await import('../src/lib/prisma');
+  const { settleVerifiedTransfer } = await import('../src/services/subscription.service');
+  const { fakeAllowanceDb, seedAllowance } = await import('./helpers/fake-allowance-db');
+  const db = fakeAllowanceDb();
+  const restore = db.install(prisma);
+  try {
+    seedAllowance(db, { userId: 'u1', dailyLimitRaw: 8_000_000n, perTraceLimitRaw: 8_000_000n });
+    const base = {
+      from: Keypair.random().publicKey(), to: Keypair.random().publicKey(), ledger: 42, txSource: '',
+      memo: { type: 'none' } as any, transfers: [], toMuxedId: null, envelopeMismatch: false,
+    };
+    const claimAt = new Date('2026-11-20T00:00:10Z');
+    // D+1's own pass first, then the late claim for a transfer that closed on D.
+    await settleVerifiedTransfer(db.client, {
+      userId: 'u1', type: 'DAILY_PASS', now: claimAt,
+      transfer: { ...base, txHash: 'c1'.repeat(32), amount: PRICE, createdAt: Date.parse('2026-11-20T00:00:05Z') / 1000 },
+    });
+    const late = await settleVerifiedTransfer(db.client, {
+      userId: 'u1', type: 'DAILY_PASS', now: claimAt,
+      transfer: { ...base, txHash: 'c2'.repeat(32), amount: PRICE, createdAt: Date.parse('2026-11-19T23:59:50Z') / 1000 },
+    });
+    assert.equal(late.ledgerCloseAt.toISOString(), '2026-11-19T23:59:50.000Z');
+    assert.equal(late.overageRaw, 0n, 'D has its own budget');
+    assert.deepEqual(db.bucket('u1', '2026-11-19'), { spentRaw: '5000000', reservedRaw: '0', overageRaw: '0' });
+    assert.deepEqual(db.bucket('u1', '2026-11-20'), { spentRaw: '5000000', reservedRaw: '0', overageRaw: '0' });
+    assert.equal(db.allowances.get('u1')!.spentTodayRaw, '5000000', 'the late claim never touches the current day');
+  } finally {
+    restore();
   }
 });

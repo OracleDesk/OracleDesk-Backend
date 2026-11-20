@@ -1,0 +1,63 @@
+{
+  "name": "ecb-meeting-calendar",
+  "now": "2026-10-18T12:00:00.000Z",
+  "description": "ECB question that names the scheduled October meeting, with coverage: authoritative.",
+  "question": "Will the ECB cut its deposit rate at its October 2026 meeting?",
+  "category": "ECB",
+  "resolutionSourceId": "ECB",
+  "meeting": {
+    "body": "ECB",
+    "date": "2026-10-29"
+  },
+  "grounding": [
+    {
+      "signalId": "sig-ecb-1",
+      "source": "NEWSAPI",
+      "url": "https://europe.example.com/ecb-split",
+      "publisher": null,
+      "title": "ECB policymakers split over a rate cut",
+      "content": "European Central Bank officials disagreed on whether to cut the deposit rate.",
+      "publishedAt": "2026-10-18T06:00:00.000Z",
+      "relevanceScore": 0.8,
+      "category": "GEOPOLITICAL",
+      "sanitizedFlags": [],
+      "clusterSize": 1
+    }
+  ],
+  "candidates": [
+    {
+      "id": "sig-ecb-1",
+      "source": "NEWSAPI",
+      "clusterId": null,
+      "url": "https://europe.example.com/ecb-split",
+      "publisher": null,
+      "title": "ECB policymakers split over a rate cut",
+      "summary": "European Central Bank officials disagreed on whether to cut the deposit rate.",
+      "publishedAt": "2026-10-18T06:00:00.000Z"
+    },
+    {
+      "id": "sig-noise-1",
+      "source": "NEWSAPI",
+      "clusterId": null,
+      "url": "https://sport.example.net/derby",
+      "publisher": null,
+      "title": "Derby ends in a late draw",
+      "summary": "The visitors equalised in stoppage time.",
+      "publishedAt": "2026-10-18T07:00:00.000Z"
+    },
+    {
+      "id": "sig-noise-2",
+      "source": "NEWSAPI",
+      "clusterId": null,
+      "url": "https://arts.example.org/box-office",
+      "publisher": null,
+      "title": "Box office weekend led by an animated sequel",
+      "summary": "The sequel opened above forecasts.",
+      "publishedAt": "2026-10-18T03:00:00.000Z"
+    }
+  ],
+  "expected": {
+    "kind": "AUTHORITATIVE",
+    "units": 1
+  }
+}

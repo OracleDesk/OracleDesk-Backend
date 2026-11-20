@@ -36,6 +36,12 @@ export interface JwtPayload {
    * preserves it so a refresh can never bypass step-up.
    */
   auth_time?: number;
+  /**
+   * Session id — a random UUID minted at sign-in and carried on every token.
+   * Used by the premium-device registry (#288) to associate a JWT with a
+   * specific device slot.
+   */
+  sid?: string;
   iat: number;
   exp: number;
 }
@@ -241,12 +247,13 @@ export interface TokenIdentity {
  * sub-users. Kept as one token-issuing function so every call site gains the
  * EdDSA/`kid`/`iss`/`aud` layer (#44) and the session id (#43) at once.
  */
-export function signToken(userId: string, walletAddress: string, identity: TokenIdentity = {}): string {
+export function signToken(userId: string, walletAddress: string, identity: TokenIdentity = {}, sessionId?: string): string {
   const payload: Record<string, unknown> = {
     userId,
     walletAddress,
     account: identity.account ?? walletAddress,
     auth_time: identity.authTime ?? Math.floor(Date.now() / 1000),
+    sid: sessionId ?? crypto.randomUUID(),
   };
   if (identity.subId != null || identity.subIdKind != null) {
     payload.subId = identity.subId ?? null;

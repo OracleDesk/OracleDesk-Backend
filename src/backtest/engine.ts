@@ -13,8 +13,9 @@
  */
 import { DEFAULT_PARAMS, runTraderPolicy, type TraderParams } from '../agents/trader-policy';
 import type {
-  BuyOrder, Clock, DecisionRecord, ExecResult, Forecast, MarketView, PositionView, TraderEnv,
+  BuyOrder, Clock, DecisionPrice, DecisionRecord, ExecResult, Forecast, MarketView, PoolView, PositionView, TraderEnv,
 } from '../agents/trader-env';
+import { StalePriceError } from '../services/market-price.service';
 import { MathError } from '../generated/fpmm';
 import { toDisplayUsdc, usdcFromNumber } from '../lib/amounts';
 import { canonicalJson, sha256Hex } from '../utils/hash.util';
@@ -108,6 +109,8 @@ class Replay {
   drawdownPauses = 0;
   externalTradesSkipped = 0;
   latestEventAt: Date | null = null;
+  /** Ledger of the newest applied event: what the simulated pools are "as of". */
+  latestLedger = 0;
   now: Date;
   private cursor = 0;
   private nextId = 1;
@@ -137,6 +140,7 @@ class Replay {
       const event = this.events[this.cursor++];
       this.apply(event);
       this.latestEventAt = new Date(eventTime(event));
+      this.latestLedger = Math.max(this.latestLedger, event.ledger);
     }
   }
 
@@ -196,11 +200,10 @@ class Replay {
 
   // ─── Execution ───────────────────────────────────────────────────────────
 
-  buy(marketId: string, direction: 'YES' | 'NO', amount: number, edge: number, kelly: number, kind: 'trade' | 'hedge'): ExecResult {
+  /** Fills exactly `collateral` base units: the size the policy chose, never re-derived from a float (#225). */
+  buy(marketId: string, direction: 'YES' | 'NO', collateral: bigint, edge: number, kelly: number, kind: 'trade' | 'hedge'): ExecResult {
     const market = this.markets.get(marketId);
     if (!market) return { ok: false, reason: 'MarketNotFound' };
-    // The policy works in floats; the simulation in base units. This is the only conversion.
-    const collateral = usdcFromNumber(amount);
     const outcome = sideOf(direction);
     const midBps = market.pool.priceBps(outcome);
 
@@ -325,6 +328,28 @@ class BacktestEnv implements TraderEnv {
     return {
       id: m.id, category: m.category, currentYesProb: m.pool.priceYesBps() / 10_000, initialYesProb: m.initialYesProb,
       totalLiquidity: this.liquidity(m), expiryTimestamp: new Date(m.closeTime * 1000),
+      // The replay's market ids are the on-chain ids.
+      onChainMarketId: BigInt(m.id),
+    };
+  }
+
+  /** The simulated pool, as production's decision price and sizing reads see the chain (#266, #225). */
+  async price(m: MarketView): Promise<DecisionPrice> {
+    this.seen('price');
+    const pool = this.r.markets.get(m.id)!.pool;
+    return {
+      yesBps: BigInt(pool.priceYesBps()), reserveYes: pool.reserveYes, reserveNo: pool.reserveNo, feeBps: pool.feeBps,
+      asOfLedger: this.r.latestLedger, source: 'indexed', lagLedgers: 0,
+    };
+  }
+
+  async pool(marketId: string): Promise<PoolView | null> {
+    this.seen('pool');
+    const market = this.r.markets.get(marketId);
+    if (!market) return null;
+    return {
+      reserveYes: market.pool.reserveYes, reserveNo: market.pool.reserveNo, feeBps: market.pool.feeBps,
+      asOfLedger: this.r.latestLedger, source: 'sim', lagLedgers: 0,
     };
   }
 
@@ -384,11 +409,25 @@ class BacktestEnv implements TraderEnv {
     return { news, fed, macro, aggregatedAt: now, signalCount: news.length + fed.length + macro.length };
   }
 
+  async price(market: MarketView): Promise<DecisionPrice> {
+    const sim = this.r.markets.get(market.id);
+    if (!sim) throw new Error(`Unknown backtest market ${market.id}`);
+    return {
+      yesBps: BigInt(sim.pool.priceYesBps()),
+      reserveYes: sim.pool.reserveYes,
+      reserveNo: sim.pool.reserveNo,
+      feeBps: sim.pool.feeBps,
+      asOfLedger: 0,
+      source: 'indexed',
+      lagLedgers: 0,
+    };
+  }
+
   async closedPnlSince(t: Date) {
     this.seen('closedPnlSince');
     return this.r.positions
       .filter((p) => p.status === 'CLOSED' && p.closedAt && p.closedAt.getTime() >= t.getTime())
-      .map((p) => toDisplayUsdc(p.payoutRaw - p.collateralRaw));
+      .map((p) => p.payoutRaw - p.collateralRaw);
   }
 
   async forecast(m: MarketView): Promise<Forecast | null> {
@@ -443,13 +482,14 @@ class BacktestEnv implements TraderEnv {
     this.seen('hedge');
     this.r.hedged.add(`${rec.originalMarketId}|${rec.hedgeMarketId}`);
     // Unlike production's autoHedge (which only records a PENDING trade), the replay executes the hedge so the rule's effect shows up.
-    const res = this.r.buy(rec.hedgeMarketId, rec.hedgeDirection, rec.hedgeSize, 0, 0, 'hedge');
+    // Hedge recommendations are display USDC; this is their only conversion.
+    const res = this.r.buy(rec.hedgeMarketId, rec.hedgeDirection, usdcFromNumber(rec.hedgeSize), 0, 0, 'hedge');
     if (!res.ok) throw new Error(`hedge refused: ${res.reason}`);
   }
 
   async buy(order: BuyOrder) {
     this.seen('buy');
-    return this.r.buy(order.marketId, order.direction, order.amount, order.edge, order.kelly, 'trade');
+    return this.r.buy(order.marketId, order.direction, order.amountRaw, order.edge, order.kelly, 'trade');
   }
 
   async exit(positionId: string, reason: string) {
@@ -459,6 +499,23 @@ class BacktestEnv implements TraderEnv {
 
   async recordDecision(d: DecisionRecord) {
     if (d.kind === 'DRAWDOWN_PAUSE') this.r.drawdownPauses++;
+  }
+
+  /** The replayed pool is the indexed state as of the newest applied event: never stale (#266). */
+  async price(m: MarketView): Promise<DecisionPrice> {
+    this.seen('price');
+    const market = this.r.markets.get(m.id);
+    if (!market) throw new StalePriceError(`market ${m.id} is not in the replay`);
+    const { pool } = market;
+    return {
+      yesBps: BigInt(pool.priceYesBps()),
+      reserveYes: pool.reserveYes,
+      reserveNo: pool.reserveNo,
+      feeBps: pool.feeBps,
+      asOfLedger: this.r.latestLedger,
+      source: 'indexed',
+      lagLedgers: 0,
+    };
   }
 }
 

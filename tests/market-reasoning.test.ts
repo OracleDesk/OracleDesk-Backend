@@ -92,3 +92,87 @@ test('questionDocument emits v1 unchanged without resolutionDetails and v2 with 
   // v1 fields are a subset of v2, so v1 readers keep working.
   for (const [k, v] of Object.entries(v1)) if (k !== 'version') assert.deepEqual((v2 as any)[k], v);
 });
+
+// ─── generateReasoningTrace on TraceDocV2 (#227) ─────────────────────────────
+
+async function withTraceStubs<T>(
+  market: { onChainMarketId: bigint | null } | null,
+  fn: (created: any[]) => Promise<T>,
+): Promise<T> {
+  const { prisma } = await import('../src/lib/prisma');
+  const llm = await import('../src/lib/llm');
+  const budget = await import('../src/lib/llm-budget');
+  const created: any[] = [];
+  const orig = { create: prisma.reasoningTrace.create, findUnique: prisma.market.findUnique };
+  (prisma.reasoningTrace.create as any) = async ({ data }: any) => {
+    created.push(data);
+    return { ...data, createdAt: new Date(), updatedAt: new Date() };
+  };
+  (prisma.market.findUnique as any) = async () => market;
+  const prevCaller = llm.setLlmJsonCaller(async () =>
+    JSON.stringify({ hedge_conditions: ['Close if CPI exceeds 3.5%'], reasoning_summary: 'CPI drives it.', key_signals: ['CPI'], risk_factors: ['Revision'] }),
+  );
+  const prevStore = budget.setLlmGuardStore(new budget.MemoryGuardStore());
+  try {
+    return await fn(created);
+  } finally {
+    (prisma.reasoningTrace.create as any) = orig.create;
+    (prisma.market.findUnique as any) = orig.findUnique;
+    llm.setLlmJsonCaller(prevCaller);
+    budget.setLlmGuardStore(prevStore);
+  }
+}
+
+const TRACE_INPUT = {
+  marketId: '22222222-2222-4222-8222-222222222222',
+  agentType: 'TRADER' as const,
+  decisionType: 'OPEN_POSITION',
+  sourcesUsed: [{ source: 'NEWSAPI', weight: 0.7, signal: 'Fed holds', signalId: 'sig_1', url: 'https://example.com/a', publisher: 'Wire', publishedAt: '2026-10-16T00:00:00Z' }],
+  probabilityEstimate: 0.6,
+  marketProbability: 0.5,
+  edge: 0.1,
+  confidenceInterval: { lower: 0.5, upper: 0.7 },
+  betFraction: 0.05,
+  betSizeUsdc: 10,
+};
+
+test('generateReasoningTrace: row id equals tracePayload.traceId and the payload is a valid TraceDocV2', async () => {
+  const { generateReasoningTrace } = await import('../src/services/reasoning.service');
+  const { TraceDocV2 } = await import('../src/schemas/trace');
+  const { FakeClock, setClock } = await import('../src/lib/clock');
+  const prev = setClock(new FakeClock(new Date('2026-10-18T12:00:00Z')));
+  try {
+    await withTraceStubs({ onChainMarketId: 9n }, async (created) => {
+      const { trace, tracePayload } = await generateReasoningTrace(TRACE_INPUT);
+      assert.equal(created.length, 1);
+      assert.equal(created[0].id, tracePayload.traceId);
+      assert.equal(trace.id, tracePayload.traceId);
+      assert.doesNotThrow(() => TraceDocV2.parse(tracePayload));
+      assert.equal(tracePayload.market.onChainId, '9');
+      assert.equal(tracePayload.createdAt, '2026-10-18T12:00:00.000Z', 'createdAt comes from lib/clock');
+      assert.equal(tracePayload.provenance.llm.length, 1);
+      assert.equal(tracePayload.sourcesUsed[0].signalId, 'sig_1');
+    });
+  } finally {
+    setClock(prev);
+  }
+});
+
+test('generateReasoningTrace: a missing market row yields market.onChainId null', async () => {
+  const { generateReasoningTrace } = await import('../src/services/reasoning.service');
+  await withTraceStubs(null, async () => {
+    const { tracePayload } = await generateReasoningTrace(TRACE_INPUT);
+    assert.equal(tracePayload.market.onChainId, null);
+  });
+});
+
+test('generateReasoningTrace: an invalid document throws TRACE_DOC_INVALID and writes no row', async () => {
+  const { generateReasoningTrace } = await import('../src/services/reasoning.service');
+  await withTraceStubs(null, async (created) => {
+    await assert.rejects(
+      generateReasoningTrace({ ...TRACE_INPUT, marketId: 'not-a-uuid' }),
+      (err: any) => err.code === 'TRACE_DOC_INVALID' && err.statusCode === 422 && Array.isArray(err.details?.issues),
+    );
+    assert.equal(created.length, 0);
+  });
+});

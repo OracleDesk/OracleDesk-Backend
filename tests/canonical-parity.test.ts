@@ -87,11 +87,12 @@ function findNonPlain(value: unknown, path = '$'): string[] {
 test('tracePayload never contains a Date or other class instance', async () => {
   const { prisma } = await import('../src/lib/prisma');
   const { generateReasoningTrace } = await import('../src/services/reasoning.service');
-  const original = prisma.reasoningTrace.create;
-  (prisma.reasoningTrace.create as any) = async ({ data }: any) => ({ id: 't1', ...data });
+  const original = { create: prisma.reasoningTrace.create, findUnique: prisma.market.findUnique };
+  (prisma.reasoningTrace.create as any) = async ({ data }: any) => ({ ...data });
+  (prisma.market.findUnique as any) = async () => ({ onChainMarketId: 7n });
   try {
     const { tracePayload } = await generateReasoningTrace({
-      marketId: 'm1',
+      marketId: '33333333-3333-4333-8333-333333333333',
       agentType: 'TRADER',
       decisionType: 'TRADE',
       sourcesUsed: [{ source: 'FRED', weight: 0.9, signal: 'CPI', rawValue: 0.6 }],
@@ -104,8 +105,10 @@ test('tracePayload never contains a Date or other class instance', async () => {
       agentWallet: 'GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H',
     });
     assert.deepEqual(findNonPlain(tracePayload), []);
-    assert.equal(typeof (tracePayload as Record<string, unknown>).timestamp, 'string', 'timestamp is pre-formatted, not a Date');
+    assert.equal(typeof tracePayload.createdAt, 'string', 'createdAt is pre-formatted, not a Date');
+    assert.equal(tracePayload.market.onChainId, '7', 'bigint market id is encoded as a decimal string');
   } finally {
-    (prisma.reasoningTrace.create as any) = original;
+    (prisma.reasoningTrace.create as any) = original.create;
+    (prisma.market.findUnique as any) = original.findUnique;
   }
 });

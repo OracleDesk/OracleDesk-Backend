@@ -22,6 +22,11 @@ export type FailureClass =
   | 'AUTH'
   | 'INSUFFICIENT_BALANCE'
   | 'UNKNOWN_OUTCOME'
+  // #245: market-core DeadlineExpired (#19) / LimitPriceExceeded (#20) behind a
+  // treasury v2 trade. The treasury collapses both into a generic market-core
+  // failure, so they are attributed by attributeTradeBoundFailure().
+  | 'DEADLINE_EXPIRED'
+  | 'LIMIT_PRICE'
   | 'UNKNOWN';
 
 export type RetryAction = 'resend' | 'rebuild' | 'resync-rebuild' | 'never';
@@ -52,6 +57,9 @@ export const RETRY_POLICY: Record<FailureClass, RetryAction> = {
   AUTH: 'never',
   INSUFFICIENT_BALANCE: 'never',
   UNKNOWN_OUTCOME: 'never',
+  // Re-sending can never succeed: the trader must re-decide on a new quote.
+  DEADLINE_EXPIRED: 'never',
+  LIMIT_PRICE: 'never',
   UNKNOWN: 'never',
 };
 
@@ -262,3 +270,40 @@ export function isChainError(err: unknown): err is ChainError {
   return Boolean(err && typeof (err as { code?: unknown }).code === 'string' && (err as { name?: string }).name === 'ChainError');
 }
 
+
+/** market-core error codes behind a treasury v2 trade (contracts/market-core). */
+export const MARKET_CORE_DEADLINE_EXPIRED = 19;
+export const MARKET_CORE_LIMIT_PRICE_EXCEEDED = 20;
+
+/**
+ * Re-attributes a CONTRACT_ERROR from a bounded (v2) trade (#245), in order:
+ *   (a) market-core Error(Contract, #19 / #20) seen in simulation diagnostics,
+ *   (b) the ledger close time at failure is past the trade's deadline,
+ *   (c) the local limit re-check against the failing simulation's quote failed.
+ * Anything else stays CONTRACT_ERROR. Other classes are returned unchanged.
+ */
+export function attributeTradeBoundFailure(
+  failure: ClassifiedFailure,
+  ctx: {
+    diagnosticContractCodes?: number[];
+    deadline?: bigint | null;
+    ledgerCloseTime?: number | null;
+    limitRecheckFailed?: boolean;
+  },
+): ClassifiedFailure {
+  if (failure.class !== 'CONTRACT_ERROR') return failure;
+  const codes = ctx.diagnosticContractCodes ?? [];
+  if (codes.includes(MARKET_CORE_DEADLINE_EXPIRED)) return { ...failure, class: 'DEADLINE_EXPIRED' };
+  if (codes.includes(MARKET_CORE_LIMIT_PRICE_EXCEEDED)) return { ...failure, class: 'LIMIT_PRICE' };
+  if (
+    ctx.deadline !== undefined &&
+    ctx.deadline !== null &&
+    ctx.ledgerCloseTime !== undefined &&
+    ctx.ledgerCloseTime !== null &&
+    BigInt(Math.floor(ctx.ledgerCloseTime)) > ctx.deadline
+  ) {
+    return { ...failure, class: 'DEADLINE_EXPIRED' };
+  }
+  if (ctx.limitRecheckFailed) return { ...failure, class: 'LIMIT_PRICE' };
+  return failure;
+}

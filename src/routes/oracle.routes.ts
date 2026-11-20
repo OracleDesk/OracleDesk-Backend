@@ -10,7 +10,7 @@ router.get(
   '/markets/:marketId/resolution',
   cachePolicy(async (req) => {
     const market = await prisma.market.findUnique({
-      where: { id: req.params.marketId },
+      where: { id: String(req.params.marketId) },
       select: { status: true },
     });
     if (market && (market.status === 'RESOLVED' || market.status === 'CANCELLED')) {

@@ -485,7 +485,8 @@ export function isBinaryQuestion(question: string): boolean {
   return true;
 }
 
-const FRED_SERIES: Array<[RegExp, string]> = [
+/** Question measurable → the FRED series that resolves it. */
+export const FRED_SERIES: ReadonlyArray<[RegExp, string]> = [
   [/\bcpi\b|consumer price/i, 'CPIAUCSL'],
   [/unemployment/i, 'UNRATE'],
   [/federal funds|fed funds|policy rate|target rate/i, 'DFEDTARU'],
@@ -493,6 +494,39 @@ const FRED_SERIES: Array<[RegExp, string]> = [
   [/payrolls?|nonfarm/i, 'PAYEMS'],
   [/10-?year|treasury yield/i, 'DGS10'],
 ];
+
+/**
+ * Series that report the same measurable as the resolving one. Ingestion
+ * stores FEDFUNDS (effective rate, monthly) while fed-funds questions resolve
+ * on DFEDTARU (target upper bound); both move only at FOMC decisions.
+ */
+const FRED_SERIES_EQUIVALENTS: Record<string, readonly string[]> = {
+  DFEDTARU: ['DFEDTARU', 'FEDFUNDS'],
+};
+
+/**
+ * FRED series ids that can back `question` (#228): the resolving series and
+ * its equivalents. Empty when the question names no FRED measurable.
+ */
+export function fredSeriesFor(question: string): string[] {
+  const hit = FRED_SERIES.find(([re]) => re.test(question));
+  if (!hit) return [];
+  return [...(FRED_SERIES_EQUIVALENTS[hit[1]] ?? [hit[1]])];
+}
+
+/**
+ * The scheduled meeting whose announcement is exactly `deadline` (#228), as
+ * extractQuestion computes it for "at its December meeting". A plain date
+ * ("by December 31") never matches: that is end of day, not the decision time.
+ */
+export function meetingAt(deadline: Date, sourceId: SourceId | null): MeetingDef | null {
+  const bodies: MeetingBody[] = sourceId === 'ECB' ? ['ECB'] : sourceId === 'FRED' ? ['FOMC', 'ECB'] : [];
+  for (const body of bodies) {
+    const def = MEETINGS[body].find((m) => meetingInstant(m).getTime() === deadline.getTime());
+    if (def) return def;
+  }
+  return null;
+}
 
 function sourceUrl(def: ResolutionSourceDef, question: string): string {
   const template = def.urlTemplate ?? '';

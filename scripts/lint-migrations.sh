@@ -37,7 +37,28 @@ if [ -z "$added" ]; then
   exit 0
 fi
 
-failed=0
+# --- Prefix collision / ordering check (#262) ----------------------------
+new_folders_json="$(while IFS= read -r file; do basename "$(dirname "$file")"; done <<< "$added" | jq -R . | jq -s .)"
+base_folders_json="$(git ls-tree --name-only "$merge_base" prisma/migrations/ 2>/dev/null \
+  | grep -v migration_lock \
+  | jq -R . | jq -s . || echo '[]')"
+
+prefix_exit=0
+NEW_FOLDERS="$new_folders_json" BASE_FOLDERS="$base_folders_json" \
+  node --input-type=module << 'NODE' || prefix_exit=$?
+import { checkFolderNames } from './scripts/check-migration-compat.mjs';
+const newNames  = JSON.parse(process.env.NEW_FOLDERS  || '[]');
+const baseNames = JSON.parse(process.env.BASE_FOLDERS || '[]');
+const { ok, errors } = checkFolderNames(newNames, baseNames);
+if (!ok) { errors.forEach(e => process.stderr.write(e + '\n')); process.exit(1); }
+NODE
+if [ $prefix_exit -ne 0 ]; then
+  echo "Migration prefix lint failed (duplicate or non-increasing timestamp prefix)." >&2
+  failed=1
+fi
+# -------------------------------------------------------------------------
+
+failed=${failed:-0}
 while IFS= read -r file; do
   name="$(basename "$(dirname "$file")")"
 

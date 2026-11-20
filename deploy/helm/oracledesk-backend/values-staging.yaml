@@ -1,0 +1,21 @@
+existingSecret: oracledesk-backend-staging-secrets
+
+config:
+  NODE_ENV: production
+  CHAIN_EXECUTION_MODE: dry-run
+  EVENT_BUS_ENABLED: "true"
+  INDEXER_ENABLED: "true"
+  SHUTDOWN_DRAIN_MS: "5000"
+
+shutdownDrainSeconds: 5
+
+roles:
+  api:
+    replicas: 1
+    strategy: RollingUpdate
+  indexer:
+    replicas: 1
+    strategy: Recreate
+  worker:
+    replicas: 1
+    strategy: Recreate

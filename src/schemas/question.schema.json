@@ -5,22 +5,19 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "schemaVersion",
-    "kind",
+    "version",
     "question",
     "category",
     "contractCategory",
     "closeTime",
     "resolutionSource",
-    "resolutionSpecHash",
-    "backendMarketId"
+    "resolutionHash",
+    "backendMarketId",
+    "resolution"
   ],
   "properties": {
-    "schemaVersion": {
+    "version": {
       "const": 2
-    },
-    "kind": {
-      "const": "oracledesk.question"
     },
     "question": {
       "type": "string",
@@ -42,21 +39,75 @@
     },
     "contractCategory": {
       "type": "string",
-      "enum": ["Macro", "Geopolitics", "Crypto", "Sports", "Culture", "Other"]
+      "enum": [
+        "Macro",
+        "Geopolitics",
+        "Crypto",
+        "Sports",
+        "Culture",
+        "Other"
+      ]
     },
     "closeTime": {
       "type": "integer"
     },
     "resolutionSource": {
-      "type": ["string", "null"]
+      "type": [
+        "string",
+        "null"
+      ]
     },
-    "resolutionSpecHash": {
+    "resolutionHash": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
     },
     "backendMarketId": {
       "type": "string",
       "format": "uuid"
+    },
+    "priceResolution": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "kind",
+        "reflector",
+        "asset",
+        "assetKind",
+        "threshold",
+        "direction",
+        "maxStaleness"
+      ],
+      "properties": {
+        "kind": {
+          "const": "price"
+        },
+        "reflector": {
+          "type": "string"
+        },
+        "asset": {
+          "type": "string"
+        },
+        "assetKind": {
+          "type": "string"
+        },
+        "threshold": {
+          "type": [
+            "number",
+            "string"
+          ]
+        },
+        "direction": {
+          "type": "string"
+        },
+        "maxStaleness": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "resolution": {
+      "type": "object",
+      "additionalProperties": true
     }
   }
 }

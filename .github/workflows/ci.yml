@@ -57,8 +57,16 @@ jobs:
 
       - run: npx prisma generate
       - run: npx prisma migrate deploy
-      - name: Verify schema datamodel matches migrations
-        run: npx prisma migrate diff --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma --exit-code
+      - name: Create shadow database for drift check
+        run: >-
+          PGPASSWORD=oracledesk
+          psql -h localhost -U oracledesk -c "CREATE DATABASE oracledesk_shadow;"
+        env:
+          PGPASSWORD: oracledesk
+      - name: Verify schema/migration parity (two-way drift check)
+        run: npm run check:drift
+        env:
+          SHADOW_DATABASE_URL: postgresql://oracledesk:oracledesk@localhost:5432/oracledesk_shadow
       - name: Audit database constraints
         run: npx tsx scripts/audit-constraints.ts --json audit.json
       - run: npm run build
@@ -107,3 +115,20 @@ jobs:
 
       - name: Lint new migrations
         run: npm run lint:migrations
+
+  deploy-artifacts:
+    name: Validate Dockerfile and Helm chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Helm lint (staging and production values)
+        run: |
+          helm lint deploy/helm/oracledesk-backend -f deploy/helm/oracledesk-backend/values-staging.yaml
+          helm lint deploy/helm/oracledesk-backend -f deploy/helm/oracledesk-backend/values-production.yaml
+      - name: Docker build check (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: false

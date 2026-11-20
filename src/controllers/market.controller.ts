@@ -7,6 +7,7 @@ import type { JobRecord } from '../types';
 import { JobStatus } from '../types';
 import { sendSuccess, sendError, parsePagination, buildPaginationMeta } from '../utils/response.util';
 import { runMarketMakerCycle } from '../agents/market-maker.agent';
+import { getRunningCycleId } from '../cron/ingestion.cron';
 import { generateMarketSchema, listMarketsSchema } from '../validators/market.validator';
 import { toContractCategory } from '../lib/categories';
 import { parseU64 } from '../lib/amounts';
@@ -21,6 +22,7 @@ import {
 } from '@prisma/client';
 import { AppError } from '../middlewares/error.middleware';
 import { assertAgentActive } from '../services/agent-controls.service';
+import { freshnessMeta } from '../lib/freshness';
 
 
 const jobTracker: Map<string, JobRecord> = new Map();
@@ -139,7 +141,10 @@ export async function listMarkets(
     res,
     markets.map(serializeMarket),
     200,
-    buildPaginationMeta(page, limit, total) as any,
+    { ...(buildPaginationMeta(page, limit, total) as any), ...(await freshnessMeta(
+      'indexed',
+      markets.reduce<number | null>((min, market) => market.chainSyncedLedger === null ? min : min === null ? market.chainSyncedLedger : Math.min(min, market.chainSyncedLedger), null),
+    )) },
   );
 }
 
@@ -167,7 +172,7 @@ export async function getMarket(
     return;
   }
 
-  sendSuccess(res, serializeMarket(market));
+  sendSuccess(res, serializeMarket(market), 200, await freshnessMeta('indexed', market.chainSyncedLedger));
 }
 
 /**
@@ -186,7 +191,7 @@ export async function getMarketByOnChainId(req: Request, res: Response): Promise
     sendError(res, 404, 'MARKET_NOT_FOUND', `No backend market for on-chain id ${raw}`);
     return;
   }
-  sendSuccess(res, serializeMarket(market));
+  sendSuccess(res, serializeMarket(market), 200, await freshnessMeta('indexed', market.chainSyncedLedger));
 }
 
 /**
@@ -207,6 +212,13 @@ export async function triggerMarketGeneration(
 
   // A paused market maker answers 423 immediately instead of starting a job (#79).
   await assertAgentActive('MARKET_MAKER');
+
+  // Refuse if a cycle is already running in this process (#283).
+  const activeCycleId = getRunningCycleId();
+  if (activeCycleId) {
+    sendError(res, 409, 'GENERATION_IN_PROGRESS', 'A generation cycle is already running', { cycleId: activeCycleId });
+    return;
+  }
 
   const jobId = uuidv4();
 
@@ -418,5 +430,5 @@ export async function getOnChainMarketState(req: Request, res: Response): Promis
     source: 'chain',
     ledger: result.ledger,
     cached: result.cached,
-  });
+  }, 200, await freshnessMeta(result.cached ? 'chain-cache' : 'rpc', result.ledger));
 }

@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import { Keypair, Networks, StrKey } from '@stellar/stellar-sdk';
 import { z } from 'zod';
 import { resolveFileVars, validateSecrets, SECRET_NAMES } from './secrets';
+import { applyDeprecatedAliases, collectConfigWarnings, emitConfigWarnings } from './meta';
 import { generateEntitlementKey } from '../services/entitlement/keys';
 
 dotenv.config();
@@ -86,7 +87,9 @@ const reflectorFeeds = z
   })
   .pipe(z.record(z.string(), z.record(z.string(), reflectorFeedSchema)));
 
-export const PROBE_NAMES = ['database', 'redis', 'rpc', 'indexer'] as const;
+// outbox, signers and channels are the chain-write probes (#220); they are only
+// ever critical on an instance that writes (see isChainWriter in health.service).
+export const PROBE_NAMES = ['database', 'redis', 'rpc', 'indexer', 'outbox', 'signers', 'channels'] as const;
 
 const probeName = z
   .string()
@@ -145,11 +148,29 @@ const previousSigningKeys = z
 const boolDefault = (fallback: 'true' | 'false') =>
   z.enum(['true', 'false']).default(fallback).transform((v) => v === 'true');
 
-const envSchema = z
+// The plain object schema (#243): its `.shape` lists every key, which the
+// lifecycle metadata in ./meta.ts and the boot warnings are checked against.
+export const envObjectSchema = z
   .object({
     DATABASE_URL: z.string({ error: 'is required' }).min(1, 'is required'),
     PORT: z.string().default('8000').transform(Number),
     NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
+    // Process role for split Kubernetes deployments (#272): all (default), api, indexer, or worker.
+    PROCESS_ROLE: z.enum(['all', 'api', 'indexer', 'worker']).default('all'),
+    // Multi-provider IPFS replication and hedged gateway settings (#271).
+    IPFS_PROVIDERS: commaList(z.enum(['pinata', 'kubo', 'psa']), 'pinata'),
+    IPFS_KUBO_API_URL: optionalString,
+    IPFS_KUBO_AUTH: optionalString,
+    IPFS_PSA_ENDPOINT: optionalString,
+    IPFS_PSA_TOKEN: optionalString,
+    IPFS_MIN_REPLICAS: z.string().default('1').transform(Number).pipe(z.number().int().min(1).max(10)),
+    IPFS_GATEWAYS: commaList(z.string().url(), ''),
+    IPFS_HEDGE_DELAY_MS: z.string().default('750').transform(Number).pipe(z.number().int().min(50).max(30000)),
+    IPFS_SINGLE_BLOCK_MAX: z.string().default('262144').transform(Number).pipe(z.number().int().min(1024).max(1048576)),
+    IPFS_RECHECK_HOURS: z.string().default('24').transform(Number).pipe(z.number().int().min(1).max(720)),
+    // Fail boot (instead of warning) on deprecated, reserved or unknown
+    // prefixed variables (#243).
+    CONFIG_STRICT: z.enum(['true', 'false']).default('false').transform((v) => v === 'true'),
     REDIS_URL: z.string().default('redis://localhost:6379'),
 
     // ── HTTP ──────────────────────────────────────────────────────────────
@@ -167,6 +188,19 @@ const envSchema = z
     // JWT_SECRET, AUTH_SIGNING_SECRET or a wallet key. Format documented in
     // docs/contract-requests.md; a missing key in production stops boot.
     ENTITLEMENT_SIGNING_KEY: optionalString,
+    // Dedicated Ed25519 key for signing SEP-7 URI requests (#270); never reused.
+    URI_REQUEST_SIGNING_SECRET: optionalString,
+    // Dedicated Ed25519 key for signing reasoning traces (#273); never reused.
+    TRACE_SIGNING_KEY: optionalString,
+    TRACE_SIGNING_PREVIOUS_KEYS: commaList(
+      z.string().regex(/^[0-9a-f]{64}$/i, 'must be a 64-char hex Ed25519 public key'),
+      '',
+    ),
+    TRACE_SIGNING_REQUIRED: boolDefault('false'),
+    SEP7_ORIGIN_DOMAIN: optionalString,
+    SEP7_CALLBACK_BASE_URL: optionalString,
+    SEP7_TOKEN_TTL_SECONDS: z.string().default('3600').transform(Number)
+      .pipe(z.number().int().min(30).max(86400)),
     AUTH_HOME_DOMAIN: z.string().default('localhost'),
     AUTH_WEB_AUTH_DOMAIN: optionalString,
     // Public keys of previous server signing keys that may still verify
@@ -197,6 +231,16 @@ const envSchema = z
     AUTH_IP_HASH_SALT: optionalString,
     // Express `trust proxy`; a comma list of hops or addresses, or "true".
     TRUST_PROXY: optionalString,
+    // ── Premium session device cap (#288) ────────────────────────────────
+    PREMIUM_MAX_DEVICES: z.string().default('2').transform(Number)
+      .pipe(z.number().int().min(1).max(20)),
+    PREMIUM_DAILY_READ_LIMIT: z.string().default('200').transform(Number)
+      .pipe(z.number().int().min(1)),
+    PREMIUM_DAILY_KEY_RELEASE_LIMIT: z.string().default('50').transform(Number)
+      .pipe(z.number().int().min(1)),
+    // HyperLogLog distinct-IP-prefix threshold for anomaly alerts.
+    PREMIUM_ANOMALY_IP_THRESHOLD: z.string().default('5').transform(Number)
+      .pipe(z.number().int().min(1)),
     REDIS_COMMAND_TIMEOUT_MS: z.string().default('500').transform(Number)
       .pipe(z.number().int().min(50).max(30000)),
     REDIS_CONNECT_TIMEOUT_MS: z.string().default('2000').transform(Number)
@@ -237,6 +281,10 @@ const envSchema = z
     // (see docs/api.md: that makes subscription revenue trading capital).
     PAYMENTS_RECIPIENT: optionalAddress,
     DAILY_PASS_PRICE_RAW: z.string().regex(/^\d+$/, 'must be an integer in 7-decimal base units').default('5000000'),
+    // #224 phase B: false stops writing the Float display mirrors on payments,
+    // subscriptions and allowances (DB defaults of 0 apply). Removed together
+    // with the columns by the pending contract migration.
+    PAYMENT_FLOAT_WRITES: boolDefault('true'),
 
     // ── x402 daily pass (#61) ─────────────────────────────────────────────
     // The facilitator that verifies and settles x402 payments on Stellar.
@@ -268,6 +316,18 @@ const envSchema = z
     // In-memory cache TTL for validated payment requirements.
     X402_PRICE_CACHE_TTL_MS: z.string().default('60000').transform(Number)
       .pipe(z.number().int().min(1000)),
+
+    // ── x402 allowance reservations (#219) ────────────────────────────────
+    // Shared HMAC-SHA256 secret the x402 trace service signs
+    // /x402/allowance/* requests with. Empty disables those endpoints (503).
+    // Dedicated: never X402_KEY_RELEASE_SECRET or another key.
+    X402_ALLOWANCE_HMAC_SECRET: optionalString.refine(
+      (v) => v === '' || v.length >= 32,
+      'must be at least 32 characters',
+    ),
+    // How long a RESERVED charge holds budget before the sweep expires it.
+    X402_ALLOWANCE_RESERVATION_TTL_SECONDS: z.string().default('120').transform(Number)
+      .pipe(z.number().int().min(10).max(3600)),
     // ── Server-issued payment intents (#52) ──────────────────────────────
     // How long a client may take to submit a transaction for an open intent.
     PAYMENT_INTENT_TTL_SECONDS: z.string().default('900').transform(Number)
@@ -374,6 +434,9 @@ const envSchema = z
     // ── Timebounds & Rebuilds (#42) ───────────────────────────────────────
     TIMEOUT_MARKET_CREATE_SECONDS: z.string().default('60').transform(Number).pipe(z.number().int().min(15).max(300)),
     TIMEOUT_TRADE_SECONDS: z.string().default('30').transform(Number).pipe(z.number().int().min(10).max(120)),
+    // #245: seconds after the decision ledger's close time that an agent trade
+    // may still execute (the on-chain deadline for the v2 entrypoints).
+    TRADE_DECISION_TTL_SECONDS: z.string().default('60').transform(Number).pipe(z.number().int().min(1).max(300)),
     TIMEOUT_TRACE_PUBLISH_SECONDS: z.string().default('45').transform(Number).pipe(z.number().int().min(10).max(180)),
     TIMEOUT_MAINTENANCE_SECONDS: z.string().default('30').transform(Number).pipe(z.number().int().min(10).max(120)),
     AUTH_EXPIRY_MARGIN_LEDGERS: z.string().default('12').transform(Number).pipe(z.number().int().min(2).max(100)),
@@ -405,6 +468,20 @@ const envSchema = z
     // (non-news) source before the review may say AGREE.
     DISPUTE_HIGH_VALUE_LIQUIDITY: z.string().default('10000').transform(Number)
       .pipe(z.number().nonnegative()),
+    // Evaluator calibration (#247)
+    // Maximum acceptable one-sided Clopper–Pearson upper bound on the false-silence
+    // rate for a slice to be eligible for threshold enforcement.
+    DISPUTE_TARGET_FALSE_SILENCE_RATE: z.string().default('0.02').transform(Number)
+      .pipe(z.number().gt(0.001).max(0.2)),
+    // Minimum number of AGREE reviews above a candidate threshold before that
+    // threshold qualifies. With 0 errors, 150 reviews are needed for a 2% target.
+    DISPUTE_CALIBRATION_MIN_N: z.string().default('30').transform(Number)
+      .pipe(z.number().int().min(1)),
+    // 'off' = ignore calibration entirely.
+    // 'observe' = log shadow decisions but keep existing behaviour (default).
+    // 'enforce' = apply calibrated threshold; AGREE becomes INSUFFICIENT for
+    //             uncalibrated slices.
+    DISPUTE_CALIBRATED_THRESHOLD: z.enum(['off', 'observe', 'enforce']).default('observe'),
     // The resolver admin (guardian). The resolver has no admin view, so this
     // is configuration; cancel_proposal / guardian_void_market are simulated as it.
     RESOLVER_GUARDIAN_ADDRESS: optionalAddress,
@@ -414,6 +491,38 @@ const envSchema = z
     ALERT_SLACK_WEBHOOK_URL: optionalString.refine((v) => v === '' || URL.canParse(v), 'must be a URL'),
     // HMAC-SHA256 key for the X-OracleDesk-Signature header on generic webhooks.
     ALERT_WEBHOOK_SECRET: optionalString,
+
+    // ── Operational alerts (#226) ─────────────────────────────────────────
+    // Evaluation schedule (one leader per tick via an advisory lock).
+    ALERT_EVAL_CRON: z.string().default('* * * * *'),
+    // Hysteresis: open after N consecutive bad evaluations, resolve after M good.
+    ALERT_OPEN_AFTER: z.string().default('2').transform(Number).pipe(z.number().int().min(1).max(100)),
+    ALERT_RESOLVE_AFTER: z.string().default('3').transform(Number).pipe(z.number().int().min(1).max(100)),
+    // Unacknowledged CRITICAL incidents re-notify this often.
+    ALERT_ESCALATE_EVERY_MS: z.string().default(String(30 * 60_000)).transform(Number).pipe(z.number().int().min(60_000)),
+    // At most one open notification per subject per this period.
+    ALERT_MIN_REOPEN_MS: z.string().default(String(10 * 60_000)).transform(Number).pipe(z.number().int().min(0)),
+    // Outbox rows in SUBMITTED/PENDING older than this are WARN (past maxTime is CRITICAL).
+    ALERT_OUTBOX_STUCK_MS: z.string().default(String(15 * 60_000)).transform(Number).pipe(z.number().int().min(60_000)),
+    // Terminal outbox rows whose completion handler has not run after this long.
+    ALERT_UNHANDLED_MS: z.string().default(String(10 * 60_000)).transform(Number).pipe(z.number().int().min(60_000)),
+    // Consecutive failed runs of one cron job before it alerts.
+    ALERT_CRON_FAILURE_STREAK: z.string().default('3').transform(Number).pipe(z.number().int().min(1)),
+    // Operator pauses are INFO and not alerted unless enabled.
+    ALERT_OPERATOR_PAUSES: boolDefault('false'),
+    // Severity → sink names, e.g. {"CRITICAL":["webhook:0","slack"],"WARN":["slack"]}.
+    // Empty = every sink for WARN and CRITICAL, none for INFO.
+    ALERT_ROUTES_JSON: optionalString.refine((v) => {
+      if (v === '') return true;
+      try {
+        const parsed = JSON.parse(v);
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) &&
+          Object.entries(parsed).every(([k, list]) => ['INFO', 'WARN', 'CRITICAL'].includes(k) &&
+            Array.isArray(list) && list.every((n) => typeof n === 'string'));
+      } catch {
+        return false;
+      }
+    }, 'must be a JSON object of INFO|WARN|CRITICAL → sink-name arrays'),
 
     // ── Transaction outbox (#35) ──────────────────────────────────────────
     // Recovery worker interval; it resolves non-terminal chain_transactions.
@@ -446,6 +555,15 @@ const envSchema = z
     INDEXER_MAX_LAG_LEDGERS: z.string().default('120').transform(Number),
     INDEXER_MAX_STALENESS_MS: z.string().default('60000').transform(Number),
     LIVENESS_MAX_LOOP_DELAY_MS: z.string().default('2000').transform(Number),
+    // Chain-write readiness (#220). auto = live mode && this process runs the
+    // outbox worker (PROCESS_ROLE all|worker); true/false force it. On a
+    // non-writer the outbox/signers/channels probes are no-ops and never critical.
+    HEALTH_CHAIN_WRITER: z.enum(['auto', 'true', 'false']).default('auto'),
+    HEALTH_OUTBOX_MAX_INFLIGHT: z.string().default('50').transform(Number).pipe(z.number().int().min(1)),
+    HEALTH_OUTBOX_MAX_AGE_MS: z.string().default('300000').transform(Number).pipe(z.number().int().min(1)),
+    HEALTH_HANDLER_MAX_STREAK: z.string().default('5').transform(Number).pipe(z.number().int().min(1)),
+    HEALTH_BALANCE_MIN_RUNWAY_HOURS: z.string().default('24').transform(Number).pipe(z.number().min(0)),
+    HEALTH_BALANCE_TTL_MS: z.string().default('60000').transform(Number).pipe(z.number().int().min(0)),
     // Time /readyz reports "draining" before the HTTP server stops accepting.
     SHUTDOWN_DRAIN_MS: z.string().default('5000').transform(Number),
 
@@ -486,6 +604,12 @@ const envSchema = z
     CALIBRATION_WEIGHTING: z.enum(['time', 'last', 'first']).default('time'),
     // Shrink the trader's probability toward 0.5 by the fitted calibration factor.
     CALIBRATION_SHRINKAGE_ENABLED: z.enum(['true', 'false']).default('false').transform((v) => v === 'true'),
+    // #244 recalibration: identity-prior strength (pseudo-markets) and the
+    // largest log-odds intercept a fitted map may apply.
+    RECALIBRATION_PRIOR_STRENGTH: z.string().default('20').transform(Number).pipe(z.number().positive()),
+    RECALIBRATION_MAX_INTERCEPT: z.string().default('0.5').transform(Number).pipe(z.number().min(0).max(2)),
+    // #223 learned source weights: a key fitted on fewer effective samples keeps its parent weight.
+    WEIGHTS_MIN_NEFF: z.string().default('30').transform(Number).pipe(z.number().positive()),
 
     // Build commit, recorded in trace provenance (#66). Set by CI/deploy.
     GIT_SHA: optionalString,
@@ -517,6 +641,9 @@ const envSchema = z
     LLM_ANTHROPIC_RPM: z.string().default('12').transform(Number)
       .pipe(z.number().int().positive()),
     LLM_GEMINI_RPM: z.string().default('15').transform(Number)
+      .pipe(z.number().int().positive()),
+    // OpenAI-compatible calls, router and structured (#218).
+    LLM_OPENAI_RPM: z.string().default('15').transform(Number)
       .pipe(z.number().int().positive()),
     LLM_BREAKER_FAILURE_THRESHOLD: z.string().default('3').transform(Number)
       .pipe(z.number().int().positive()),
@@ -560,6 +687,15 @@ const envSchema = z
     // creation) share the caps between the budget read and the submit.
     TREASURY_HEADROOM_SAFETY_BPS: z.string().default('500').transform(Number)
       .pipe(z.number().int().min(0).max(9_999)),
+    // #266 — fresh-price gating for the trader.
+    /** Indexer lag threshold (ledgers) before the trader prefers a live chain read. Default 12 ≈ 1 min. */
+    TRADER_MAX_PRICE_LAG_LEDGERS: z.string().default('12').transform(Number).pipe(z.number().int().min(1)),
+    /** Max price drift (bps) between decision and execution quote before refusing the order. */
+    TRADER_MAX_PRICE_DRIFT_BPS: z.string().default('150').transform(Number).pipe(z.number().int().min(0)),
+    /** Consecutive stale-price markets that abort the scan cycle with PRICE_SOURCE_DOWN. */
+    TRADER_STALE_ABORT_COUNT: z.string().default('3').transform(Number).pipe(z.number().int().min(1)),
+    /** #225 — max ledgers the reserves the trader sizes against may lag the RPC (valuation DEFAULT_MAX_AGE_LEDGERS). */
+    TRADER_POOL_MAX_AGE_LEDGERS: z.string().default('120').transform(Number).pipe(z.number().int().min(1)),
     // #147 — development-only local IPFS stub selected explicitly.
     IPFS_TRANSPORT: z.enum(['pinata', 'local']).default('pinata'),
     IPFS_LOCAL_DIR: z.string().default('.ipfs-local'),
@@ -589,6 +725,21 @@ const envSchema = z
     SIGNAL_RAW_RETENTION_DAYS: z.string().default('7').transform(Number)
       .pipe(z.number().int().min(1).max(365)),
 
+    // ── Cross-source corroboration (#228) ─────────────────────────────────
+    // off: no check. observe: log the verdict and continue. enforce: an
+    // uncorroborated proposal creates nothing (no row, pin, seed or trace).
+    CORROBORATION_MODE: z.enum(['off', 'observe', 'enforce']).default('observe'),
+    // Independent units (clusters merged by domain and rewrite distance) needed.
+    CORROBORATION_MIN_PUBLISHERS: z.string().default('2').transform(Number).pipe(z.number().int().min(1).max(20)),
+    // Coverage must be published within this many hours before the cycle.
+    CORROBORATION_WINDOW_HOURS: z.string().default('72').transform(Number).pipe(z.number().int().min(1).max(24 * 30)),
+    // SimHash distance under which two clusters are one rewritten story.
+    CORROBORATION_SIMHASH_REWRITE: z.string().default('10').transform(Number).pipe(z.number().int().min(0).max(64)),
+    // Store rows considered per check, newest first.
+    CORROBORATION_MAX_CANDIDATES: z.string().default('500').transform(Number).pipe(z.number().int().min(1).max(10_000)),
+    // Live mode requires enforce unless this is set.
+    CORROBORATION_ALLOW_OBSERVE_LIVE: boolDefault('false'),
+
     // ── Resilience & Timeouts ─────────────────────────────────────────────
     TIMEOUT_RPC_READ_MS: z.string().default('8000').transform(Number),
     TIMEOUT_RPC_WRITE_MS: z.string().default('45000').transform(Number),
@@ -610,6 +761,10 @@ const envSchema = z
     // Request & cycle deadlines
     HTTP_REQUEST_TIMEOUT_MS: z.string().default('30000').transform(Number),
     CYCLE_DEADLINE_MS: z.string().default('600000').transform(Number),
+    // Must exceed CYCLE_DEADLINE_MS so a live cycle never loses its lease.
+    MARKET_RESERVATION_LEASE_MS: z.string().default('660000').transform(Number).pipe(
+      z.number().refine((v) => v > 600000, { message: 'MARKET_RESERVATION_LEASE_MS must exceed CYCLE_DEADLINE_MS (600000)' }),
+    ),
     IPFS_MAX_BYTES: z.string().default('2097152').transform(Number),
 
     // ── Trace Audit (Issue #150) ──────────────────────────────────────────
@@ -655,6 +810,23 @@ const envSchema = z
     CORRELATION_PRIOR_KAPPA: z.string().default('20').transform(Number)
       .pipe(z.number().positive()),
 
+    // ── Portfolio risk (Issue #280) ───────────────────────────────────────
+    // Monte Carlo paths per run, the largest positions kept, the shrinkage
+    // applied to snapshot correlations, and a soft wall-clock budget.
+    RISK_MC_PATHS: z.string().default('20000').transform(Number)
+      .pipe(z.number().int().min(100)),
+    RISK_MAX_MARKETS: z.string().default('150').transform(Number)
+      .pipe(z.number().int().min(1)),
+    RISK_RHO_SHRINK: z.string().default('0.8').transform(Number)
+      .pipe(z.number().min(0).max(1)),
+    RISK_MAX_DURATION_MS: z.string().default('10000').transform(Number)
+      .pipe(z.number().int().positive()),
+    // Expected-shortfall gate (bps of bankroll); off by default. Exported by the
+    // service, not yet enforced by any caller.
+    RISK_GATE_ENABLED: boolDefault('false'),
+    RISK_MAX_ES_BPS: z.string().default('500').transform(Number)
+      .pipe(z.number().int().min(0).max(10_000)),
+
     // ── Market lifecycle reconciler (Issue #83) ───────────────────────────
     RECONCILE_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
     RECONCILE_MAX_MARKETS: z.string().default('200').transform(Number)
@@ -666,6 +838,19 @@ const envSchema = z
     // How far (in ledgers) the indexer may trail an observation before
     // resolution findings are deferred to it.
     RECONCILE_INDEXER_LAG_LEDGERS: z.string().default('20').transform(Number)
+      .pipe(z.number().int().min(0)),
+
+    // ── Money audit (Issue #222) ──────────────────────────────────────────
+    MONEY_AUDIT_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
+    // Guarded repairs (re-running idempotent handlers); off by default.
+    MONEY_AUDIT_AUTO_REPAIR: z.enum(['true', 'false']).default('false').transform((v) => v === 'true'),
+    // A subject updated this recently is in flight, not drift.
+    MONEY_AUDIT_GRACE_MS: z.string().default('120000').transform(Number)
+      .pipe(z.number().int().min(0)),
+    // A PENDING trade with no in-flight outbox row older than this is stuck.
+    MONEY_AUDIT_PENDING_GRACE_MS: z.string().default('3600000').transform(Number)
+      .pipe(z.number().int().min(0)),
+    MONEY_AUDIT_MAX_RPC_CALLS: z.string().default('200').transform(Number)
       .pipe(z.number().int().min(0)),
 
     // ── Copy Trading (Issue #151) ─────────────────────────────────────────
@@ -696,7 +881,9 @@ const envSchema = z
     CHAIN_CACHE_TTL_MS: z.string().default('5000').transform(Number),
     CHAIN_CACHE_NEG_TTL_MS: z.string().default('2000').transform(Number),
     CHAIN_CACHE_WAIT_MS: z.string().default('1500').transform(Number),
-  })
+  });
+
+export const envSchema = envObjectSchema
   .superRefine((env, ctx) => {
     // ── Login signing-key rotation (#48) ──
     const currentPublic =
@@ -760,6 +947,29 @@ const envSchema = z
     if (env.NODE_ENV === 'production' && env.IPFS_TRANSPORT === 'local') {
       ctx.addIssue({ code: 'custom', path: ['IPFS_TRANSPORT'], message: 'local IPFS is development-only' });
     }
+    if (env.NODE_ENV === 'production' && env.IPFS_MIN_REPLICAS < 2) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['IPFS_MIN_REPLICAS'],
+        message: 'must be >= 2 in production for redundant IPFS pin replication',
+      });
+    }
+    if (env.PROCESS_ROLE === 'indexer') {
+      if (!env.INDEXER_ENABLED) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['INDEXER_ENABLED'],
+          message: 'must be true when PROCESS_ROLE=indexer',
+        });
+      }
+      if (!env.EVENT_BUS_ENABLED) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['EVENT_BUS_ENABLED'],
+          message: 'must be true when PROCESS_ROLE=indexer so published events reach api pods',
+        });
+      }
+    }
     if (env.X402_ENABLED) {
       if (!env.X402_FACILITATOR_URL) {
         ctx.addIssue({ code: 'custom', path: ['X402_FACILITATOR_URL'], message: 'is required when X402_ENABLED=true' });
@@ -771,6 +981,13 @@ const envSchema = z
       }
     }
     if (env.CHAIN_EXECUTION_MODE === 'live') {
+      if (env.CORROBORATION_MODE !== 'enforce' && !env.CORROBORATION_ALLOW_OBSERVE_LIVE) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['CORROBORATION_MODE'],
+          message: 'must be enforce when CHAIN_EXECUTION_MODE=live (or set CORROBORATION_ALLOW_OBSERVE_LIVE=true)',
+        });
+      }
       if (!env.AGENT_SECRET_KEY) {
         ctx.addIssue({ code: 'custom', path: ['AGENT_SECRET_KEY'], message: 'is required when CHAIN_EXECUTION_MODE=live' });
       }
@@ -799,6 +1016,34 @@ const envSchema = z
       }
       if (env.FEE_PAYER_SECRET === env.AUTH_SIGNING_SECRET) {
         ctx.addIssue({ code: 'custom', path: ['FEE_PAYER_SECRET'], message: 'must differ from AUTH_SIGNING_SECRET' });
+      }
+    }
+    if (env.X402_ALLOWANCE_HMAC_SECRET) {
+      for (const [label, other] of [
+        ['X402_KEY_RELEASE_SECRET', env.X402_KEY_RELEASE_SECRET],
+        ['JWT_SECRET', env.JWT_SECRET],
+      ] as const) {
+        if (other && env.X402_ALLOWANCE_HMAC_SECRET === other) {
+          ctx.addIssue({ code: 'custom', path: ['X402_ALLOWANCE_HMAC_SECRET'], message: `must differ from ${label}` });
+        }
+      }
+    }
+    if (env.URI_REQUEST_SIGNING_SECRET) {
+      if (!StrKey.isValidEd25519SecretSeed(env.URI_REQUEST_SIGNING_SECRET)) {
+        ctx.addIssue({ code: 'custom', path: ['URI_REQUEST_SIGNING_SECRET'], message: 'must be a Stellar secret seed (S…)' });
+      }
+      if (env.URI_REQUEST_SIGNING_SECRET === env.AUTH_SIGNING_SECRET) {
+        ctx.addIssue({ code: 'custom', path: ['URI_REQUEST_SIGNING_SECRET'], message: 'must differ from AUTH_SIGNING_SECRET' });
+      }
+      if (env.URI_REQUEST_SIGNING_SECRET === env.AGENT_SECRET_KEY) {
+        ctx.addIssue({ code: 'custom', path: ['URI_REQUEST_SIGNING_SECRET'], message: 'must differ from AGENT_SECRET_KEY' });
+      }
+      if (env.URI_REQUEST_SIGNING_SECRET === env.FEE_PAYER_SECRET) {
+        ctx.addIssue({ code: 'custom', path: ['URI_REQUEST_SIGNING_SECRET'], message: 'must differ from FEE_PAYER_SECRET' });
+      }
+      const cbBase = env.SEP7_CALLBACK_BASE_URL || env.PUBLIC_API_BASE_URL;
+      if (env.NODE_ENV === 'production' && cbBase && !cbBase.startsWith('https://')) {
+        ctx.addIssue({ code: 'custom', path: ['SEP7_CALLBACK_BASE_URL'], message: 'must use https:// in production' });
       }
     }
 
@@ -867,6 +1112,50 @@ const envSchema = z
         }
       }
     }
+    // ── Trace signing key validation (#273) ──
+    if (env.TRACE_SIGNING_KEY) {
+      let tracePubHex: string | null = null;
+      const trimmed = env.TRACE_SIGNING_KEY.trim();
+      try {
+        if (StrKey.isValidEd25519SecretSeed(trimmed)) {
+          tracePubHex = Buffer.from(Keypair.fromSecret(trimmed).rawPublicKey()).toString('hex');
+        } else if (/^[0-9a-f]{64}$/i.test(trimmed)) {
+          tracePubHex = Buffer.from(Keypair.fromRawEd25519Seed(Buffer.from(trimmed, 'hex')).rawPublicKey()).toString('hex');
+        } else {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['TRACE_SIGNING_KEY'],
+            message: 'must be a Stellar secret seed (S…) or 64-char hex Ed25519 seed',
+          });
+        }
+      } catch {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['TRACE_SIGNING_KEY'],
+          message: 'must be a valid Ed25519 seed',
+        });
+      }
+      if (tracePubHex) {
+        const otherSecrets: Array<[string, string | undefined]> = [
+          ['AGENT_SECRET_KEY', env.AGENT_SECRET_KEY],
+          ['AUTH_SIGNING_SECRET', env.AUTH_SIGNING_SECRET],
+          ['FEE_PAYER_SECRET', env.FEE_PAYER_SECRET],
+          ['URI_REQUEST_SIGNING_SECRET', env.URI_REQUEST_SIGNING_SECRET],
+          ...channelKeys.map((k, idx) => [`CHANNEL_SECRET_KEYS[${idx}]`, k] as [string, string]),
+        ];
+        for (const [label, other] of otherSecrets) {
+          if (!other || !StrKey.isValidEd25519SecretSeed(other)) continue;
+          const otherPubHex = Buffer.from(Keypair.fromSecret(other).rawPublicKey()).toString('hex');
+          if (otherPubHex === tracePubHex) {
+            ctx.addIssue({
+              code: 'custom',
+              path: ['TRACE_SIGNING_KEY'],
+              message: `must differ from ${label}`,
+            });
+          }
+        }
+      }
+    }
     if (env.FEE_POLICY_JSON) {
       try {
         const parsed = JSON.parse(env.FEE_POLICY_JSON);
@@ -922,6 +1211,11 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     throw new ConfigError(`Invalid environment configuration:\n  ${err instanceof Error ? err.message : String(err)}`);
   }
 
+  // #243: keys that are set but do nothing. Computed on the raw env so
+  // <SECRET>_FILE names are still visible.
+  const configWarnings = collectConfigWarnings(env, Object.keys(envObjectSchema.shape), SECRET_NAMES);
+  applyDeprecatedAliases(resolvedEnv);
+
   if (resolvedEnv.CHAIN_CACHE_ENABLED === undefined) {
     resolvedEnv.CHAIN_CACHE_ENABLED = (resolvedEnv.NODE_ENV || env.NODE_ENV) === 'test' ? 'false' : 'true';
   }
@@ -932,6 +1226,14 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     throw new ConfigError(`Invalid environment configuration:\n${lines.join('\n')}`);
   }
   const data = parsed.data;
+  if (configWarnings.length > 0) {
+    if (data.CONFIG_STRICT) {
+      throw new ConfigError(
+        `Invalid environment configuration (CONFIG_STRICT=true):\n${configWarnings.map((w) => `  ${w.message}`).join('\n')}`,
+      );
+    }
+    if (data.NODE_ENV !== 'test') emitConfigWarnings(configWarnings);
+  }
   // Using <NAME>_FILE implies the file provider, so refresh re-reads the
   // mounts instead of the (possibly empty) plain environment variable.
   if (
@@ -965,6 +1267,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     ephemeralSecrets.push('ENTITLEMENT_SIGNING_KEY');
   }
   if (!data.AUTH_WEB_AUTH_DOMAIN) data.AUTH_WEB_AUTH_DOMAIN = data.AUTH_HOME_DOMAIN;
+  if (!data.SEP7_ORIGIN_DOMAIN) data.SEP7_ORIGIN_DOMAIN = data.AUTH_HOME_DOMAIN;
+  if (!data.SEP7_CALLBACK_BASE_URL) data.SEP7_CALLBACK_BASE_URL = data.PUBLIC_API_BASE_URL;
   if (!data.SEP45_RPC_URL) data.SEP45_RPC_URL = data.STELLAR_RPC_URL;
   if (!data.AUTH_IP_HASH_SALT) {
     // A per-process salt still makes IPs unlinkable across instances; set

@@ -60,7 +60,7 @@ router.get(
   cachePolicy(async (req) => {
     if (!req.headers.authorization) {
       const trace = await prisma.reasoningTrace.findUnique({
-        where: { id: req.params.id },
+        where: { id: String(req.params.id) },
         select: { onChainTraceId: true },
       });
       if (trace && trace.onChainTraceId !== null) {
@@ -71,7 +71,7 @@ router.get(
   }),
   validator(async (req) => {
     const trace = await prisma.reasoningTrace.findUnique({
-      where: { id: req.params.id },
+      where: { id: String(req.params.id) },
       select: { id: true, updatedAt: true, verified: true, onChainTraceId: true },
     });
     if (!trace) return null;
@@ -84,5 +84,7 @@ router.get(
 // Idempotency-Key optional (#123). Lock is 60s by default, above verify's 20s IPFS timeout.
 router.post('/verify', requireAuth, idempotent(), verifyTrace);
 router.post('/:id/unlock', requireAuth, idempotent(), unlockTrace);
+// Envelope data key for a sealed trace (#154); entitled users only, never cached.
+router.get('/:id/key', requireAuth, noStore(), getTraceKey);
 
 export default router;

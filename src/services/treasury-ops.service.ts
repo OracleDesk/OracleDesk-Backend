@@ -18,7 +18,14 @@ import {
 } from '@stellar/stellar-sdk';
 import type { AssembledTransaction } from '@stellar/stellar-sdk/contract';
 import { config } from '../config';
+import { secret } from '../config/secrets';
 import { CONTRACTS } from '../config/contracts';
+import {
+  buildTxUri,
+  generateSep7Token,
+  hashSep7Token,
+  isQrTooLarge,
+} from './sep7.service';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { formatUsdc, parseU64, parseUsdc } from '../lib/amounts';
@@ -98,6 +105,7 @@ export interface SignatureRecord {
   signature: string;
   addedAt: string;
   addedBy: string;
+  channel?: 'paste' | 'sep7';
 }
 
 export interface OpsDeps {
@@ -473,18 +481,127 @@ function parseSignatures(row: { signatures: unknown }): SignatureRecord[] {
   return Array.isArray(row.signatures) ? (row.signatures as unknown as SignatureRecord[]) : [];
 }
 
+function eligibleEd25519Signers(account: AccountState): AccountSigner[] {
+  const list: AccountSigner[] = [
+    ...(account.masterWeight > 0 ? [{ key: account.address, kind: 'ed25519' as const, weight: account.masterWeight }] : []),
+    ...account.signers.filter((s) => s.kind === 'ed25519' && s.weight > 0),
+  ];
+  const dedup = new Map<string, AccountSigner>();
+  for (const s of list) {
+    if (!dedup.has(s.key)) dedup.set(s.key, s);
+  }
+  return [...dedup.values()];
+}
+
+/**
+ * Pure signature-extraction and weight-accounting step shared by paste and
+ * SEP-7 callback channels (#270).
+ */
+export function acceptSignatures(
+  row: { kind: string; unsignedXdr: string; txHash: string; signatures: unknown },
+  incomingTx: { hash(): Buffer; signatures?: Array<{ hint(): Buffer; signature(): Buffer }> },
+  account: AccountState,
+  now: number,
+  addedBy: string,
+  channel: 'paste' | 'sep7' = 'paste',
+): {
+  status: 'READY' | 'PARTIALLY_SIGNED';
+  weightCollected: number;
+  requiredSigners: number;
+  signatures: SignatureRecord[];
+  newlyAccepted: string[];
+  signedXdr: string;
+} {
+  const existing = parseSignatures(row);
+  const seenSigners = new Set(existing.map((s) => s.signer));
+  const records = [...existing];
+  const newlyAccepted: string[] = [];
+  const required = Math.max(
+    1,
+    account.thresholds.high,
+    row.kind === 'treasury.withdraw' ? config.TREASURY_WITHDRAW_MIN_SIGNERS : 0,
+  );
+
+  const candidates = eligibleEd25519Signers(account);
+
+  for (const sig of incomingTx.signatures ?? []) {
+    const hint = sig.hint();
+    const match = candidates.find((candidate) => {
+      if (candidate.kind !== 'ed25519') return false;
+      try {
+        return Keypair.fromPublicKey(candidate.key).signatureHint().equals(hint);
+      } catch {
+        return false;
+      }
+    });
+    if (!match || seenSigners.has(match.key)) continue;
+    let valid = false;
+    try {
+      valid = Keypair.fromPublicKey(match.key).verify(incomingTx.hash(), sig.signature());
+    } catch {
+      valid = false;
+    }
+    if (!valid) continue;
+    seenSigners.add(match.key);
+    newlyAccepted.push(match.key);
+    records.push({
+      signer: match.key,
+      hint: hint.toString('hex'),
+      signature: sig.signature().toString('base64'),
+      addedAt: new Date(now).toISOString(),
+      addedBy,
+      channel,
+    });
+  }
+
+  const merged = TransactionBuilder.fromXDR(row.unsignedXdr, config.STELLAR_NETWORK_PASSPHRASE) as unknown as {
+    addDecoratedSignature(sig: unknown): void;
+    toXDR(): string;
+  };
+  for (const record of records) {
+    merged.addDecoratedSignature(
+      new xdr.DecoratedSignature({ hint: Buffer.from(record.hint, 'hex'), signature: Buffer.from(record.signature, 'base64') }),
+    );
+  }
+  const weightCollected = records.reduce((sum, record) => {
+    const signer = candidates.find((candidate) => candidate.key === record.signer);
+    return sum + (signer?.weight ?? 0);
+  }, 0);
+
+  const status = weightCollected >= required ? 'READY' : 'PARTIALLY_SIGNED';
+  return {
+    status,
+    weightCollected,
+    requiredSigners: required,
+    signatures: records,
+    newlyAccepted,
+    signedXdr: merged.toXDR(),
+  };
+}
+
+async function revokeOpenSep7Requests(operationId: string): Promise<void> {
+  await (prisma as any).sep7Request
+    ?.updateMany({
+      where: { operationId, status: 'ISSUED' },
+      data: { status: 'REVOKED' },
+    })
+    .catch(() => {});
+}
+
 /** Merges a signed XDR into the prepared operation after hash/signature checks. */
 export async function addSignature(
   operationId: string,
   signedXdr: string,
   addedBy: string,
   deps: OpsDeps = {},
+  channel: 'paste' | 'sep7' = 'paste',
 ): Promise<{ status: string; weightCollected: number; requiredSigners: number; signatures: SignatureRecord[] }> {
   const row = await prisma.adminOperation.findUnique({ where: { id: operationId } });
   if (!row) throw new AppError(404, 'ADMIN_OP_NOT_FOUND', 'Admin operation not found');
   const now = nowMs(deps);
   if (row.expiresAt.getTime() <= now || row.status === 'EXPIRED') {
     await prisma.adminOperation.update({ where: { id: row.id }, data: { status: 'EXPIRED' } });
+    await revokeOpenSep7Requests(row.id);
     await audit(row.id, 'EXPIRED', addedBy);
     throw new AppError(410, 'ADMIN_OP_EXPIRED', 'This operation has expired; prepare a new one');
   }
@@ -507,76 +624,284 @@ export async function addSignature(
   const admin = (row.sourceAccount && (deps.account ? await deps.account(row.sourceAccount) : await readAccount(row.sourceAccount))) || null;
   if (!admin) throw new AppError(503, 'ADMIN_STATE_UNAVAILABLE', 'Could not read the admin account state');
 
-  const existing = parseSignatures(row);
-  const seenSigners = new Set(existing.map((s) => s.signer));
-  const records = [...existing];
-  const required = Math.max(
-    1,
-    admin.thresholds.high,
-    row.kind === 'treasury.withdraw' ? config.TREASURY_WITHDRAW_MIN_SIGNERS : 0,
-  );
+  const accepted = acceptSignatures(row, incomingTx, admin, now, addedBy, channel);
 
-  const candidates: AccountSigner[] = [
-    ...(admin.masterWeight > 0 ? [{ key: admin.address, kind: 'ed25519' as const, weight: admin.masterWeight }] : []),
-    ...admin.signers,
-  ];
-
-  for (const sig of incomingTx.signatures ?? []) {
-    const hint = sig.hint();
-    const match = candidates.find((candidate) => {
-      if (candidate.kind !== 'ed25519') return false;
-      try {
-        return Keypair.fromPublicKey(candidate.key).signatureHint().equals(hint);
-      } catch {
-        return false;
-      }
-    });
-    if (!match || seenSigners.has(match.key)) continue;
-    let valid = false;
-    try {
-      valid = Keypair.fromPublicKey(match.key).verify(incomingTx.hash(), sig.signature());
-    } catch {
-      valid = false;
-    }
-    if (!valid) continue;
-    seenSigners.add(match.key);
-    records.push({
-      signer: match.key,
-      hint: hint.toString('hex'),
-      signature: sig.signature().toString('base64'),
-      addedAt: new Date(now).toISOString(),
-      addedBy,
-    });
-  }
-
-  // Rebuild the envelope with every accepted signature.
-  const merged = TransactionBuilder.fromXDR(row.unsignedXdr, config.STELLAR_NETWORK_PASSPHRASE) as unknown as {
-    addDecoratedSignature(sig: unknown): void;
-  };
-  for (const record of records) {
-    merged.addDecoratedSignature(
-      new xdr.DecoratedSignature({ hint: Buffer.from(record.hint, 'hex'), signature: Buffer.from(record.signature, 'base64') }),
-    );
-  }
-  const weightCollected = records.reduce((sum, record) => {
-    const signer = candidates.find((candidate) => candidate.key === record.signer);
-    return sum + (signer?.weight ?? 0);
-  }, 0);
-
-  const status = weightCollected >= required ? 'READY' : 'PARTIALLY_SIGNED';
-  const signedXdrOut = (merged as unknown as { toXDR(): string }).toXDR();
   await prisma.adminOperation.update({
     where: { id: row.id },
     data: {
-      signedXdr: signedXdrOut,
-      signatures: records as unknown as object,
-      weightCollected,
-      status,
+      signedXdr: accepted.signedXdr,
+      signatures: accepted.signatures as unknown as object,
+      weightCollected: accepted.weightCollected,
+      status: accepted.status,
     },
   });
-  await audit(row.id, status, addedBy, { weightCollected, required });
+  if (accepted.status === 'READY') {
+    await revokeOpenSep7Requests(row.id);
+  }
+  await audit(row.id, accepted.status, addedBy, {
+    weightCollected: accepted.weightCollected,
+    required: accepted.requiredSigners,
+    channel,
+  });
 
-  return { status, weightCollected, requiredSigners: required, signatures: records };
+  return {
+    status: accepted.status,
+    weightCollected: accepted.weightCollected,
+    requiredSigners: accepted.requiredSigners,
+    signatures: accepted.signatures,
+  };
+}
+
+function resolveSep7SigningSecret(): string {
+  try {
+    return secret('URI_REQUEST_SIGNING_SECRET') || config.URI_REQUEST_SIGNING_SECRET;
+  } catch {
+    return config.URI_REQUEST_SIGNING_SECRET;
+  }
+}
+
+/**
+ * Issues single-use signed SEP-7 URIs for every unsigned eligible ed25519
+ * signer on a prepared/partially-signed treasury operation (#270). Re-issuing
+ * rotates tokens and revokes previously issued tokens.
+ */
+export async function issueSep7Requests(
+  operationId: string,
+  actor: string,
+  deps: OpsDeps = {},
+): Promise<
+  Array<{
+    signer: string;
+    weight: number;
+    uri: string;
+    qrTooLarge: boolean;
+    expiresAt: string;
+    status: string;
+  }>
+> {
+  const signingSecret = resolveSep7SigningSecret();
+  if (!signingSecret) {
+    throw new AppError(503, 'SEP7_NOT_CONFIGURED', 'URI_REQUEST_SIGNING_SECRET is not configured');
+  }
+
+  const row = await prisma.adminOperation.findUnique({ where: { id: operationId } });
+  if (!row) throw new AppError(404, 'ADMIN_OP_NOT_FOUND', 'Admin operation not found');
+  const now = nowMs(deps);
+  if (row.expiresAt.getTime() <= now || row.status === 'EXPIRED') {
+    await prisma.adminOperation.update({ where: { id: row.id }, data: { status: 'EXPIRED' } });
+    await revokeOpenSep7Requests(row.id);
+    throw new AppError(410, 'ADMIN_OP_EXPIRED', 'This operation has expired; prepare a new one');
+  }
+  if (!['PREPARED', 'PARTIALLY_SIGNED'].includes(row.status)) {
+    throw new AppError(409, 'ADMIN_OP_NOT_SIGNABLE', `Operation is ${row.status}`);
+  }
+
+  const admin = (row.sourceAccount && (deps.account ? await deps.account(row.sourceAccount) : await readAccount(row.sourceAccount))) || null;
+  if (!admin) throw new AppError(503, 'ADMIN_STATE_UNAVAILABLE', 'Could not read the admin account state');
+
+  const signedSet = new Set(parseSignatures(row).map((s) => s.signer));
+  const signers = eligibleEd25519Signers(admin).filter((s) => !signedSet.has(s.key));
+  const signingKey = Keypair.fromSecret(signingSecret);
+  const expiresAtMs = Math.min(row.expiresAt.getTime(), now + config.SEP7_TOKEN_TTL_SECONDS * 1000);
+  const expiresAt = new Date(expiresAtMs);
+  const callbackBase = (config.SEP7_CALLBACK_BASE_URL || config.PUBLIC_API_BASE_URL).replace(/\/+$/, '');
+  const originDomain = config.SEP7_ORIGIN_DOMAIN || config.AUTH_HOME_DOMAIN;
+  const summary = typeof (row as any).summary === 'string' && (row as any).summary
+    ? String((row as any).summary)
+    : `Approve ${row.kind}`;
+
+  const issued: Array<{
+    signer: string;
+    weight: number;
+    uri: string;
+    qrTooLarge: boolean;
+    expiresAt: string;
+    status: string;
+  }> = [];
+
+  for (const s of signers) {
+    const token = generateSep7Token();
+    const tokenHash = hashSep7Token(token);
+    const callback = `url:${callbackBase}/sep7/callback/${token}`;
+    const uri = buildTxUri(
+      {
+        xdr: row.unsignedXdr,
+        callback,
+        pubkey: s.key,
+        msg: summary,
+        networkPassphrase: config.STELLAR_NETWORK_PASSPHRASE,
+        originDomain,
+      },
+      signingKey,
+    );
+
+    // Store only the redacted URI placeholder and SHA-256 tokenHash in DB so raw tokens are never persisted.
+    const storedRedactedUri = uri.replace(encodeURIComponent(token), '[redacted]');
+    await (prisma as any).sep7Request.upsert({
+      where: { operationId_signer: { operationId: row.id, signer: s.key } },
+      create: {
+        operationId: row.id,
+        signer: s.key,
+        tokenHash,
+        status: 'ISSUED',
+        uri: storedRedactedUri,
+        expiresAt,
+      },
+      update: {
+        tokenHash,
+        status: 'ISSUED',
+        uri: storedRedactedUri,
+        expiresAt,
+        usedAt: null,
+        rejectCode: null,
+      },
+    });
+
+    issued.push({
+      signer: s.key,
+      weight: s.weight,
+      uri,
+      qrTooLarge: isQrTooLarge(uri),
+      expiresAt: expiresAt.toISOString(),
+      status: 'ISSUED',
+    });
+  }
+
+  await audit(row.id, 'SEP7_ISSUED', actor, { count: issued.length });
+  return issued;
+}
+
+/** Returns per-signer SEP-7 status without ever returning raw callback tokens. */
+export async function getSep7Status(operationId: string) {
+  const row = await prisma.adminOperation.findUnique({ where: { id: operationId } });
+  if (!row) throw new AppError(404, 'ADMIN_OP_NOT_FOUND', 'Admin operation not found');
+  const requests: Array<{
+    signer: string;
+    status: string;
+    expiresAt: Date;
+    usedAt: Date | null;
+    rejectCode: string | null;
+  }> = (await (prisma as any).sep7Request?.findMany({
+    where: { operationId },
+    select: { signer: true, status: true, expiresAt: true, usedAt: true, rejectCode: true },
+  })) ?? [];
+  return requests;
+}
+
+/**
+ * Handles an unauthenticated wallet SEP-7 callback (`POST /sep7/callback/:token`) (#270).
+ */
+export async function handleSep7Callback(
+  token: string,
+  signedXdr: string,
+  io?: { to(room: string): { emit(event: string, payload: unknown): void } },
+  deps: OpsDeps = {},
+): Promise<{ status: string; weightCollected: number; requiredSigners: number; signatures: SignatureRecord[] }> {
+  const tokenHash = hashSep7Token(token);
+  const reqRow = await (prisma as any).sep7Request.findUnique({ where: { tokenHash } });
+  const now = nowMs(deps);
+
+  if (!reqRow || reqRow.status !== 'ISSUED' || new Date(reqRow.expiresAt).getTime() <= now) {
+    throw new AppError(410, 'SEP7_TOKEN_INVALID', 'Signing request is no longer valid');
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = TransactionBuilder.fromXDR(signedXdr, config.STELLAR_NETWORK_PASSPHRASE);
+  } catch {
+    throw new AppError(400, 'INVALID_SIGNED_XDR', 'xdr is not a valid Stellar transaction envelope');
+  }
+
+  // Reject fee-bump envelopes.
+  if (parsed && typeof parsed === 'object' && 'innerTransaction' in parsed) {
+    throw new AppError(400, 'FEE_BUMP_NOT_ALLOWED', 'Fee-bump envelopes are not accepted for SEP-7 signing');
+  }
+
+  const incomingTx = parsed as { hash(): Buffer; signatures?: Array<{ hint(): Buffer; signature(): Buffer }> };
+  const expectedKey = Keypair.fromPublicKey(reqRow.signer);
+  const expectedHint = expectedKey.signatureHint();
+  const hasExpectedSignerSig = (incomingTx.signatures ?? []).some((sig) => {
+    try {
+      return sig.hint().equals(expectedHint) && expectedKey.verify(incomingTx.hash(), sig.signature());
+    } catch {
+      return false;
+    }
+  });
+  if (!hasExpectedSignerSig) {
+    throw new AppError(400, 'SIGNER_SIGNATURE_MISSING', 'Envelope does not contain a valid signature from the expected signer');
+  }
+
+  const row = await prisma.adminOperation.findUnique({ where: { id: reqRow.operationId } });
+  if (!row || row.expiresAt.getTime() <= now || !['PREPARED', 'PARTIALLY_SIGNED'].includes(row.status)) {
+    await revokeOpenSep7Requests(reqRow.operationId);
+    throw new AppError(410, 'SEP7_TOKEN_INVALID', 'Signing request is no longer valid');
+  }
+
+  if (incomingTx.hash().toString('hex') !== row.txHash) {
+    throw new AppError(409, 'ADMIN_OP_HASH_MISMATCH', 'Signed transaction body does not match the prepared operation');
+  }
+
+  const admin = (row.sourceAccount && (deps.account ? await deps.account(row.sourceAccount) : await readAccount(row.sourceAccount))) || null;
+  if (!admin) throw new AppError(503, 'ADMIN_STATE_UNAVAILABLE', 'Could not read the admin account state');
+
+  const isStillSigner = eligibleEd25519Signers(admin).some((s) => s.key === reqRow.signer);
+  if (!isStillSigner) {
+    await (prisma as any).sep7Request.update({
+      where: { id: reqRow.id },
+      data: { status: 'REJECTED', rejectCode: 'NOT_A_SIGNER' },
+    });
+    throw new AppError(403, 'NOT_A_SIGNER', 'Signer is no longer authorized on the source account');
+  }
+
+  // Compare-and-set single-use transition inside a transaction so concurrent
+  // callbacks with the same token result in exactly one winner.
+  const accepted = acceptSignatures(row, incomingTx, admin, now, `sep7:${reqRow.signer}`, 'sep7');
+  await prisma.$transaction(async (tx: any) => {
+    const claimed = await tx.sep7Request.updateMany({
+      where: { id: reqRow.id, status: 'ISSUED' },
+      data: { status: 'USED', usedAt: new Date(now) },
+    });
+    if (claimed.count !== 1) {
+      throw new AppError(410, 'SEP7_TOKEN_INVALID', 'Signing request is no longer valid');
+    }
+    await tx.adminOperation.update({
+      where: { id: row.id },
+      data: {
+        signedXdr: accepted.signedXdr,
+        signatures: accepted.signatures as unknown as object,
+        weightCollected: accepted.weightCollected,
+        status: accepted.status,
+      },
+    });
+    if (accepted.status === 'READY') {
+      await tx.sep7Request.updateMany({
+        where: { operationId: row.id, status: 'ISSUED' },
+        data: { status: 'REVOKED' },
+      });
+    }
+  });
+
+  await audit(row.id, accepted.status, `sep7:${reqRow.signer}`, {
+    weightCollected: accepted.weightCollected,
+    required: accepted.requiredSigners,
+    channel: 'sep7',
+  });
+
+  io?.to('admins').emit('ADMIN_OP_SIGNATURE_ADDED', {
+    operationId: row.id,
+    signer: reqRow.signer,
+    channel: 'sep7',
+    status: accepted.status,
+    weightCollected: accepted.weightCollected,
+    requiredSigners: accepted.requiredSigners,
+  });
+
+  return {
+    status: accepted.status,
+    weightCollected: accepted.weightCollected,
+    requiredSigners: accepted.requiredSigners,
+    signatures: accepted.signatures,
+  };
 }
 
 /** Submits a READY operation and records its final result. No server key is used. */
@@ -666,13 +991,33 @@ export async function cancelOperation(operationId: string, actor: string): Promi
     throw new AppError(409, 'ADMIN_OP_NOT_CANCELLABLE', `Operation is ${row.status}`);
   }
   await prisma.adminOperation.update({ where: { id: row.id }, data: { status: 'CANCELLED' } });
+  await revokeOpenSep7Requests(row.id);
   await audit(row.id, 'CANCELLED', actor);
 }
 
 export async function getOperation(operationId: string) {
   const row = await prisma.adminOperation.findUnique({ where: { id: operationId } });
   if (!row) throw new AppError(404, 'ADMIN_OP_NOT_FOUND', 'Admin operation not found');
-  return row;
+  const sep7Requests: Array<{ signer: string; status: string; expiresAt: Date }> =
+    (await (prisma as any).sep7Request?.findMany?.({
+      where: { operationId },
+      select: { signer: true, status: true, expiresAt: true },
+    })) ?? [];
+  const sigBySigner = new Map(parseSignatures(row).map((s) => [s.signer, s]));
+  const reqBySigner = new Map(sep7Requests.map((r) => [r.signer, r]));
+  const allSigners = new Set([...sigBySigner.keys(), ...reqBySigner.keys()]);
+  const signers = [...allSigners].map((key) => {
+    const sig = sigBySigner.get(key);
+    const req = reqBySigner.get(key);
+    return {
+      key,
+      signed: Boolean(sig),
+      channel: sig?.channel ?? null,
+      sep7Status: req?.status ?? null,
+      sep7ExpiresAt: req?.expiresAt ? new Date(req.expiresAt).toISOString() : null,
+    };
+  });
+  return { ...row, signers };
 }
 
 export async function listOperations(page: number, limit: number) {

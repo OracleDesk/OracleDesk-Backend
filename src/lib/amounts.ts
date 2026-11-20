@@ -37,6 +37,22 @@ export function toDisplayUsdc(raw: bigint): number {
   return Number(formatUsdc(raw));
 }
 
+/** A probability/price in [0,1] projected to integer basis points. */
+export function priceToBps(value: number): number {
+  if (!Number.isFinite(value) || value < 0 || value > 1) {
+    throw new Error(`Invalid probability price: ${value}`);
+  }
+  return Math.round(value * 10_000);
+}
+
+/** Effective price in basis points from exact collateral and share amounts. */
+export function priceBpsFromRaw(collateralRaw: bigint, sharesRaw: bigint): number | null {
+  if (collateralRaw < 0n || sharesRaw < 0n) throw new Error('Price amounts must be non-negative');
+  if (sharesRaw === 0n) return null;
+  const bps = (collateralRaw * 10_000n + sharesRaw / 2n) / sharesRaw;
+  return Number(bps > 10_000n ? 10_000n : bps);
+}
+
 /** Parses a decimal u64 string such as an on-chain market id. */
 export function parseU64(input: string): bigint | null {
   if (!/^\d{1,20}$/.test(input)) return null;

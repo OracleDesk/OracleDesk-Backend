@@ -2,7 +2,7 @@ import type { Response } from 'express';
 import { currentContext } from '../lib/context';
 import type { ApiResponse, ApiError, PaginationMeta } from '../types';
 import { canonicalJson, sha256Hex } from './hash.util';
-import { checkETagMatch } from '../middlewares/cache.middleware';
+import { checkETagMatch } from './etag.util';
 
 /**
  * Send a successful 2xx response

@@ -6,15 +6,27 @@ import hpp from 'hpp';
 
 import { config } from './config';
 import { logger } from './lib/logger';
+import type { RequestContext } from './lib/context';
 import { acceptInboundId, currentContext, newId, runInContext, runWithContext } from './lib/context';
+
+declare global {
+  namespace Express {
+    interface Locals {
+      requestContext?: RequestContext;
+    }
+  }
+}
 import { sendError } from './utils/response.util';
 import { errorMiddleware } from './middlewares/error.middleware';
 import { globalLimiter } from './middlewares/rate-limit.middleware';
 import { abortMiddleware } from './middlewares/abort.middleware';
 import router from './routes';
+import wellKnownRouter from './routes/well-known.routes';
+import sep7Router from './routes/sep7.routes';
 import { createHealthRouter } from './routes/health.routes';
 import { health } from './services/health.service';
 import { isAllowedOrigin, socketMetrics } from './lib/socket-limits';
+import { captureRawBody } from './middlewares/service-auth.middleware';
 
 const app = express();
 
@@ -32,6 +44,23 @@ if (config.TRUST_PROXY) {
 
 // BigInt (u64 market ids, i128 amounts) serialises as a decimal string.
 app.set('json replacer', (_key: string, value: unknown) => (typeof value === 'bigint' ? value.toString() : value));
+
+// ─── Request correlation (#110, restored for #236) ───
+// Generate a server-side request id for every incoming HTTP request, accept
+// an inbound `X-Request-Id` only if it is well-formed (and only for logs — the
+// durable key is always server-generated), and echo the chosen value back on
+// the response. Every downstream middleware and handler runs inside this
+// context, so logs, LLM calls and durable rows can be joined by `requestId`.
+app.use((req, res, next) => {
+  const raw = req.get('x-request-id');
+  const inbound = acceptInboundId(raw);
+  const requestId = newId('req');
+  res.setHeader('X-Request-Id', inbound ?? requestId);
+  runWithContext({ requestId, kind: 'http', clientRequestId: inbound }, () => {
+    res.locals.requestContext = currentContext();
+    next();
+  });
+});
 
 // ─── Liveness / Readiness (#111) ───
 // Before the rate limiter, compression and CORS: orchestrators poll often from one IP.
@@ -60,10 +89,14 @@ app.use(globalLimiter);
 
 // ─── Body Parsing + Compression ───
 app.use(compression());
-app.use(express.json({ limit: '1mb' }));
+// #219: keeps raw bytes for HMAC-signed service routes (captureRawBody).
+app.use(express.json({ limit: '1mb', verify: captureRawBody }));
 // Stream-based body parsing can resume handlers outside the request's async
 // context; re-enter it so everything downstream stays correlated.
-app.use((_req, res, next) => runInContext(res.locals.requestContext, next));
+app.use((_req, res, next) => {
+  const ctx = res.locals.requestContext;
+  return ctx ? runInContext(ctx, next) : next();
+});
 
 // ─── HTTP Logging ───
 // Paths only: the route template, never the query string or referrer.
@@ -105,6 +138,12 @@ app.get('/health', (_req, res) => {
   }
   res.json({ ok: true, data, error: null });
 });
+
+// ─── SEP-7 Well-Known & Wallet Callback (#270) ───
+// Mounted before /api/v1 and outside /internal; wallet callbacks carry no Origin
+// and authenticate via single-use SHA-256 hashed tokens.
+app.use('/.well-known', wellKnownRouter);
+app.use('/sep7', sep7Router);
 
 // ─── API Routes ───
 app.use('/api/v1', router);

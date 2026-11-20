@@ -255,6 +255,30 @@ export async function pauseAgent(
   if (changed) {
     logger.warn({ scope, source: p.source, until: p.until?.toISOString() }, 'Agent paused');
     emitChange(scope, changed);
+    notifyPaused(scope, p.source);
+  }
+}
+
+type PauseListener = (scope: ControlScope, source: PauseSource) => void;
+const pauseListeners = new Set<PauseListener>();
+
+/**
+ * Called after a pause commits (#226): the ops-alert engine queues a
+ * debounced evaluation so a breaker trip is reported within seconds, not one
+ * cron period. Returns an unsubscribe function.
+ */
+export function onAgentPaused(listener: PauseListener): () => void {
+  pauseListeners.add(listener);
+  return () => pauseListeners.delete(listener);
+}
+
+function notifyPaused(scope: ControlScope, source: PauseSource): void {
+  for (const listener of pauseListeners) {
+    try {
+      listener(scope, source);
+    } catch (err) {
+      logger.warn({ err }, 'Agent pause listener failed');
+    }
   }
 }
 

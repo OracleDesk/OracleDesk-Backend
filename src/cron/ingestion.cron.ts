@@ -6,8 +6,12 @@ import { config } from '../config';
 import { logger } from '../lib/logger';
 import { newId, runWithContext } from '../lib/context';
 import { recordCronRun } from './registry';
+import { resumeIncomplete } from '../services/market-saga.service';
 
 let runningCycleId: string | null = null;
+
+/** Returns the current in-progress cycle id, or null if no cycle is running. */
+export function getRunningCycleId(): string | null { return runningCycleId; }
 
 /**
  * Schedules the Market Maker Agent to run every 15 minutes.
@@ -47,6 +51,24 @@ export function startIngestionCron(): void {
         logger.error({ err }, 'Ingestion cron: cycle failed');
       } finally {
         runningCycleId = null;
+      }
+    });
+  });
+
+  // Saga resume sweep (#242): every minute, advance generation runs whose
+  // backoff has elapsed. Selection and claiming run under a short advisory
+  // lock inside resumeIncomplete; steps run outside any transaction.
+  let resuming = false;
+  cron.schedule('* * * * *', () => {
+    if (resuming) return;
+    resuming = true;
+    return runWithContext({ requestId: newId('cyc'), kind: 'cron', job: 'saga_resume' }, async () => {
+      try {
+        await resumeIncomplete();
+      } catch (err) {
+        logger.warn({ err }, 'Saga resume sweep failed');
+      } finally {
+        resuming = false;
       }
     });
   });

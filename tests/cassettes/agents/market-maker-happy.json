@@ -82,7 +82,7 @@
           }
         ]
       },
-      "recordedAt": "2026-10-19T10:18:48.320Z"
+      "recordedAt": "2026-11-20T07:05:08.046Z"
     },
     {
       "kind": "http",
@@ -109,7 +109,7 @@
           }
         ]
       },
-      "recordedAt": "2026-10-19T10:18:48.320Z"
+      "recordedAt": "2026-11-20T07:05:08.046Z"
     },
     {
       "kind": "http",
@@ -136,7 +136,7 @@
           }
         ]
       },
-      "recordedAt": "2026-10-19T10:18:48.320Z"
+      "recordedAt": "2026-11-20T07:05:08.046Z"
     },
     {
       "kind": "http",
@@ -163,7 +163,7 @@
           }
         ]
       },
-      "recordedAt": "2026-10-19T10:18:48.320Z"
+      "recordedAt": "2026-11-20T07:05:08.046Z"
     },
     {
       "kind": "http",
@@ -190,7 +190,7 @@
           }
         ]
       },
-      "recordedAt": "2026-10-19T10:18:48.320Z"
+      "recordedAt": "2026-11-20T07:05:08.046Z"
     },
     {
       "kind": "http",
@@ -216,11 +216,11 @@
           }
         ]
       },
-      "recordedAt": "2026-10-19T10:18:48.320Z"
+      "recordedAt": "2026-11-20T07:05:08.046Z"
     },
     {
       "kind": "anthropic",
-      "fingerprint": "cb42984b6f6768ae86c471a1d5c4c7e592656ef61f781b26a991aa15c64f15ad",
+      "fingerprint": "12090f1de5c1052e79d66d9b135aa3612fb044d8a5e8b7b5b694744f60f75711",
       "request": {
         "model": "claude-sonnet-4-6",
         "max_tokens": 4096,
@@ -263,7 +263,8 @@
                 },
                 "minimum_liquidity_usdc": {
                   "type": "number",
-                  "exclusiveMinimum": 0
+                  "minimum": 10,
+                  "maximum": 100000
                 },
                 "category": {
                   "type": "string",
@@ -384,11 +385,11 @@
           "output_tokens": 180
         }
       },
-      "recordedAt": "2026-10-19T10:18:48.325Z"
+      "recordedAt": "2026-11-20T07:05:08.051Z"
     },
     {
       "kind": "anthropic",
-      "fingerprint": "577ca376e66f72496126ea263905144315c8f999a3aba46de06a20596819bba4",
+      "fingerprint": "113b230e990436d3ae53e8724f3804cab99371df4c79816baaf04d5235c3bdac",
       "request": {
         "model": "claude-sonnet-4-6",
         "max_tokens": 1024,
@@ -397,7 +398,7 @@
         "messages": [
           {
             "role": "user",
-            "content": "\nMarket ID:          market-0003\nAgent Type:         MARKET_MAKER\nDecision:           MARKET_CREATION\nAgent Probability:  0.42\nMarket Probability: 0.43666666666666665\nEdge:               -0.0167\nCI:                 0.320 – 0.520\nBet Fraction:       N/A\n\nTop signals driving this decision:\n<untrusted_signals nonce=\"<NONCE>\">\n{\"id\":\"s1\",\"source\":\"NEWSAPI\",\"title\":\"Fed officials signal a rate cut at the December meeting\",\"content\":\"\"}\n</untrusted_signals nonce=\"<NONCE>\">\n\nWrite 3–5 specific, measurable conditions that would invalidate this trade thesis\nand trigger an early close. Focus on data changes, not price changes.\n"
+            "content": "\nMarket ID:          <UUID>\nAgent Type:         MARKET_MAKER\nDecision:           MARKET_CREATION\nAgent Probability:  0.42\nMarket Probability: 0.43666666666666665\nEdge:               -0.0167\nCI:                 0.320 – 0.520\nBet Fraction:       N/A\n\nTop signals driving this decision:\n<untrusted_signals nonce=\"<NONCE>\">\n{\"id\":\"s1\",\"source\":\"NEWSAPI\",\"title\":\"Fed officials signal a rate cut at the December meeting\",\"content\":\"\"}\n</untrusted_signals nonce=\"<NONCE>\">\n\nWrite 3–5 specific, measurable conditions that would invalidate this trade thesis\nand trigger an early close. Focus on data changes, not price changes.\n"
           }
         ],
         "tools": [
@@ -475,7 +476,7 @@
           "output_tokens": 180
         }
       },
-      "recordedAt": "2026-10-19T10:18:48.340Z"
+      "recordedAt": "2026-11-20T07:05:08.071Z"
     }
   ]
 }

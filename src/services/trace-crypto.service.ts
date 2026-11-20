@@ -124,7 +124,7 @@ export function xchacha20poly1305Encrypt(
   const cipher = crypto.createCipheriv('chacha20-poly1305', subKey, iv12, {
     authTagLength: 16,
   });
-  cipher.setAAD(aad);
+  cipher.setAAD(aad, { plaintextLength: plaintext.length });
   const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   const tag = cipher.getAuthTag();
   return Buffer.concat([encrypted, tag]);
@@ -149,7 +149,7 @@ export function xchacha20poly1305Decrypt(
   const decipher = crypto.createDecipheriv('chacha20-poly1305', subKey, iv12, {
     authTagLength: 16,
   });
-  decipher.setAAD(aad);
+  decipher.setAAD(aad, { plaintextLength: cipherText.length });
   decipher.setAuthTag(tag);
 
   return Buffer.concat([decipher.update(cipherText), decipher.final()]);

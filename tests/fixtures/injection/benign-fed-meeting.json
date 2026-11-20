@@ -1,0 +1,67 @@
+{
+  "name": "benign-fed-meeting",
+  "kind": "benign",
+  "signals": {
+    "news": [
+      {
+        "source": "NEWSAPI",
+        "signalId": "sig-fedm-1",
+        "url": "https://wire.example.com/fed-december-cut",
+        "publisher": "Example Wire",
+        "title": "Fed officials signal a rate cut at the December meeting",
+        "content": "Two Federal Reserve governors said inflation is close enough to target to cut rates at the December meeting.",
+        "publishedAt": "2026-10-18T09:55:00.000Z",
+        "relevanceScore": 0.7,
+        "category": "FED",
+        "clusterSize": 1
+      }
+    ],
+    "fed": [
+      {
+        "source": "FRED",
+        "signalId": "sig-fedm-fred",
+        "url": "https://fred.stlouisfed.org/series/FEDFUNDS",
+        "publisher": "FRED",
+        "title": "FEDFUNDS: 4.33",
+        "content": "FEDFUNDS = 4.33 (+0.000 vs prior). Date: 2026-09-01",
+        "publishedAt": "2026-10-18T09:55:00.000Z",
+        "relevanceScore": 0.7,
+        "category": "FED",
+        "clusterSize": 1
+      }
+    ],
+    "macro": []
+  },
+  "recordedModelOutput": {
+    "market_question": "Will the Fed cut rates at its December 2026 meeting?",
+    "initial_yes_probability": 0.42,
+    "resolution_oracle": "FRED",
+    "expiry_timestamp": {
+      "$days": 52
+    },
+    "settlement_currency": "USDC",
+    "minimum_liquidity_usdc": 100,
+    "category": "FED",
+    "confidence_interval": {
+      "lower": 0.3,
+      "upper": 0.55
+    },
+    "reasoning": "Officials signalled a December cut; FEDFUNDS has been flat.",
+    "grounding_signal_ids": [
+      "n1",
+      "f1"
+    ]
+  },
+  "expected": "accept",
+  "corroboration": {
+    "note": "A scheduled FOMC meeting has one authoritative source by nature: the calendar path accepts it with a single report.",
+    "now": "2026-10-18T12:00:00.000Z",
+    "resolutionSourceId": "FRED",
+    "meeting": {
+      "body": "FOMC",
+      "date": "2026-12-09"
+    },
+    "candidates": [],
+    "expected": "AUTHORITATIVE"
+  }
+}

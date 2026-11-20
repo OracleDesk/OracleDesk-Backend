@@ -1,0 +1,61 @@
+image:
+  repository: ghcr.io/oracledesk/oracledesk-backend
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# Existing Kubernetes Secret supplying DATABASE_URL, REDIS_URL, signing keys, etc.
+# Never commit secret values into values-*.yaml.
+existingSecret: oracledesk-backend-secrets
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
+
+shutdownDrainSeconds: 10
+
+config:
+  NODE_ENV: production
+  PORT: "8000"
+  EVENT_BUS_ENABLED: "true"
+  INDEXER_ENABLED: "true"
+  SHUTDOWN_DRAIN_MS: "10000"
+
+# Three Deployments named `api`, `indexer`, and `worker` to match post-deploy checks.
+# `indexer` and `worker` are pinned to replicas: 1 and strategy: Recreate until
+# leader election lands.
+roles:
+  api:
+    replicas: 2
+    strategy: RollingUpdate
+    resources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 512Mi
+  indexer:
+    replicas: 1
+    strategy: Recreate
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+  worker:
+    replicas: 1
+    strategy: Recreate
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 512Mi
+
+migrations:
+  enabled: true
+  activeDeadlineSeconds: 300

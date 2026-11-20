@@ -188,7 +188,24 @@ test('market maker: news+fred signals → anthropic proposal → dry-run create 
     assert.equal(publication.status, 'AWAITING_MARKET');
     assert.ok(!env.chain.some((c) => c.fn === 'publishTrace'));
 
-    assert.deepEqual(logs(env).filter((a) => a !== 'MARKET_CREATED'), ['GENERATE_QUESTION_LLM', 'DEDUP_CHECK']);
+    // The enqueued payload is the validated v2 document, unchanged (#227).
+    assert.equal(publication.payload.schemaVersion, 2);
+    assert.equal(publication.payload.traceId, trace.id);
+    assert.ok(!('onChainMarketId' in publication.payload), 'no top-level onChainMarketId');
+    assert.equal(publication.payload.market.onChainId, null, 'dry-run creation trace: no on-chain id yet');
+    assert.deepEqual(publication.payload.seedPolicy, market.seedPolicy);
+
+    // Corroboration (#228, observe by default): a Fed question "at its December
+    // meeting", resolved by FRED, with the Fed headline as coverage, passes the
+    // calendar path. The verdict is on the market and in the trace.
+    assert.equal(market.corroboration.kind, 'AUTHORITATIVE');
+    assert.equal(market.corroboration.policy.mode, 'observe');
+    assert.deepEqual(publication.payload.corroboration, {
+      kind: 'AUTHORITATIVE', units: market.corroboration.corroborators.length, domains: ['example.com'],
+    });
+
+    // The dedup reservation (#283) replaced checkDuplicate and its DEDUP_CHECK log.
+    assert.deepEqual(logs(env).filter((a) => a !== 'MARKET_CREATED'), ['GENERATE_QUESTION_LLM']);
     assert.ok(env.signals.rows.size > 0 && env.signals.fetches.length === 3, 'the store started empty and was filled');
   });
   assert.ok(Date.now() - started < 10_000, 'offline and fast');
@@ -232,6 +249,61 @@ test('market maker: duplicate proposal is skipped and no market row is created',
       initialYesProb: 0.4, confidenceInterval: { lower: 0.3, upper: 0.5 }, expiryTimestamp: new Date(DECEMBER_CLOSE * 1000), createdAt: new Date(NOW.getTime() - 86_400_000),
     });
   });
+});
+
+// ─── Corroboration (#228) ─────────────────────────────────────────────────────
+
+// Not tied to a meeting, no FRED series: only the one Fed headline covers it.
+const SINGLE_SOURCE = { market_question: 'Will the Fed cut rates by December 31, 2026?' };
+
+async function withCorroborationMode<T>(mode: 'observe' | 'enforce', fn: () => Promise<T>): Promise<T> {
+  const { config } = await import('../src/config');
+  const { resetCorroborationCache } = await import('../src/services/corroboration.service');
+  const prev = config.CORROBORATION_MODE;
+  (config as { CORROBORATION_MODE: string }).CORROBORATION_MODE = mode;
+  resetCorroborationCache();
+  try {
+    return await fn();
+  } finally {
+    (config as { CORROBORATION_MODE: string }).CORROBORATION_MODE = prev;
+  }
+}
+
+test('market maker: enforce mode — an uncorroborated proposal writes no market, pin, seed or trace', async () => {
+  const { runMarketMakerCycle } = await import('../src/agents/market-maker.agent');
+  await withCorroborationMode('enforce', () =>
+    scenario('market-maker-uncorroborated-enforce', { http, anthropic: anthropic({ proposalOver: SINGLE_SOURCE }) }, async (env, cassette) => {
+      assert.equal(await runMarketMakerCycle({ priority: 'cron' }), null);
+      assert.deepEqual(kinds(cassette).filter((k) => k !== 'http'), ['anthropic'], 'no hedge call');
+      assert.equal(env.db.rows('market').length, 0, 'no DB row');
+      assert.equal(env.db.rows('marketReservation').length, 0, 'not even reserved');
+      assert.equal(env.db.rows('reasoningTrace').length, 0, 'no trace');
+      assert.equal(env.ipfs.size, 0, 'no pin');
+      assert.ok(!env.chain.some((c) => c.fn === 'agentCreateMarket'), 'no seed');
+      const log = env.db.rows('agentLog').find((l) => l.action === 'PROPOSAL_UNCORROBORATED');
+      assert.ok(log, 'rejection logged');
+      assert.equal(log.level, 'WARN');
+      assert.equal(log.data.units, 1);
+      assert.deepEqual(log.data.domains, ['example.com']);
+      assert.ok(log.data.signalHashes.every((h: string) => /^[0-9a-f]{64}$/.test(h)), 'hashes only');
+      assert.ok(!JSON.stringify(log.data).includes('rate cut'), 'no signal text in the log');
+    }),
+  );
+});
+
+test('market maker: observe mode — an uncorroborated proposal is created and the verdict logged', async () => {
+  const { runMarketMakerCycle } = await import('../src/agents/market-maker.agent');
+  await withCorroborationMode('observe', () =>
+    scenario('market-maker-uncorroborated-observe', { http, anthropic: anthropic({ proposalOver: SINGLE_SOURCE }) }, async (env) => {
+      const result = await runMarketMakerCycle({ priority: 'cron' });
+      const [market] = env.db.rows('market');
+      assert.equal(result?.marketId, market.id, 'behaviour unchanged: the market is created');
+      assert.equal(market.corroboration.kind, 'UNCORROBORATED');
+      assert.ok(env.db.rows('agentLog').some((l) => l.action === 'PROPOSAL_UNCORROBORATED'));
+      const [publication] = env.db.rows('tracePublication');
+      assert.equal(publication.payload.corroboration.kind, 'UNCORROBORATED');
+    }),
+  );
 });
 
 test('market maker: invalid confidence interval from LLM returns null and logs', async () => {

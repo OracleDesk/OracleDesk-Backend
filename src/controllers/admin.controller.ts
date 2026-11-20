@@ -4,6 +4,7 @@ import { sendSuccess, parsePagination, buildPaginationMeta } from '../utils/resp
 import {
   controlScopeSchema,
   createOperationSchema,
+  moneyAuditRunSchema,
   pauseAgentSchema,
   reconcileRunSchema,
   recordSchema,
@@ -12,22 +13,31 @@ import {
 } from '../validators/admin.validator';
 import { controlsOverview, pauseAgent, resumeAgent } from '../services/agent-controls.service';
 import { defaultDeps, runReconciliation } from '../services/market-reconciler.service';
+import { runMoneyAudit } from '../services/money-audit/run';
 import { v4 as uuidv4 } from 'uuid';
 import { prisma } from '../lib/prisma';
-import { TraceAuditStatus } from '@prisma/client';
+import { AgentDecisionKind, AgentDecisionReason, AgentType, TraceAuditStatus } from '@prisma/client';
 import { runTraceAudit } from '../services/trace-audit.service';
 import { sendError } from '../utils/response.util';
 import { logger } from '../lib/logger';
 import { config } from '../config';
 import { secret } from '../config/secrets';
-import { health } from '../services/health.service';
+import { chainWritesStatus, health } from '../services/health.service';
 import { indexerStatus } from '../services/indexer.service';
 import { agentSigner } from '../services/stellar/clients';
 import { effectiveMode, specCompatReport } from '../services/stellar/spec-compat';
 import { getFeeOracle } from '../services/stellar/fees';
 import { getLlmUsage } from '../lib/llm-budget';
 import { getCronStatus } from '../cron/registry';
+import { MAX_SILENCE_MINUTES, acknowledgeIncident, listIncidents, silenceIncident } from '../services/ops-alerts/incidents';
+import { getReplicationSummary } from '../jobs/ipfs-replication.job';
+import {
+  ensureSigningKeyRegistered,
+  retireSigningKey,
+  signingKeyStatus,
+} from '../services/agent-signing-key.service';
 import { AppError } from '../middlewares/error.middleware';
+import * as sourceWeights from '../services/source-weights.service';
 import {
   ADMIN_ROLES,
   grantAdminRole,
@@ -47,12 +57,16 @@ import {
   addSignature,
   cancelOperation,
   getOperation,
+  getSep7Status,
   getTreasuryState,
+  issueSep7Requests,
   listOperations,
   prepareOperation,
   recordSubmitted,
   submitOperation,
 } from '../services/treasury-ops.service';
+import { outboxActionSchema, outboxIdSchema, outboxListQuerySchema } from '../validators/admin.validator';
+import { abandon, listOutbox, outboxDetail, recoverNow, rerunHandler } from '../services/outbox-admin.service';
 
 function actor(req: Request): string {
   if (!req.user) throw new AppError(401, 'UNAUTHORIZED', 'Authentication required');
@@ -106,6 +120,53 @@ export async function recordTreasuryOperation(req: Request, res: Response): Prom
 export async function cancelTreasuryOperation(req: Request, res: Response): Promise<void> {
   await cancelOperation(String(req.params.id), actor(req));
   sendSuccess(res, { cancelled: true });
+}
+
+export async function issueOperationSep7(req: Request, res: Response): Promise<void> {
+  const issued = await issueSep7Requests(String(req.params.id), actor(req));
+  sendSuccess(res, { requests: issued }, 201);
+}
+
+export async function getOperationSep7Status(req: Request, res: Response): Promise<void> {
+  const requests = await getSep7Status(String(req.params.id));
+  sendSuccess(res, { requests });
+}
+
+export async function getChainSigningKeys(_req: Request, res: Response): Promise<void> {
+  sendSuccess(res, await signingKeyStatus());
+}
+
+export async function registerChainSigningKey(req: Request, res: Response): Promise<void> {
+  const mode = req.body?.mode === 'prepare' ? 'prepare' : 'submit';
+  const result = await ensureSigningKeyRegistered({ mode });
+  await prisma.agentLog
+    .create({
+      data: {
+        agentType: 'MARKET_MAKER',
+        level: 'INFO',
+        action: 'SIGNING_KEY_REGISTERED',
+        data: { actor: actor(req), mode, publicKey: result.publicKey, alreadyActive: Boolean(result.alreadyActive) } as object,
+      },
+    })
+    .catch(() => {});
+  sendSuccess(res, result, 201);
+}
+
+export async function retireChainSigningKey(req: Request, res: Response): Promise<void> {
+  const mode = req.body?.mode === 'prepare' ? 'prepare' : 'submit';
+  const publicKey = String(req.params.publicKey ?? '').trim();
+  const result = await retireSigningKey(publicKey, { mode });
+  await prisma.agentLog
+    .create({
+      data: {
+        agentType: 'MARKET_MAKER',
+        level: 'INFO',
+        action: 'SIGNING_KEY_RETIRED',
+        data: { actor: actor(req), mode, publicKey: result.publicKey } as object,
+      },
+    })
+    .catch(() => {});
+  sendSuccess(res, result);
 }
 
 /** GET /admin/agents/controls: effective state per scope plus the last 20 audit events. */
@@ -255,11 +316,14 @@ export async function getSystemStatus(_req: Request, res: Response): Promise<voi
       lagLedgers: typeof latestLedger === 'number' && indexer.lastLedger !== null ? latestLedger - indexer.lastLedger : null,
     },
     crons: getCronStatus(),
+    ipfsReplication: await getReplicationSummary().catch(() => null),
     chain: {
       mode: config.CHAIN_EXECUTION_MODE,
       agentPublicKey: agentSigner().publicKey ?? null,
       preflight: 'not_implemented',
     },
+    // Outbox backlog, handler streaks, signer/channel balances (#220). Public keys only.
+    chainWrites: await chainWritesStatus().catch(() => null),
     llm: {
       anthropicConfigured: secret('ANTHROPIC_API_KEY') !== '',
       geminiConfigured: secret('GEMINI_API_KEY') !== '',
@@ -310,6 +374,61 @@ export async function triggerReconciliationRun(req: Request, res: Response): Pro
     { ...defaultDeps, emit: io ? (e, p) => io.to('admins').emit(e, p) : undefined },
   ).catch((err) => logger.error({ err, runId }, 'Background reconciliation run failed'));
   sendSuccess(res, { runId, message: 'Reconciliation run scheduled' }, 202);
+}
+
+/** GET /admin/money-audit/runs?limit= — money-audit runs (#222), newest first. */
+export async function listMoneyAuditRuns(req: Request, res: Response): Promise<void> {
+  const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? '20'), 10) || 20));
+  sendSuccess(res, await prisma.moneyAuditRun.findMany({ orderBy: { startedAt: 'desc' }, take: limit }));
+}
+
+/** GET /admin/money-audit/runs/:id/findings?severity=&invariant=&page=&limit= */
+export async function listMoneyAuditFindings(req: Request, res: Response): Promise<void> {
+  const id = String(req.params.id);
+  const run = await prisma.moneyAuditRun.findUnique({ where: { id } });
+  if (!run) throw new AppError(404, 'RUN_NOT_FOUND', 'Money audit run not found');
+  const { page, limit, skip } = parsePagination(req.query as any);
+  const where = {
+    runId: id,
+    ...(typeof req.query.severity === 'string' && req.query.severity ? { severity: req.query.severity.toUpperCase() } : {}),
+    ...(typeof req.query.invariant === 'string' && req.query.invariant ? { invariant: req.query.invariant.toUpperCase() } : {}),
+  };
+  const [findings, total] = await Promise.all([
+    prisma.moneyAuditFinding.findMany({ where, orderBy: { createdAt: 'asc' }, skip, take: limit }),
+    prisma.moneyAuditFinding.count({ where }),
+  ]);
+  sendSuccess(res, { run, findings }, 200, buildPaginationMeta(page, limit, total) as any);
+}
+
+/**
+ * POST /admin/money-audit/run
+ * Starts an audit in the background (same advisory lock as the cron) and
+ * returns 202 with its id. A dry run reports but never repairs.
+ */
+export async function triggerMoneyAuditRun(req: Request, res: Response): Promise<void> {
+  const parsed = moneyAuditRunSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'Invalid money audit request', parsed.error.flatten().fieldErrors as any);
+  }
+  const runId = uuidv4();
+  runMoneyAudit({ runId, dryRun: parsed.data.dryRun ?? false })
+    .catch((err) => logger.error({ err, runId }, 'Background money audit run failed'));
+  sendSuccess(res, { runId, message: 'Money audit run scheduled' }, 202);
+}
+
+/** POST /admin/money-audit/findings/:id/ack — later runs carry the ack by fingerprint and do not re-alert. */
+export async function ackMoneyAuditFinding(req: Request, res: Response): Promise<void> {
+  const id = String(req.params.id);
+  const finding = await prisma.moneyAuditFinding.findUnique({ where: { id } });
+  if (!finding) throw new AppError(404, 'FINDING_NOT_FOUND', 'Money audit finding not found');
+  if (finding.ackedAt) {
+    sendSuccess(res, finding);
+    return;
+  }
+  sendSuccess(res, await prisma.moneyAuditFinding.update({
+    where: { id },
+    data: { action: 'ACKED', ackedBy: actor(req), ackedAt: new Date() },
+  }));
 }
 
 /**
@@ -433,4 +552,54 @@ export async function cancelDisputeTx(req: Request, res: Response): Promise<void
 /** POST /admin/disputes/:id/void-tx — unsigned guardian_void_market. */
 export async function voidDisputeTx(req: Request, res: Response): Promise<void> {
   sendSuccess(res, await buildGuardianTx(disputeId(req), 'guardian_void_market'));
+}
+
+// ─── Admin outbox console (#221) ─────────────────────────────────────────
+
+function outboxId(req: Request): string {
+  const parsed = outboxIdSchema.safeParse(String(req.params.id ?? ''));
+  if (!parsed.success) throw new AppError(400, 'VALIDATION_ERROR', 'id must be a chain transaction UUID');
+  return parsed.data;
+}
+
+function outboxReason(req: Request): string {
+  const parsed = outboxActionSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'reason is required (10-500 characters)', parsed.error.flatten().fieldErrors as any);
+  }
+  return parsed.data.reason;
+}
+
+/** GET /admin/chain/transactions — outbox rows, newest first, with filters. */
+export async function listChainTransactions(req: Request, res: Response): Promise<void> {
+  const parsed = outboxListQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'Invalid outbox filter', parsed.error.flatten().fieldErrors as any);
+  }
+  const { page, limit } = parsePagination(req.query as any);
+  const { rows, total } = await listOutbox({ ...parsed.data, page, limit });
+  sendSuccess(res, rows, 200, buildPaginationMeta(page, limit, total) as any);
+}
+
+/** GET /admin/chain/transactions/:id — decoded envelope, fee bumps, RPC status, linked rows. */
+export async function getChainTransaction(req: Request, res: Response): Promise<void> {
+  sendSuccess(res, await outboxDetail(outboxId(req)));
+}
+
+/** POST /admin/chain/transactions/:id/recover — one recovery pass for this row now. */
+export async function recoverChainTransaction(req: Request, res: Response): Promise<void> {
+  const id = outboxId(req);
+  sendSuccess(res, await recoverNow(id, actor(req), outboxReason(req)));
+}
+
+/** POST /admin/chain/transactions/:id/rerun-handler — terminal rows only. */
+export async function rerunChainTransactionHandler(req: Request, res: Response): Promise<void> {
+  const id = outboxId(req);
+  sendSuccess(res, await rerunHandler(id, actor(req), outboxReason(req)));
+}
+
+/** POST /admin/chain/transactions/:id/abandon — only when the envelope provably cannot land. */
+export async function abandonChainTransaction(req: Request, res: Response): Promise<void> {
+  const id = outboxId(req);
+  sendSuccess(res, await abandon(id, actor(req), outboxReason(req)));
 }

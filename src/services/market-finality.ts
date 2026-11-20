@@ -4,6 +4,7 @@
  * two cannot diverge.
  */
 import { prisma } from '../lib/prisma';
+import { bigintToDecimalString, decimalToBigint, toDisplayUsdc } from '../lib/amounts';
 
 export type FinalOutcome = 'Yes' | 'No' | null; // null: the market was voided
 
@@ -39,10 +40,57 @@ export async function applyMarketFinality(
       },
     });
     if (updated.count === 0) return false;
+    const positions = await tx.position.findMany({
+      where: { marketId, status: 'OPEN' },
+      select: {
+        id: true,
+        direction: true,
+        sharesRaw: true,
+        costBasisRaw: true,
+        realisedCollateralRaw: true,
+        realisedPnlRaw: true,
+      },
+    });
     await tx.position.updateMany({
       where: { marketId, status: 'OPEN' },
-      data: { status: 'CLOSED', closedAt: at, closeReason: outcome ? `${outcome.toUpperCase()}_RESOLVED` : 'VOIDED' },
+      data: {
+        status: 'CLOSED',
+        closedAt: at,
+        closeReason: outcome ? `${outcome.toUpperCase()}_RESOLVED` : 'VOIDED',
+        markValueRaw: null,
+        liquidationValueRaw: null,
+        unrealisedPnlRaw: null,
+      },
     });
+    for (const position of positions) {
+      if (position.sharesRaw == null || position.costBasisRaw == null) continue;
+      const sharesRaw = decimalToBigint(position.sharesRaw);
+      const costBasisRaw = decimalToBigint(position.costBasisRaw);
+      const payoutRaw = outcome === null
+        ? sharesRaw / 2n
+        : (position.direction === outcome.toUpperCase() ? sharesRaw : 0n);
+      const realisedPnlRaw = decimalToBigint(position.realisedPnlRaw) + payoutRaw - costBasisRaw;
+      const priceBps = outcome === null ? 5_000 : (position.direction === outcome.toUpperCase() ? 10_000 : 0);
+      await tx.position.update({
+        where: { id: position.id },
+        data: {
+          status: 'CLOSED',
+          closedAt: at,
+          closeReason: outcome ? `${outcome.toUpperCase()}_RESOLVED` : 'VOIDED',
+          sharesRaw: '0',
+          costBasisRaw: '0',
+          realisedCollateralRaw: bigintToDecimalString(decimalToBigint(position.realisedCollateralRaw) + payoutRaw),
+          realisedPnlRaw: bigintToDecimalString(realisedPnlRaw),
+          unrealisedPnlRaw: '0',
+          markValueRaw: '0',
+          liquidationValueRaw: '0',
+          markPriceBps: priceBps,
+          currentPrice: priceBps / 10_000,
+          pnl: toDisplayUsdc(realisedPnlRaw),
+          illiquid: false,
+        },
+      });
+    }
     return true;
   });
 }

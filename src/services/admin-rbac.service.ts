@@ -24,6 +24,10 @@ export const ADMIN_PERMISSIONS = [
   'refund.approve',
   'refund.prepare',
   'indexer.replay',
+  'chain.signing_keys',
+  // Admin outbox console (#221); reaches existing databases by migration.
+  'chain.outbox.read',
+  'chain.outbox.operate',
 ] as const;
 export type AdminPermission = (typeof ADMIN_PERMISSIONS)[number];
 
@@ -41,6 +45,8 @@ const ROLE_PERMISSIONS: Record<AdminRoleName, readonly AdminPermission[]> = {
     'calibration.recompute',
     'refund.request',
     'refund.prepare',
+    'chain.outbox.read',
+    'chain.outbox.operate',
   ],
   auditor: [
     'admin.read',
@@ -49,6 +55,7 @@ const ROLE_PERMISSIONS: Record<AdminRoleName, readonly AdminPermission[]> = {
     'trace_audit.run',
     'reconciliation.run',
     'refund.approve',
+    'chain.outbox.read',
   ],
 };
 

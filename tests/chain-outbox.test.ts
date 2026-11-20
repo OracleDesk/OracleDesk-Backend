@@ -19,96 +19,26 @@ import {
 
 type Outbox = typeof import('../src/services/stellar/outbox');
 type Row = import('../src/services/stellar/outbox').ChainTransactionRow;
-type Store = import('../src/services/stellar/outbox').OutboxStore;
+import { blankRow, memoryStore } from './helpers/memory-outbox';
 
-const load = () => import('../src/services/stellar/outbox');
+// Row leases (#221) go to an in-memory Redis so recovery never needs a server.
+const load = async () => {
+  const outbox = await import('../src/services/stellar/outbox');
+  const { FakeRedis } = await import('./helpers/fake-redis');
+  outbox.setRowLeaseRedisForTest(new FakeRedis() as never);
+  return outbox;
+};
 
 const AGENT = 'GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H';
 const NOW_SECS = 1_800_000_000;
 
 // ─── Fakes ───────────────────────────────────────────────────────────────────
 
-const blankRow = (): Omit<Row, 'id' | 'kind'> => ({
-  refId: null, contract: null, method: null, args: null, simulated: null, source: null,
-  sequence: null, hash: null, envelopeXdr: null, status: 'BUILT', submitLedger: null,
-  minTime: null, maxTime: null, ledger: null, resultXdr: null, returnValue: null,
-  innerFee: null, resourceFee: null, feeBumpHashes: [], feeBumpEnvelopes: null,
-  landedHash: null, bumpAttempts: 0, attempts: 0, error: null, handledAt: null,
-  updatedAt: new Date(0),
-});
-
-/** In-memory OutboxStore with compare-and-set transitions and a status history. */
-function memoryStore() {
-  const rows = new Map<string, Row>();
-  let n = 0;
-  const history: string[] = [];
-  const terminal = ['SUCCESS', 'FAILED', 'EXPIRED'];
-  const store: Store & { rows: Map<string, Row>; history: string[]; seed(data: Partial<Row> & { kind: string }): Row } = {
-    rows,
-    history,
-    seed(data) {
-      const row: Row = { ...blankRow(), id: `ob${++n}`, ...data } as Row;
-      rows.set(row.id, row);
-      return row;
-    },
-    async create(data) {
-      const row = store.seed(data);
-      history.push(`${row.id}:${row.status}`);
-      return { ...row };
-    },
-    async transition(id, from, to, patch = {}) {
-      const row = rows.get(id);
-      if (!row || !from.includes(row.status as never)) return null;
-      Object.assign(row, patch, { status: to, updatedAt: new Date() });
-      history.push(`${id}:${to}`);
-      return { ...row };
-    },
-    async findInFlight(now, graceMs) {
-      const cutoff = now.getTime() - graceMs;
-      return [...rows.values()]
-        .filter((r) =>
-          r.status === 'SUBMITTED' || r.status === 'PENDING'
-            ? true
-            : (r.status === 'BUILT' || r.status === 'SIGNED') && (r.updatedAt?.getTime() ?? 0) < cutoff,
-        )
-        .map((r) => ({ ...r }));
-    },
-    async findUnhandled() {
-      return [...rows.values()].filter((r) => terminal.includes(r.status) && !r.handledAt).map((r) => ({ ...r }));
-    },
-    async findByAnyHash(hashes) {
-      const row = [...rows.values()].find(
-        (r) => (r.hash && hashes.includes(r.hash)) || (r.landedHash && hashes.includes(r.landedHash)) || r.feeBumpHashes.some((h) => hashes.includes(h)),
-      );
-      return row ? { ...row } : null;
-    },
-    async findById(id) {
-      const row = rows.get(id);
-      return row ? { ...row } : null;
-    },
-    async markHandled(id) {
-      const row = rows.get(id);
-      if (row && !row.handledAt) row.handledAt = new Date();
-    },
-    async recordBump(row, outerHash, envelope) {
-      const live = rows.get(row.id);
-      if (!live || live.bumpAttempts !== row.bumpAttempts) return false;
-      live.bumpAttempts += 1;
-      live.feeBumpHashes = [...live.feeBumpHashes, outerHash];
-      live.feeBumpEnvelopes = [...((live.feeBumpEnvelopes as unknown[]) ?? []), envelope];
-      return true;
-    },
-    async recordError(id, error) {
-      const row = rows.get(id);
-      if (row) row.error = error;
-    },
-  };
-  return store;
-}
-
 const NOT_FOUND = (over: Record<string, unknown> = {}) => ({
   status: 'NOT_FOUND',
+  latestLedger: 100,
   latestLedgerCloseTime: NOW_SECS,
+  oldestLedger: 1,
   oldestLedgerCloseTime: NOW_SECS - 100_000,
   ...over,
 });
@@ -297,6 +227,7 @@ test('NOT_FOUND past maxTime marks EXPIRED and fails the Trade', async () => {
     hash: 'cd'.repeat(32),
     envelopeXdr: 'unused',
     maxTime: BigInt(NOW_SECS - 600), // already past
+    submitLedger: 90, // inside RPC retention (oldestLedger 1)
   });
 
   await withTestHandlers(outbox, { 'trade.buy': handleTradeBuyOutcome as never }, async () => {
@@ -305,6 +236,55 @@ test('NOT_FOUND past maxTime marks EXPIRED and fails the Trade', async () => {
     assert.equal(store.rows.get(row.id)!.status, 'EXPIRED');
     assert.equal(trade.status, 'FAILED');
     assert.equal(trade.errorMessage, 'expired unsubmitted');
+  });
+});
+
+test('ledger time decides expiry, not the host clock: host past maxTime, ledger not → still in flight (#221)', async () => {
+  const outbox = await load();
+  const store = memoryStore();
+  const row = store.seed({
+    kind: 'test.kind',
+    status: 'SUBMITTED',
+    hash: '9a'.repeat(32),
+    envelopeXdr: 'unused',
+    maxTime: BigInt(NOW_SECS + 100),
+    submitLedger: 90,
+  });
+  let runs = 0;
+  await withTestHandlers(outbox, { 'test.kind': async () => void runs++ }, async () => {
+    // The host clock is an hour past maxTime; the latest ledger closed before it.
+    const server = fakeServer({ [row.hash!]: NOT_FOUND({ latestLedgerCloseTime: NOW_SECS }) });
+    const stats = await outbox.recoverInFlight({ server: server as never, store, now: () => NOW_SECS + 3600 });
+    assert.equal(stats.expired, 0);
+    assert.equal(store.rows.get(row.id)!.status, 'SUBMITTED');
+    assert.equal(runs, 0);
+
+    // Once ledger close time passes maxTime + skew it expires.
+    const later = fakeServer({ [row.hash!]: NOT_FOUND({ latestLedgerCloseTime: NOW_SECS + 100 + outbox.OUTBOX_EXPIRY_SKEW_SECONDS + 1 }) });
+    await outbox.recoverInFlight({ server: later as never, store, now: () => NOW_SECS });
+    assert.equal(store.rows.get(row.id)!.status, 'EXPIRED');
+    assert.equal(runs, 1);
+  });
+});
+
+test('past maxTime but the submission is outside RPC retention: stays in flight with an explanation (#221)', async () => {
+  const outbox = await load();
+  const store = memoryStore();
+  const row = store.seed({
+    kind: 'test.kind',
+    status: 'PENDING',
+    hash: '9b'.repeat(32),
+    envelopeXdr: 'unused',
+    maxTime: BigInt(NOW_SECS - 600),
+    submitLedger: 10,
+  });
+  await withTestHandlers(outbox, { 'test.kind': async () => undefined }, async () => {
+    const server = fakeServer({ [row.hash!]: NOT_FOUND({ oldestLedger: 50 }) });
+    const stats = await outbox.recoverInFlight({ server: server as never, store, now: () => NOW_SECS });
+    assert.equal(stats.expired, 0);
+    const after = store.rows.get(row.id)!;
+    assert.equal(after.status, 'PENDING');
+    assert.match(after.error ?? '', /expiry unprovable: submit ledger 10 is older than the RPC retention floor 50/);
   });
 });
 

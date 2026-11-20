@@ -82,7 +82,7 @@
           }
         ]
       },
-      "recordedAt": "2026-10-19T10:18:48.356Z"
+      "recordedAt": "2026-11-20T07:04:44.630Z"
     },
     {
       "kind": "http",
@@ -109,7 +109,7 @@
           }
         ]
       },
-      "recordedAt": "2026-10-19T10:18:48.356Z"
+      "recordedAt": "2026-11-20T07:04:44.630Z"
     },
     {
       "kind": "http",
@@ -136,7 +136,7 @@
           }
         ]
       },
-      "recordedAt": "2026-10-19T10:18:48.356Z"
+      "recordedAt": "2026-11-20T07:04:44.630Z"
     },
     {
       "kind": "http",
@@ -163,7 +163,7 @@
           }
         ]
       },
-      "recordedAt": "2026-10-19T10:18:48.356Z"
+      "recordedAt": "2026-11-20T07:04:44.630Z"
     },
     {
       "kind": "http",
@@ -190,7 +190,7 @@
           }
         ]
       },
-      "recordedAt": "2026-10-19T10:18:48.356Z"
+      "recordedAt": "2026-11-20T07:04:44.630Z"
     },
     {
       "kind": "http",
@@ -216,11 +216,11 @@
           }
         ]
       },
-      "recordedAt": "2026-10-19T10:18:48.356Z"
+      "recordedAt": "2026-11-20T07:04:44.630Z"
     },
     {
       "kind": "anthropic",
-      "fingerprint": "bcd369b3597c0381901fad56976c5e4a8d9ee5d7653355aee2d6cb279a87fdd1",
+      "fingerprint": "8b23cba50995ff08fa5600e0103863eff3071a4c834e1c55680d02e02b296af9",
       "request": {
         "model": "claude-sonnet-4-6",
         "max_tokens": 4096,
@@ -263,7 +263,8 @@
                 },
                 "minimum_liquidity_usdc": {
                   "type": "number",
-                  "exclusiveMinimum": 0
+                  "minimum": 10,
+                  "maximum": 100000
                 },
                 "category": {
                   "type": "string",
@@ -384,7 +385,7 @@
           "output_tokens": 180
         }
       },
-      "recordedAt": "2026-10-19T10:18:48.358Z"
+      "recordedAt": "2026-11-20T07:04:44.631Z"
     }
   ]
 }

@@ -210,11 +210,11 @@ test('portfolio summary uses cost basis and liquidation-based PnL', async () => 
           { size: 99, pnl: 0, costBasisRaw: '100000000', realisedPnlRaw: '5000000', unrealisedPnlRaw: '-20000000' },
           { size: 10, pnl: -1, costBasisRaw: null, realisedPnlRaw: '0', unrealisedPnlRaw: null },
         ]
-      : [{ pnl: 2, closedAt: new Date(0) }];
+      : [{ pnl: 2, realisedPnlRaw: '20000000', unrealisedPnlRaw: '0', closedAt: new Date(0) }];
   (prisma.trade.aggregate as any) = async () => ({ _sum: { builderFee: 0 } });
   const s = await getPortfolioSummary(null);
-  assert.equal(s.deployedCapital, 20); // 10 USDC cost basis + 10 legacy size
-  assert.equal(s.totalPnl, -1 + 2 + (0.5 - 2)); // legacy -1, closed +2, open realised 0.5 + unrealised -2 (USDC)
+  assert.equal(s.deployedCapital, 10); // raw cost basis only
+  assert.equal(s.totalPnl, 0.5); // open realised + unrealised and closed realised, all in raw units
 });
 
 test('backfill fills from indexed events, estimates otherwise and reports skips', async () => {
@@ -223,13 +223,14 @@ test('backfill fills from indexed events, estimates otherwise and reports skips'
   const { calcBuy } = await import('../src/generated/fpmm');
   const base = { executedAt: new Date('2026-01-01'), createdAt: new Date('2026-01-01'), status: 'EXECUTED' };
   const rows = [
-    { id: 'exact', direction: 'YES', trade: { ...base, txHash: 'aa'.repeat(32), amount: 2 }, market: { onChainMarketId: 1n, seedAmountRaw: null, initialYesProb: 0.5 } },
-    { id: 'est', direction: 'NO', trade: { ...base, txHash: 'bb'.repeat(32), amount: 3 }, market: { onChainMarketId: 1n, seedAmountRaw: null, initialYesProb: 0.5 } },
-    { id: 'dry', direction: 'YES', trade: { ...base, txHash: null, amount: 1 }, market: { onChainMarketId: 1n, seedAmountRaw: null, initialYesProb: 0.5 } },
+    { id: 'exact', direction: 'YES', trade: { ...base, id: 'trade-exact', txHash: 'aa'.repeat(32), amountRaw: '20000000' }, market: { onChainMarketId: 1n, seedAmountRaw: null, initialYesProb: 0.5 } },
+    { id: 'est', direction: 'NO', trade: { ...base, id: 'trade-est', txHash: 'bb'.repeat(32), amountRaw: '30000000' }, market: { onChainMarketId: 1n, seedAmountRaw: null, initialYesProb: 0.5 } },
+    { id: 'dry', direction: 'YES', trade: { ...base, id: 'trade-dry', txHash: null, amountRaw: '10000000' }, market: { onChainMarketId: 1n, seedAmountRaw: null, initialYesProb: 0.5 } },
   ];
   const updates: any[] = [];
   (prisma.position.findMany as any) = async () => rows;
   (prisma.position.update as any) = async (a: any) => { updates.push(a); return a; };
+  (prisma.trade.update as any) = async () => ({});
   const deps = {
     findTradeEvent: async (tx: string) => (tx.startsWith('aa') ? { shares: 19_000_000n, collateral: 20_000_000n, fee: 200_000n } : null),
     previousReserves: async () => ({ reserveYes: 1_000_000_000n, reserveNo: 2_000_000_000n }),

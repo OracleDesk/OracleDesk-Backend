@@ -1,6 +1,7 @@
 import type { Request, Response, NextFunction, RequestHandler } from 'express';
 import { sha256Hex, canonicalJson } from '../utils/hash.util';
 import { checkAccess } from '../services/subscription.service';
+import { checkETagMatch } from '../utils/etag.util';
 
 export type CachePolicy =
   | { kind: 'immutable'; maxAge: number }
@@ -10,12 +11,7 @@ export type CachePolicy =
 
 const POLICY_VERSION = 'v1';
 
-export function checkETagMatch(ifNoneMatch: string, etag: string): boolean {
-  if (ifNoneMatch.trim() === '*') return true;
-  const targetClean = etag.replace(/^W\//, '').trim();
-  const list = ifNoneMatch.split(',').map((s) => s.trim().replace(/^W\//, ''));
-  return list.includes(targetClean);
-}
+export { checkETagMatch };
 
 export async function authClass(req: Request): Promise<string> {
   const user = (req as any).user;
@@ -24,9 +20,12 @@ export async function authClass(req: Request): Promise<string> {
     return 'anon';
   }
 
-  const traceId = req.params.id;
+  const traceId = req.params.id === undefined ? undefined : String(req.params.id);
   if (traceId) {
     try {
+      // Loaded lazily: response.util imports this module, and a static import of
+      // subscription.service closes a cycle back through error.middleware.
+      const { checkAccess } = await import('../services/subscription.service');
       const access = await checkAccess(user.userId, traceId);
       if (access.hasAccess) return 'pass';
     } catch {}

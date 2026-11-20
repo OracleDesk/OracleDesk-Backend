@@ -3,7 +3,6 @@ import { Prisma } from '@prisma/client';
 import { logger } from '../lib/logger';
 import { currentContext } from '../lib/context';
 import { sendError } from '../utils/response.util';
-
 export class AppError extends Error {
   constructor(
     public readonly statusCode: number,
@@ -16,6 +15,7 @@ export class AppError extends Error {
     Error.captureStackTrace(this, this.constructor);
   }
 }
+import { JsonBoundsError } from '../utils/hash.util';
 
 /**
  * Global Express error handler.
@@ -27,6 +27,11 @@ export function errorMiddleware(
   res: Response,
   _next: NextFunction,
 ): void {
+  if (err instanceof JsonBoundsError) {
+    sendError(res, 413, 'JSON_TOO_COMPLEX', 'The JSON request exceeds the allowed safety limits');
+    return;
+  }
+
   // Client aborted request
   if (err.name === 'ClientAbortedError' || (err instanceof AppError && err.code === 'CLIENT_ABORTED')) {
     logger.debug({ path: req.path, method: req.method }, 'Client aborted request');

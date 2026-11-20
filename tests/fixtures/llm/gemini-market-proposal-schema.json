@@ -24,7 +24,9 @@
       "format": "enum"
     },
     "minimum_liquidity_usdc": {
-      "type": "number"
+      "type": "number",
+      "minimum": 10,
+      "maximum": 100000
     },
     "category": {
       "type": "string",
@@ -70,6 +72,26 @@
       },
       "minItems": 1,
       "maxItems": 5
+    },
+    "price_asset": {
+      "type": "string"
+    },
+    "price_threshold": {
+      "type": "string"
+    },
+    "price_direction": {
+      "type": "string",
+      "enum": [
+        "Above",
+        "AtOrAbove",
+        "Below",
+        "AtOrBelow"
+      ],
+      "format": "enum"
+    },
+    "price_close_timestamp": {
+      "type": "integer",
+      "maximum": 9007199254740991
     }
   },
   "propertyOrdering": [
@@ -82,7 +104,11 @@
     "category",
     "confidence_interval",
     "reasoning",
-    "grounding_signal_ids"
+    "grounding_signal_ids",
+    "price_asset",
+    "price_threshold",
+    "price_direction",
+    "price_close_timestamp"
   ],
   "required": [
     "market_question",

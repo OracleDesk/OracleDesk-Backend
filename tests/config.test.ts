@@ -63,3 +63,14 @@ test('SEP-45 and signing-key rotation settings are validated (#47/#48)', async (
   assert.equal(c.AUTH_PREVIOUS_SIGNING_KEYS[0].publicKey, previous);
   assert.equal(c.SEP45_ENABLED, false);
 });
+
+test('HEALTH_CRITICAL accepts the chain-write probes and rejects unknown names (#220)', async () => {
+  const { loadConfig } = await import('../src/config');
+  const c = loadConfig({ DATABASE_URL: 'x', HEALTH_CRITICAL: 'database,outbox,signers,channels' });
+  assert.deepEqual(c.HEALTH_CRITICAL, ['database', 'outbox', 'signers', 'channels']);
+  assert.equal(c.HEALTH_CHAIN_WRITER, 'auto');
+  assert.equal(c.HEALTH_OUTBOX_MAX_INFLIGHT, 50);
+  assert.equal(c.HEALTH_BALANCE_TTL_MS, 60_000);
+  assert.throws(() => loadConfig({ DATABASE_URL: 'x', HEALTH_CRITICAL: 'database,fee_payer' }), /HEALTH_CRITICAL/);
+  assert.throws(() => loadConfig({ DATABASE_URL: 'x', HEALTH_CHAIN_WRITER: 'maybe' }), /HEALTH_CHAIN_WRITER/);
+});

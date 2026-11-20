@@ -1,0 +1,58 @@
+[
+  {
+    "object": "markets_question_embedding_hnsw",
+    "kind": "index",
+    "match": "markets_question_embedding_hnsw",
+    "reason": "HNSW index on Unsupported(\"vector(768)\") — cannot be represented in the datamodel; managed by raw SQL in 20261018000002_market_embeddings (#69).",
+    "issue": null,
+    "expires": null
+  },
+  {
+    "object": "copy_trades_txHash_key",
+    "kind": "index",
+    "match": "copy_trades_txHash_key",
+    "reason": "Partial unique index (WHERE txHash IS NOT NULL) — Prisma emits a plain @unique; partial index managed by raw SQL in 20261017000007_copy_trade_verification.",
+    "issue": null,
+    "expires": null
+  },
+  {
+    "object": "subscriptions_txHash_key",
+    "kind": "index",
+    "match": "subscriptions_txHash_key",
+    "reason": "Partial unique index (WHERE txHash IS NOT NULL) — Prisma emits a plain @unique; partial index managed by raw SQL in 20261017000004_subscription_txhash_unique.",
+    "issue": null,
+    "expires": null
+  },
+  {
+    "object": "chain_transactions_unhandled_idx",
+    "kind": "index",
+    "match": "chain_transactions_unhandled_idx",
+    "reason": "Partial covering index (status, updatedAt) INCLUDE (maxTime) WHERE handledAt IS NULL behind the outbox readiness probe; Prisma cannot express partial or INCLUDE indexes. Managed by raw SQL in 20261120110000_outbox_unhandled_index (#220).",
+    "issue": null,
+    "expires": null
+  },
+  {
+    "object": "vector",
+    "kind": "extension",
+    "match": "CREATE EXTENSION",
+    "reason": "pgvector extension installed by raw SQL in 20261007120000_stellar_port; not representable in the Prisma datamodel.",
+    "issue": null,
+    "expires": null
+  },
+  {
+    "object": "market_generation_runs",
+    "kind": "table",
+    "match": "market_generation_runs",
+    "reason": "Orphan table owned by saga issue — model will be added in #242.",
+    "issue": 242,
+    "expires": "2027-01-31"
+  },
+  {
+    "object": "trace_keys",
+    "kind": "table",
+    "match": "trace_keys",
+    "reason": "Orphan table owned by confidential-traces issue — model will be added in #249.",
+    "issue": 249,
+    "expires": "2027-01-31"
+  }
+]

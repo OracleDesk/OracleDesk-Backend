@@ -11,7 +11,9 @@ setupTestEnv();
 type Mod = typeof import('../src/services/health.service');
 type ProbeName = import('../src/services/health.service').ProbeName;
 
-const allCritical: Record<ProbeName, boolean> = { database: true, redis: true, rpc: true, indexer: true };
+const allCritical: Record<ProbeName, boolean> = {
+  database: true, redis: true, rpc: true, indexer: true, pricing: true, outbox: true, signers: true, channels: true,
+};
 
 async function service(
   probes: import('../src/services/health.service').Probe[],
@@ -21,7 +23,11 @@ async function service(
   return createHealthService({ probes, ttlMs: 2000, timeoutMs: 1500, criticality: allCritical, ...over });
 }
 
-const probe = (name: ProbeName, run: () => Promise<{ ok: boolean; error?: string }>) => ({ name, run });
+const probe = (
+  name: ProbeName,
+  run: () => Promise<{ ok: boolean; error?: string; state?: 'ok' | 'degraded' | 'failing' }>,
+  critical?: () => boolean,
+) => ({ name, run, ...(critical ? { critical } : {}) });
 const up = (name: ProbeName) => probe(name, async () => ({ ok: true }));
 
 async function withRouter(health: Awaited<ReturnType<typeof service>>, fn: (base: string) => Promise<void>) {
@@ -201,4 +207,45 @@ test('admin status requires an admin JWT', async () => {
   } finally {
     server.close();
   }
+});
+
+// ─── Chain-write probes (#220) ───────────────────────────────────────────────
+
+test('a degraded probe keeps /readyz 200 with status degraded', async () => {
+  const health = await service([up('database'), probe('outbox', async () => ({ ok: true, state: 'degraded', error: 'backlog' }))]);
+  await withRouter(health, async (base) => {
+    const res = await fetch(`${base}/readyz`);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.data.status, 'degraded');
+    const outbox = body.data.checks.find((c: { name: string }) => c.name === 'outbox');
+    assert.deepEqual({ ok: outbox.ok, state: outbox.state, error: outbox.error }, { ok: true, state: 'degraded', error: 'backlog' });
+    // A plain ok check carries no state field: the public shape is unchanged.
+    assert.equal(body.data.checks.find((c: { name: string }) => c.name === 'database').state, undefined);
+  });
+});
+
+test('a failing critical chain-write probe makes /readyz 503 but /livez stays 200', async () => {
+  const failing = (name: ProbeName) => probe(name, async () => ({ ok: false, error: 'low_balance' }), () => true);
+  const health = await service([up('database'), failing('outbox'), failing('signers'), failing('channels')]);
+  await withRouter(health, async (base) => {
+    assert.equal((await fetch(`${base}/readyz`)).status, 503);
+    const live = await fetch(`${base}/livez`);
+    assert.equal(live.status, 200);
+    assert.equal((await live.json()).data.status, 'alive');
+  });
+});
+
+test('a probe gated off at run time is never critical, even when listed in HEALTH_CRITICAL', async () => {
+  const health = await service([up('database'), probe('signers', async () => ({ ok: false, error: 'low_balance' }), () => false)]);
+  const { ready, checks } = await health.readiness();
+  assert.equal(ready, true);
+  assert.equal(checks.find((c) => c.name === 'signers')!.critical, false);
+  assert.equal(checks.find((c) => c.name === 'signers')!.state, 'failing');
+});
+
+test('chain-write probes are registered with the default probes', async () => {
+  const { defaultProbes } = await import('../src/services/health.service');
+  const names = defaultProbes.map((p) => p.name);
+  for (const name of ['outbox', 'signers', 'channels']) assert.ok(names.includes(name as ProbeName), name);
 });

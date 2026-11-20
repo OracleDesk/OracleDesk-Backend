@@ -3,13 +3,12 @@ import { logger } from '../lib/logger';
 import { writeAgentLog } from '../lib/agent-log';
 import { AppError } from '../middlewares/error.middleware';
 import type { HedgeRecommendation } from '../types';
-import { decimalToBigint } from '../lib/amounts';
+import { decimalToBigint, priceToBps, toDisplayUsdc, usdcFromNumber } from '../lib/amounts';
 import { pauseAgent } from './agent-controls.service';
 
 // ─── Hedging constants ───
-const HEDGE_TRIGGER_EDGE_DECAY  = 0.50;  // Hedge when edge decays by 50%
-const HEDGE_SIZE_FRACTION       = 0.50;  // Hedge 50% of original position
-const MAX_DAILY_DRAWDOWN_PCT    = 0.03;  // 3% daily drawdown → pause agent
+const HEDGE_SIZE_BPS            = 5_000n; // Hedge 50% of original position
+const MAX_DAILY_DRAWDOWN_BPS    = 300n;  // 3% daily drawdown → pause agent
 const DRAWDOWN_PAUSE_HOURS      = 4;     // Pause for 4 hours on max drawdown
 const STOP_LOSS_PCT_BPS         = 1_500n; // Exit once the liquidation value is 15% below cost
 const HEDGE_LOSS_PCT_BPS        = 1_000n; // Hedge once the liquidation value is 10% below cost
@@ -32,6 +31,10 @@ export interface HedgePositionInput {
   currentPrice: number | null;
   size:         number;
   pnl:          number;
+  entryPriceBps?: number | null;
+  currentPriceBps?: number | null;
+  sizeRaw?: bigint | null;
+  edgeBps?: number;
   /** Raw cost and liquidation-based unrealised PnL (#78); the loss test prefers them over `pnl`. */
   costBasisRaw?:     bigint | null;
   unrealisedPnlRaw?: bigint | null;
@@ -60,21 +63,19 @@ export async function planHedges(
   const recommendations: HedgeRecommendation[] = [];
 
   for (const position of positions) {
-    const originalEdge = position.edgeDetected;
-    const currentPrice = position.currentPrice ?? position.entryPrice;
+    const entryPriceBps = position.entryPriceBps ?? priceToBps(position.entryPrice);
+    const currentPriceBps = position.currentPriceBps ??
+      (position.currentPrice === null ? entryPriceBps : priceToBps(position.currentPrice));
+    const edgeBps = position.edgeBps ?? Math.round(position.edgeDetected * 10_000);
 
     // Calculate current edge degradation
-    const entryEdge = position.direction === 'YES'
-      ? originalEdge
-      : -originalEdge;
+    const entryEdgeBps = position.direction === 'YES' ? edgeBps : -edgeBps;
+    const currentEdgeBps = entryEdgeBps - (currentPriceBps - entryPriceBps);
 
-    const priceChange = currentPrice - position.entryPrice;
-    const currentEdge = entryEdge - priceChange;
-
-    const edgeDegraded = currentEdge < entryEdge * (1 - HEDGE_TRIGGER_EDGE_DECAY);
+    const edgeDegraded = currentEdgeBps * 2 < entryEdgeBps;
     const hasLoss = position.costBasisRaw != null && position.unrealisedPnlRaw != null
       ? lossReaches(position.costBasisRaw, position.unrealisedPnlRaw, HEDGE_LOSS_PCT_BPS)
-      : position.pnl < -(position.size * 0.10);
+      : position.sizeRaw == null && position.pnl < -(position.size * 0.10);
 
     if (!edgeDegraded && !hasLoss) continue;
 
@@ -83,7 +84,10 @@ export async function planHedges(
 
     if (!hedgeMarket) continue;
 
-    const hedgeSize = position.size * HEDGE_SIZE_FRACTION;
+    const baseSizeRaw = position.sizeRaw ?? usdcFromNumber(position.size);
+    const hedgeSizeRaw = (baseSizeRaw * HEDGE_SIZE_BPS) / 10_000n;
+    if (hedgeSizeRaw <= 0n) continue;
+    const hedgeSize = toDisplayUsdc(hedgeSizeRaw);
     const hedgeDirection = position.direction === 'YES' ? 'NO' : 'YES';
 
     recommendations.push({
@@ -91,7 +95,8 @@ export async function planHedges(
       hedgeMarketId:    hedgeMarket.id,
       hedgeDirection,
       hedgeSize,
-      rationale: `Edge decayed from ${entryEdge.toFixed(3)} to ${currentEdge.toFixed(3)}. ` +
+      hedgeSizeRaw,
+      rationale: `Edge decayed from ${(entryEdgeBps / 10_000).toFixed(3)} to ${(currentEdgeBps / 10_000).toFixed(3)}. ` +
                  `Partial hedge of ${hedgeSize} USDC via ${hedgeMarket.id} reduces net exposure by ~50%.`,
     });
   }
@@ -106,8 +111,13 @@ export async function detectHedgeOpportunities(): Promise<HedgeRecommendation[]>
     include: { market: { select: { id: true, category: true, currentYesProb: true, totalLiquidity: true } }, trade: true },
   });
 
-  return planHedges(
-    openPositions.map((position) => ({
+  const hedgeInputs: HedgePositionInput[] = [];
+  for (const position of openPositions) {
+    if (position.costBasisRaw == null) {
+      logger.warn({ positionId: position.id }, 'Skipping hedge without exact position cost basis');
+      continue;
+    }
+    hedgeInputs.push({
       marketId:     position.market.id,
       category:     position.market.category,
       direction:    position.direction,
@@ -115,10 +125,17 @@ export async function detectHedgeOpportunities(): Promise<HedgeRecommendation[]>
       currentPrice: position.currentPrice,
       size:         position.size,
       pnl:          position.pnl,
-      costBasisRaw:     position.costBasisRaw == null ? null : decimalToBigint(position.costBasisRaw),
+      entryPriceBps: position.entryPriceBps,
+      currentPriceBps: position.markPriceBps,
+      sizeRaw: decimalToBigint(position.costBasisRaw),
+      costBasisRaw: decimalToBigint(position.costBasisRaw),
       unrealisedPnlRaw: position.unrealisedPnlRaw == null ? null : decimalToBigint(position.unrealisedPnlRaw),
+      edgeBps: position.trade?.edgeBps ?? Math.round((position.trade?.edgeDetected ?? 0) * 10_000),
       edgeDetected: position.trade?.edgeDetected ?? 0,
-    })),
+    });
+  }
+  return planHedges(
+    hedgeInputs,
     findHedgeMarket,
   );
 }
@@ -145,16 +162,23 @@ export async function autoHedge(recommendation: HedgeRecommendation): Promise<an
       'Hedge market has insufficient liquidity');
   }
 
+  const priceBps = priceToBps(
+    recommendation.hedgeDirection === 'YES'
+      ? hedgeMarket.currentYesProb ?? 0.5
+      : 1 - (hedgeMarket.currentYesProb ?? 0.5),
+  );
+
   // Create a hedge trade record
   const hedgeTrade = await prisma.trade.create({
     data: {
       marketId:      recommendation.hedgeMarketId,
       direction:     recommendation.hedgeDirection,
       status:        'PENDING',
-      amount:        recommendation.hedgeSize,
-      price:         recommendation.hedgeDirection === 'YES'
-                       ? hedgeMarket.currentYesProb ?? 0.5
-                       : 1 - (hedgeMarket.currentYesProb ?? 0.5),
+      amount:        toDisplayUsdc(recommendation.hedgeSizeRaw),
+      amountRaw:     recommendation.hedgeSizeRaw.toString(),
+      priceBps,
+      price:         priceBps / 10_000,
+      edgeBps:       0,
       edgeDetected:  0, // Hedges don't require positive edge
       kellyFraction: 0,
     },
@@ -207,7 +231,12 @@ export async function enforceStopLoss(positionId: string): Promise<{
   if (position.costBasisRaw != null && position.unrealisedPnlRaw != null) {
     return evaluateLiquidationStopLoss(decimalToBigint(position.costBasisRaw), decimalToBigint(position.unrealisedPnlRaw));
   }
-  return evaluateStopLoss(position);
+  return evaluateStopLoss({
+    entryPriceBps: position.entryPriceBps,
+    currentPriceBps: position.markPriceBps,
+    entryPrice: position.entryPrice,
+    currentPrice: position.currentPrice,
+  });
 }
 
 /** True when the unrealised loss is at least `pctBps` of the cost basis. */
@@ -228,26 +257,34 @@ export function evaluateLiquidationStopLoss(costBasisRaw: bigint, unrealisedPnlR
   return { shouldClose: true, reason: `STOP_LOSS: Liquidation value ${(Number(lossBps) / 100).toFixed(1)}% below cost` };
 }
 
-/** Legacy stop-loss rule for positions without shares: close once the price has moved 15% from entry. */
-export function evaluateStopLoss(position: { entryPrice: number; currentPrice: number | null }): {
+/** Legacy stop-loss rule, evaluated in integer basis points. */
+export function evaluateStopLoss(position: {
+  entryPriceBps?: number | null;
+  currentPriceBps?: number | null;
+  entryPrice: number;
+  currentPrice: number | null;
+}): {
   shouldClose: boolean;
   reason?: string;
 } {
-  const currentPrice = position.currentPrice ?? position.entryPrice;
-  const adverseMove = Math.abs(currentPrice - position.entryPrice) / position.entryPrice;
-
-  if (adverseMove >= 0.15) {
-    return { shouldClose: true, reason: `STOP_LOSS: Adverse move of ${(adverseMove * 100).toFixed(1)}%` };
-  }
-
-  return { shouldClose: false };
+  const entryBps = position.entryPriceBps ?? priceToBps(position.entryPrice);
+  const currentBps = position.currentPriceBps ??
+    (position.currentPrice === null ? entryBps : priceToBps(position.currentPrice));
+  if (entryBps <= 0 || currentBps >= entryBps) return { shouldClose: false };
+  const adverseBps = BigInt(entryBps - currentBps);
+  if (adverseBps * 10_000n < BigInt(entryBps) * STOP_LOSS_PCT_BPS) return { shouldClose: false };
+  const lossBps = (adverseBps * 10_000n) / BigInt(entryBps);
+  return {
+    shouldClose: true,
+    reason: `STOP_LOSS: Adverse move of ${(Number(lossBps) / 100).toFixed(1)}%`,
+  };
 }
 
 /**
  * Checks if the daily drawdown limit has been breached.
  * If yes, pauses new trade execution for DRAWDOWN_PAUSE_HOURS.
  */
-export async function checkDailyDrawdown(bankroll: number): Promise<{
+export async function checkDailyDrawdown(bankrollRaw: bigint): Promise<{
   isPaused:      boolean;
   drawdownPct:   number;
   pauseUntil?:   Date;
@@ -259,10 +296,17 @@ export async function checkDailyDrawdown(bankroll: number): Promise<{
       status:   { in: ['CLOSED', 'STOP_LOSS'] },
       closedAt: { gte: todayStart },
     },
-    select: { pnl: true },
+    select: { realisedPnlRaw: true, unrealisedPnlRaw: true },
   });
 
-  const result = evaluateDailyDrawdown(todayTrades.map((t) => t.pnl), bankroll, new Date());
+  const result = evaluateDailyDrawdown(
+    todayTrades.map((t) =>
+      decimalToBigint(t.realisedPnlRaw) +
+      (t.unrealisedPnlRaw == null ? 0n : decimalToBigint(t.unrealisedPnlRaw)),
+    ),
+    bankrollRaw,
+    new Date(),
+  );
   if (result.isPaused) await recordDrawdownPause(result);
   return { isPaused: result.isPaused, drawdownPct: result.drawdownPct, pauseUntil: result.pauseUntil };
 }
@@ -271,6 +315,7 @@ export interface DrawdownEvaluation {
   isPaused:    boolean;
   drawdownPct: number;
   dailyLoss:   number;
+  dailyLossRaw: bigint;
   pauseUntil?: Date;
 }
 
@@ -278,22 +323,27 @@ export interface DrawdownEvaluation {
  * Pure drawdown rule over the P&L of positions closed today: the sum of the
  * losses (wins do not offset them) as a share of the bankroll.
  */
-export function evaluateDailyDrawdown(closedPnl: number[], bankroll: number, now: Date): DrawdownEvaluation {
-  const dailyLoss = closedPnl
-    .filter(pnl => pnl < 0)
-    .reduce((acc, pnl) => acc + Math.abs(pnl), 0);
+export function evaluateDailyDrawdown(closedPnlRaw: bigint[], bankrollRaw: bigint, now: Date): DrawdownEvaluation {
+  const dailyLossRaw = closedPnlRaw
+    .filter((pnl) => pnl < 0n)
+    .reduce((acc, pnl) => acc - pnl, 0n);
+  const dailyLoss = toDisplayUsdc(dailyLossRaw);
+  const drawdownBps = bankrollRaw > 0n ? (dailyLossRaw * 10_000n) / bankrollRaw : 0n;
+  const drawdownPct = bankrollRaw > 0n ? Number(drawdownBps) / 10_000 : (dailyLossRaw > 0n ? Infinity : 0);
+  const isPaused = bankrollRaw > 0n
+    ? dailyLossRaw * 10_000n >= bankrollRaw * MAX_DAILY_DRAWDOWN_BPS
+    : dailyLossRaw > 0n;
 
-  const drawdownPct = dailyLoss / bankroll;
-
-  if (drawdownPct >= MAX_DAILY_DRAWDOWN_PCT) {
+  if (isPaused) {
     return {
       isPaused: true,
       drawdownPct,
       dailyLoss,
+      dailyLossRaw,
       pauseUntil: new Date(now.getTime() + DRAWDOWN_PAUSE_HOURS * 60 * 60 * 1000),
     };
   }
-  return { isPaused: false, drawdownPct, dailyLoss };
+  return { isPaused: false, drawdownPct, dailyLoss, dailyLossRaw };
 }
 
 /**
@@ -301,20 +351,29 @@ export function evaluateDailyDrawdown(closedPnl: number[], bankroll: number, now
  * the next cycle, a restart and every other instance see it (#79).
  */
 export async function recordDrawdownPause(result: DrawdownEvaluation): Promise<void> {
-  logger.warn({ drawdownPct: result.drawdownPct, pauseUntil: result.pauseUntil }, 'Daily drawdown limit reached — pausing agent');
+  logger.warn({
+    drawdownPct: result.drawdownPct,
+    dailyLossRaw: result.dailyLossRaw.toString(),
+    pauseUntil: result.pauseUntil,
+  }, 'Daily drawdown limit reached — pausing agent');
 
   await pauseAgent('TRADER', {
     source: 'drawdown',
     actor: 'system',
     until: result.pauseUntil,
-    reason: `Daily drawdown ${(result.drawdownPct * 100).toFixed(2)}% reached the ${(MAX_DAILY_DRAWDOWN_PCT * 100).toFixed(0)}% limit`,
+    reason: `Daily drawdown ${(result.drawdownPct * 100).toFixed(2)}% reached the 3% limit`,
   });
 
   await writeAgentLog({
     agentType: 'TRADER',
     level:     'WARN',
     action:    'DRAWDOWN_PAUSE',
-    data:      { drawdownPct: result.drawdownPct, dailyLoss: result.dailyLoss, pauseUntil: result.pauseUntil?.toISOString() },
+    data:      {
+      drawdownPct: result.drawdownPct,
+      dailyLoss: result.dailyLoss,
+      dailyLossRaw: result.dailyLossRaw.toString(),
+      pauseUntil: result.pauseUntil?.toISOString(),
+    },
   });
 }
 

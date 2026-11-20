@@ -183,6 +183,37 @@ export interface AcquireLockDeps {
 
 const LOCK_POLL_MS = 50;
 const LOCK_POLL_JITTER_MS = 25;
+// Waiter heartbeat TTL: must be > 3× LOCK_POLL_MS + jitter to survive a GC pause (#264).
+const WAITER_HEARTBEAT_TTL_MS = 3 * (LOCK_POLL_MS + LOCK_POLL_JITTER_MS) + 500;
+
+/**
+ * Lua: remove the head member of <key>:queue when its waiter heartbeat key is
+ * missing (dead process), then return the new head. Called by non-head waiters
+ * each poll so a crashed waiter cannot wedge the queue indefinitely (#264).
+ */
+const PRUNE_HEAD_LUA = `
+local head = redis.call('ZRANGE', KEYS[1], 0, 0)
+if #head == 0 then return '' end
+local hk = KEYS[2] .. ':' .. head[1]
+if redis.call('EXISTS', hk) == 0 then
+  redis.call('ZREM', KEYS[1], head[1])
+  head = redis.call('ZRANGE', KEYS[1], 0, 0)
+end
+return #head > 0 and head[1] or ''
+`;
+
+/** All queue members registered by this process — removed by releaseAllWaiters() on shutdown (#264). */
+const ownedWaiters = new Map<string, string>(); // queueKey → member
+
+/** Remove every queue member this process registered. Called during shutdown before closeRedis(). */
+export async function releaseAllWaiters(r: Redis = getRedis()): Promise<void> {
+  await Promise.all(
+    Array.from(ownedWaiters.entries()).map(([queueKey, member]) =>
+      r.zrem(queueKey, member).catch(() => undefined),
+    ),
+  );
+  ownedWaiters.clear();
+}
 
 /**
  * Fair, FIFO per-key lock. Waiters take a monotonic ticket from
@@ -208,25 +239,42 @@ export async function acquireLock(
   const fence = await redis.incr(`${key}:fence`);
   const member = `${fence}:${token}`;
   const queueKey = `${key}:queue`;
+  const heartbeatKey = `${queueKey}:${member}`;
   await redis.zadd(queueKey, fence, member);
+  // Heartbeat key proves this waiter is alive; renewed each poll (#264).
+  await redis.set(heartbeatKey, '1', 'PX', WAITER_HEARTBEAT_TTL_MS);
+  ownedWaiters.set(queueKey, member);
   const deadline = now() + waitMs;
 
   try {
     for (;;) {
+      // Renew heartbeat so the PRUNE_HEAD_LUA doesn't reap us during GC pauses.
+      await redis.set(heartbeatKey, '1', 'PX', WAITER_HEARTBEAT_TTL_MS).catch(() => undefined);
+
       const head = await redis.zrange(queueKey, 0, 0);
       if (head.length > 0 && head[0] === member) {
         const acquired = await redis.set(key, token, 'PX', ttlMs, 'NX');
         if (acquired === 'OK') {
           await redis.zrem(queueKey, member);
+          await redis.del(heartbeatKey).catch(() => undefined);
+          ownedWaiters.delete(queueKey);
           return { token, fence };
         }
+      } else {
+        // Not the head: prune it if it is dead (#264).
+        await redis.eval(PRUNE_HEAD_LUA, 2, queueKey, queueKey).catch(() => undefined);
       }
       if (now() >= deadline) return null;
       await sleep(LOCK_POLL_MS + Math.floor(random() * LOCK_POLL_JITTER_MS));
     }
   } catch (err) {
     await redis.zrem(queueKey, member).catch(() => undefined);
+    await redis.del(heartbeatKey).catch(() => undefined);
+    ownedWaiters.delete(queueKey);
     throw err;
+  } finally {
+    // Always remove from owned set when we exit (success, timeout or error).
+    ownedWaiters.delete(queueKey);
   }
 }
 

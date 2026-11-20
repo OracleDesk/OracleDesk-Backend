@@ -18,11 +18,17 @@ on:
       values_file:
         required: true
         type: string
+      # Set only for a release whose PR carries the `migration:breaking` label
+      # (e.g. the #224 payments float contract); passes --allow-breaking.
+      allow_breaking_migrations:
+        required: false
+        type: boolean
+        default: false
     secrets:
       KUBECONFIG:
         required: true
       DATABASE_URL:
-        required: true
+        required: false
       HELM_VALUES:
         required: false
 
@@ -55,14 +61,14 @@ jobs:
         run: |
           changed="$(git diff --name-only HEAD^ HEAD -- prisma/migrations || true)"
           if [[ -n "$changed" ]]; then
-            printf '%s\n' "$changed" | xargs node scripts/check-migration-compat.mjs
+            flags=()
+            if [[ "${{ inputs.allow_breaking_migrations }}" == "true" ]]; then flags+=(--allow-breaking); fi
+            printf '%s\n' "$changed" | xargs node scripts/check-migration-compat.mjs "${flags[@]}"
           else
             echo "No migration files changed in this release"
           fi
-      - name: Apply migrations
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: npx prisma migrate deploy
+      # Migrations are executed in-cluster by the Helm pre-install/pre-upgrade Job
+      # using the exact release image digest (deploy/helm/oracledesk-backend/templates/migrate-job.yaml).
       - name: Helm upgrade
         env:
           HELM_VALUES: ${{ secrets.HELM_VALUES }}

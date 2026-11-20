@@ -167,12 +167,43 @@ Writing an integration test:
 - Use `withRedisPrefix()` from `tests/helpers/redis.ts` so parallel files don't
   share Redis keys.
 
+### Outbox crash matrix
+
+`tests/integration/outbox-recovery.int.test.ts` (#229) kills a live chain write
+at each point of the outbox state machine and checks that recovery applies
+exactly one domain effect for `market.create`, `trade.buy`, `trade.sell` and
+`trace.publish`. The crash points are named in `chain.service.ts`
+(`setCrashHookForTest`, inert unless `NODE_ENV=test`):
+
+| Crash point | Row left behind |
+|---|---|
+| `after-built` | `BUILT`, nothing signed |
+| `after-signed` | `SIGNED`, envelope and hash stored, never sent |
+| `after-send-accepted` | `SUBMITTED`, sequence not yet advanced |
+| `after-send-timeout` | `SIGNED`, the send timed out (it may have reached the network) |
+| `after-advance` | `SUBMITTED`, sequence advanced, no confirmation |
+
+The suite also crashes after a completion handler ran but before `markHandled`,
+and runs two recoverers with separate Prisma clients at once. The pieces live
+in `tests/helpers/outbox-harness.ts`: `freshModules()` (a process restart: new
+module copies, new Prisma client), `fakeChain()` (a scriptable RPC wired into
+`setTransactionSender`/`setTransactionReader`/`RecoverDeps.server`) and
+`installBindings()`. Run it with Docker running, or with `TEST_DATABASE_URL` and
+`TEST_REDIS_URL` set:
+
+```
+npm run build:test
+node --test --test-global-setup=dist-tests/tests/integration/global-setup.js \
+  dist-tests/tests/integration/outbox-recovery.int.test.js
+```
+
 ## Recording cassettes
 
 The agent-cycle tests (`tests/agents-cycle.test.ts`) run `runMarketMakerCycle()`
 and `runTraderCycle()` end to end without a network. Every Anthropic, Gemini,
-NewsAPI, FRED and GDELT request goes through a transport seam
-(`setAnthropicTransport`, `setGeminiTransport`, `setSignalHttp`) and is served
+OpenAI, NewsAPI, FRED and GDELT request goes through a transport seam
+(`setAnthropicTransport`, `setGeminiTransport`, `setOpenAITransport`,
+`setSignalHttp`) and is served
 from a cassette in `tests/cassettes/`. The library is `tests/helpers/cassettes.ts`.
 
 `CASSETTE_MODE` selects the mode:
@@ -211,7 +242,7 @@ file `"synthetic": true`. The committed cassettes are all synthetic for now;
 replace them with live recordings when you have keys.
 
 Before a cassette is written, the secret guard scans it for the configured key
-values and key-shaped strings (`sk-ant-…`, `AIza…`, 32-hex values in key
+values and key-shaped strings (`sk-ant-…`, OpenAI `sk-…`/`sk-proj-…`, `AIza…`, 32-hex values in key
 fields) and refuses to write it. `tests/cassettes-secrets.test.ts` runs the
 same scan over every committed cassette on every `npm test`. NewsAPI article
 text is third-party content: the recorder keeps only the six articles the

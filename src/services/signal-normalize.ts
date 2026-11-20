@@ -212,7 +212,30 @@ export function classifyNewsCategory(title: string): Classification {
 /** Half-life of a signal's recency weight. */
 export const RECENCY_HALF_LIFE_HOURS = 12;
 
-export const sourceWeight = (source: string): number => SOURCE_WEIGHTS[source.toUpperCase()] ?? 0.5;
+/**
+ * A weight table (#223): keys are `source:<SOURCE>` and `publisher:<outlet>`
+ * (see {@link publisherKey}). `id`/`version` identify the source_weight_sets
+ * row; the compiled fallback is `{ id: null, version: 0 }`.
+ */
+export interface SourceWeightTable {
+  id: string | null;
+  version: number;
+  weights: Readonly<Record<string, number>>;
+}
+
+/** Normalised publisher for weight keys: trimmed and lowercased ("Reuters" → "reuters"). */
+export const publisherKey = (publisher: string): string => publisher.trim().toLowerCase();
+
+/**
+ * Credibility weight of a signal. Without a table this is the compiled
+ * SOURCE_WEIGHTS lookup (publisher ignored), exactly as before #223. With a
+ * table: the publisher's weight, else the source's, else 0.5.
+ */
+export function sourceWeight(source: string, publisher?: string | null, table?: SourceWeightTable): number {
+  if (!table) return SOURCE_WEIGHTS[source.toUpperCase()] ?? 0.5;
+  const byPublisher = publisher ? table.weights[`publisher:${publisherKey(publisher)}`] : undefined;
+  return byPublisher ?? table.weights[`source:${source.toUpperCase()}`] ?? 0.5;
+}
 
 /** 1 for a signal published now, halving every RECENCY_HALF_LIFE_HOURS; never above 1. */
 export function recencyDecay(publishedAt: Date, now: Date): number {
@@ -226,9 +249,17 @@ export function recencyDecay(publishedAt: Date, now: Date): number {
  * A story carried by several outlets counts more, but logarithmically, so
  * syndication cannot drown out a single primary source. FRED rows age from
  * when the observation was last seen (`ageFrom`), not from the observation
- * date, which is the start of the reporting period.
+ * date, which is the start of the reporting period. `table` (#223) is the
+ * weight set of the current aggregation; omitted, the compiled table is used.
  */
-export function relevanceScore(source: string, ageFrom: Date, clusterSize: number, now: Date): number {
-  const score = sourceWeight(source) * recencyDecay(ageFrom, now) * Math.log2(1 + Math.max(1, clusterSize));
+export function relevanceScore(
+  source: string,
+  ageFrom: Date,
+  clusterSize: number,
+  now: Date,
+  table?: SourceWeightTable,
+  publisher?: string | null,
+): number {
+  const score = sourceWeight(source, publisher, table) * recencyDecay(ageFrom, now) * Math.log2(1 + Math.max(1, clusterSize));
   return Math.round(score * 10_000) / 10_000;
 }

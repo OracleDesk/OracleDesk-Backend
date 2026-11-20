@@ -7,12 +7,17 @@ import { logger } from '../../lib/logger';
 import { ChainError } from './errors';
 import { shutdownController } from '../../lib/shutdown';
 import { authExpirationLedger, NOMINAL_LEDGER_SECONDS } from './timebounds';
+import { readNativeBalance, xlmToStroops } from './balances';
 
 export interface ChannelAccount {
   publicKey: string;
   keypair: Keypair;
   healthy: boolean;
-  lastBalanceXlm: number;
+  /** Null until the first balance check; an unchecked channel counts as healthy. */
+  lastBalanceXlm: number | null;
+  /** Exact native balance in stroops from getAccountEntry (#220). */
+  lastBalanceStroops?: bigint | null;
+  lastCheckedAt?: string | null;
 }
 
 export interface LeasedChannel {
@@ -38,7 +43,7 @@ export class ChannelPool {
 
   constructor(
     private readonly redis = getRedis(),
-    private readonly rpcServer: rpc.Server | any = null,
+    private readonly rpcServer: Pick<rpc.Server, 'getAccountEntry'> | null = null,
   ) {
     this.initChannels();
   }
@@ -76,7 +81,9 @@ export class ChannelPool {
         publicKey: pub,
         keypair,
         healthy: true,
-        lastBalanceXlm: 100, // Initial nominal balance; updated by monitor
+        lastBalanceXlm: null, // unknown until the balance monitor runs (#220)
+        lastBalanceStroops: null,
+        lastCheckedAt: null,
       });
     }
 
@@ -154,20 +161,26 @@ export class ChannelPool {
   }
 
   /**
-   * Fetches on-chain XLM balances for all channels from Stellar RPC.
+   * Fetches on-chain native balances for all channels from Stellar RPC.
    * Channels with balance below CHANNEL_MIN_BALANCE_XLM are taken out of rotation.
+   *
+   * Reads the ledger entry (getAccountEntry): rpc.Server.getAccount returns an
+   * SDK Account with only id and sequence, so the old balances lookup read
+   * every channel as 0 XLM (#220). Compared as bigint stroops.
    */
   public async checkBalances(): Promise<void> {
     if (!this.rpcServer || this.channels.length === 0) return;
+    const minStroops = xlmToStroops(config.CHANNEL_MIN_BALANCE_XLM);
 
     for (const channel of this.channels) {
       try {
-        const account = await this.rpcServer.getAccount(channel.publicKey);
-        const nativeBalance = account?.balances?.find((b: any) => b.asset_type === 'native');
-        const xlm = nativeBalance ? parseFloat(nativeBalance.balance) : 0;
+        const stroops = await readNativeBalance(this.rpcServer, channel.publicKey);
+        const xlm = Number(stroops) / 1e7; // display only
+        channel.lastBalanceStroops = stroops;
         channel.lastBalanceXlm = xlm;
+        channel.lastCheckedAt = new Date().toISOString();
 
-        if (xlm < config.CHANNEL_MIN_BALANCE_XLM) {
+        if (stroops < minStroops) {
           if (channel.healthy) {
             channel.healthy = false;
             logger.warn(
@@ -188,6 +201,8 @@ export class ChannelPool {
     if (this.monitorTimer || config.NODE_ENV === 'test' || config.CHAIN_EXECUTION_MODE !== 'live') {
       return;
     }
+    // First read now, so the pool's healthy flags are real before the first interval.
+    this.checkBalances().catch(() => undefined);
     this.monitorTimer = setInterval(() => {
       this.checkBalances().catch(() => undefined);
     }, intervalMs);

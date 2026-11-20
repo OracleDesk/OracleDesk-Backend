@@ -5,6 +5,10 @@
  * touches a dependency, so a database outage cannot restart every instance.
  * Readiness runs one probe per dependency with a timeout, caches results for a
  * short TTL and shares one in-flight run between concurrent callers.
+ *
+ * Chain-write probes (outbox, signers, channels; #220) are tri-state: a
+ * degraded result keeps ok: true (readiness unaffected, /readyz reports
+ * status "degraded"), and they are only critical on an instance that writes.
  */
 import { monitorEventLoopDelay } from 'perf_hooks';
 import { config } from '../config';
@@ -13,12 +17,20 @@ import { logger } from '../lib/logger';
 import { getRedis } from '../lib/redis';
 import { rpcServer } from './stellar/clients';
 import { CURSOR_ID } from './indexer.service';
+import { latestLedgerView, indexerLag } from './chain-freshness.service';
+import { chainWriteProbes } from './chain-write-health.service';
 
-export type ProbeName = 'database' | 'redis' | 'rpc' | 'indexer';
+export { isChainWriter, chainWritesStatus } from './chain-write-health.service';
+
+export type ProbeName = 'database' | 'redis' | 'rpc' | 'indexer' | 'pricing' | 'outbox' | 'signers' | 'channels';
+
+export type ProbeState = 'ok' | 'degraded' | 'failing';
 
 export interface ProbeResult {
   name: ProbeName;
   ok: boolean;
+  /** Set on every executed probe; degraded keeps ok: true, failing is ok: false (#220). */
+  state?: ProbeState;
   critical: boolean;
   latencyMs: number;
   checkedAt: string;
@@ -33,6 +45,8 @@ export interface ProbeContext {
 
 export interface Probe {
   name: ProbeName;
+  /** Runtime gate ANDed with the configured criticality (chain-write probes: writer only). */
+  critical?: () => boolean;
   run(signal: AbortSignal, ctx: ProbeContext): Promise<Omit<ProbeResult, 'name' | 'critical' | 'latencyMs' | 'checkedAt'>>;
 }
 
@@ -72,7 +86,7 @@ export function createHealthService(deps: HealthServiceDeps) {
     const started = now();
     const controller = new AbortController();
     let timer: NodeJS.Timeout | undefined;
-    const base = { name: probe.name, critical: deps.criticality[probe.name] };
+    const base = { name: probe.name, critical: Boolean(deps.criticality[probe.name]) && (probe.critical?.() ?? true) };
     try {
       const timeout = new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
@@ -82,13 +96,14 @@ export function createHealthService(deps: HealthServiceDeps) {
         timer.unref();
       });
       const outcome = await Promise.race([probe.run(controller.signal, ctx), timeout]);
-      return { ...base, ...outcome, latencyMs: now() - started, checkedAt: new Date(now()).toISOString() };
+      const state: ProbeState = outcome.ok ? (outcome.state === 'degraded' ? 'degraded' : 'ok') : 'failing';
+      return { ...base, ...outcome, state, latencyMs: now() - started, checkedAt: new Date(now()).toISOString() };
     } catch (err) {
       if (now() - (lastLogged.get(probe.name) ?? -Infinity) >= LOG_INTERVAL_MS) {
         lastLogged.set(probe.name, now());
         logger.warn({ probe: probe.name, err: err instanceof Error ? err.message : err }, 'Health probe failed');
       }
-      return { ...base, ok: false, error: sanitise(err), latencyMs: now() - started, checkedAt: new Date(now()).toISOString() };
+      return { ...base, ok: false, state: 'failing', error: sanitise(err), latencyMs: now() - started, checkedAt: new Date(now()).toISOString() };
     } finally {
       clearTimeout(timer);
     }
@@ -110,9 +125,9 @@ export function createHealthService(deps: HealthServiceDeps) {
   }
 
   return {
-    async readiness(): Promise<{ ready: boolean; checks: ProbeResult[] }> {
+    async readiness(): Promise<{ ready: boolean; degraded: boolean; checks: ProbeResult[] }> {
       const checks = await Promise.all(deps.probes.map((p) => get(p.name)));
-      return { ready: checks.every((c) => c.ok || !c.critical), checks };
+      return { ready: checks.every((c) => c.ok || !c.critical), degraded: checks.some((c) => c.state === 'degraded'), checks };
     },
     /** Process-level only: never calls a dependency probe. */
     liveness(): { alive: boolean; loopDelayMs: number; fatal: boolean } {
@@ -172,6 +187,17 @@ export const defaultProbes: Probe[] = [
       return lagging ? { ok: false, detail, error: 'lagging' } : { ok: true, detail };
     },
   },
+  {
+    name: 'pricing' as ProbeName,
+    async run() {
+      const view = await latestLedgerView();
+      const lag  = await indexerLag(view);
+      const detail = { latestLedger: view.latestLedger, cursorLedger: lag.cursorLedger, lagLedgers: lag.lagLedgers };
+      const fresh  = lag.lagLedgers !== null && lag.lagLedgers <= config.TRADER_MAX_PRICE_LAG_LEDGERS;
+      return fresh ? { ok: true, detail } : { ok: false, detail, error: 'price_source_stale' };
+    },
+  },
+  ...chainWriteProbes(),
 ];
 
 export const health = createHealthService({
@@ -183,6 +209,11 @@ export const health = createHealthService({
     redis: config.HEALTH_CRITICAL.includes('redis'),
     rpc: config.HEALTH_CRITICAL.includes('rpc'),
     indexer: config.HEALTH_CRITICAL.includes('indexer'),
+    pricing: config.HEALTH_CRITICAL.includes('pricing'),
+    // Forced non-critical at run time on non-writer instances (#220).
+    outbox: config.HEALTH_CRITICAL.includes('outbox'),
+    signers: config.HEALTH_CRITICAL.includes('signers'),
+    channels: config.HEALTH_CRITICAL.includes('channels'),
   },
   maxLoopDelayMs: config.LIVENESS_MAX_LOOP_DELAY_MS,
 });

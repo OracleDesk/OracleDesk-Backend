@@ -333,6 +333,7 @@ async function highLevel() {
     cleanup() {
       llm.setAnthropicClient(null);
       llm.setGeminiModelFactory(null);
+      llm.llmRouter.healthBook.reset(); // shared with completeLLM (#218)
       budget.setLlmGuardStore(prevStore);
       budget.setLlmGuardSettings({});
       budget.setLlmWait(null);

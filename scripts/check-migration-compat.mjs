@@ -76,3 +76,41 @@ function main() {
 }
 
 if (process.argv[1] && import.meta.url === `file://${path.resolve(process.argv[1])}`) main();
+
+// ---------------------------------------------------------------------------
+// Folder-name / prefix lint (#262)
+// ---------------------------------------------------------------------------
+
+const PREFIX_RE = /^(\d{14})_/;
+
+/**
+ * Validates migration folder names for a contribution.
+ *
+ * @param {string[]} names      - New folder names being added.
+ * @param {string[]} baseNames  - All existing folder names on the merge base.
+ * @returns {{ ok: boolean; errors: string[] }}
+ */
+export function checkFolderNames(names, baseNames) {
+  const errors = [];
+  const allPrefixes = baseNames.map(n => { const m = PREFIX_RE.exec(n); return m ? m[1] : null; }).filter(Boolean);
+  const maxBase = allPrefixes.length ? allPrefixes.sort().at(-1) : '00000000000000';
+
+  for (const name of names) {
+    const m = PREFIX_RE.exec(name);
+    if (!m) {
+      errors.push(`"${name}": folder name must start with a 14-digit timestamp prefix followed by '_'.`);
+      continue;
+    }
+    const prefix = m[1];
+
+    if (allPrefixes.includes(prefix) || names.filter(n => PREFIX_RE.exec(n)?.[1] === prefix).length > 1) {
+      errors.push(`"${name}": prefix ${prefix} is already used by another migration folder.`);
+    }
+    if (prefix <= maxBase) {
+      errors.push(`"${name}": prefix ${prefix} is not strictly greater than the current maximum (${maxBase}).`);
+    }
+    allPrefixes.push(prefix);
+  }
+
+  return { ok: errors.length === 0, errors };
+}

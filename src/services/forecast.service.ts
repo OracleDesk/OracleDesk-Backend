@@ -31,8 +31,10 @@ import { LlmBudgetExceeded } from '../lib/llm-budget';
 import { defineStructured } from '../lib/llm-schema';
 import { forecastV1 } from '../lib/prompts';
 import { canonicalJson, sha256Hex, verifyTraceHash } from '../utils/hash.util';
+import type { LlmProvenance } from '../lib/llm/provenance';
 import { fetchIpfsBytes } from './ipfs.service';
 import { meaningfulTokens, tokenOverlap } from './market-policy';
+import { activeMap, applyMap, applyMapToInterval, identityMap, type RecalibrationMap } from './recalibration.service';
 import { partitionSignals, renderUntrustedBlock, renderUntrustedRecord, sanitizeSignal, sanitizeSignalText } from './llm-guard.service';
 import baseRateTable from './forecast.base-rates.json';
 import type {
@@ -288,7 +290,7 @@ export function llmForecaster(session: ForecastSession, samples: number = config
     name: 'llm',
     async forecast(input) {
       const { system, user, citations } = buildForecastPrompt(input);
-      const outputs: Array<{ value: LlmForecastOutput; model: string }> = [];
+      const outputs: Array<{ value: LlmForecastOutput; model: string; provenance: LlmProvenance }> = [];
       for (let i = 0; i < samples; i++) {
         if (!session.takeLlmCall()) {
           logger.info({ marketId: input.marketId, llmCalls: session.llmCalls }, 'Forecast LLM call cap reached for this cycle');
@@ -301,7 +303,11 @@ export function llmForecaster(session: ForecastSession, samples: number = config
             task: 'forecasting',
             prompt: { id: forecastV1.id, version: forecastV1.version, hash: forecastV1.contentHash },
           });
-          outputs.push({ value: result.value, model: `${result.provider}:${result.model}` });
+          outputs.push({
+            value: result.value,
+            model: `${result.provider}:${result.model}`,
+            provenance: result.provenance,
+          });
         } catch (err) {
           if (err instanceof LlmBudgetExceeded) {
             logger.warn({ marketId: input.marketId }, 'LLM budget exhausted — no forecast');
@@ -334,6 +340,10 @@ export function llmForecaster(session: ForecastSession, samples: number = config
           adjustments: first.adjustments.map((a) => ({ ...a, signalId: citations[a.signal_id] ?? null })),
           interval50: [first.p_low_50, first.p_high_50],
           samples: outputs.length,
+          // The full provenance of each forecast call (#235), so attribution
+          // and trader-trace provenance can report the forecast prompt and
+          // provider, not just the hedge-conditions call.
+          provenance: outputs.map((o) => o.provenance),
           ...(outputs.length > 1 ? { sampleP: ps } : {}),
         },
       };
@@ -432,11 +442,17 @@ export function setForecastCache(next: ForecastCache | null): ForecastCache {
   return prev;
 }
 
-/** forecast:{marketId}:{signalsDigest} — the question hash and the relevant signals. */
-export function forecastCacheKey(market: Pick<ForecastMarket, 'id' | 'question' | 'questionHash'>, signals: AggregatedSignal[]): string {
+/** forecast:{marketId}:{signalsDigest} — the question hash, the relevant signals and, once a
+ * non-identity recalibration map applies (#244), its id, so a refit invalidates cached forecasts. */
+export function forecastCacheKey(
+  market: Pick<ForecastMarket, 'id' | 'question' | 'questionHash'>,
+  signals: AggregatedSignal[],
+  recalibrationMapId?: string,
+): string {
   const digest = sha256Hex(canonicalJson({
     questionHash: market.questionHash ?? sha256Hex(market.question),
     signals: signals.map((s) => [s.signalId, s.title]),
+    ...(recalibrationMapId ? { recalibration: recalibrationMapId } : {}),
   }));
   return `forecast:${market.id}:${digest}`;
 }
@@ -470,11 +486,13 @@ export async function forecastMarket(
   market: ForecastMarket,
   agg: AggregatedSignals,
   session: ForecastSession,
-  deps: { forecasters?: Forecaster[]; cache?: ForecastCache; fetchDoc?: DocFetcher; now?: Date } = {},
+  deps: { forecasters?: Forecaster[]; cache?: ForecastCache; fetchDoc?: DocFetcher; now?: Date; recalibration?: (category: string) => Promise<RecalibrationMap> } = {},
 ): Promise<MarketForecast | null> {
   const c = deps.cache ?? cache;
   const relevant = relevantSignals(market, agg);
-  const key = forecastCacheKey(market, relevant);
+  const enabled = config.CALIBRATION_SHRINKAGE_ENABLED;
+  const map = await (deps.recalibration ?? defaultRecalibration)(String(market.category));
+  const key = forecastCacheKey(market, relevant, enabled && map.kind !== 'identity' ? map.id : undefined);
   const hit = await c.get(key);
   if (hit) return { forecast: hit, relevant, cached: true };
 
@@ -500,9 +518,45 @@ export async function forecastMarket(
     return null;
   }
 
-  const forecast = ensemble(members, config.FORECAST_SHRINK, forecastInputDigest(input));
+  const forecast = recalibrate(
+    ensemble(members, config.FORECAST_SHRINK, forecastInputDigest(input)),
+    map,
+    String(market.category),
+    enabled,
+  );
   const ttl = config.FORECAST_CACHE_TTL_HOURS * 3600;
   await c.set(key, forecast, ttl);
   await c.markForecast(market.id, now, ttl);
   return { forecast, relevant, cached: false };
+}
+
+// ─── Recalibration (#244) ─────────────────────────────────────────────────────
+
+function defaultRecalibration(category: string): Promise<RecalibrationMap> {
+  return config.CALIBRATION_SHRINKAGE_ENABLED
+    ? activeMap('TRADER', category)
+    : Promise.resolve(identityMap('TRADER', category));
+}
+
+/**
+ * Applies a recalibration map to the ensemble's point estimate and 90%
+ * interval, keeping the raw values. With the flag off (or an identity map)
+ * the forecast is unchanged and records applied=false, so calibration keeps
+ * measuring the raw forecaster either way.
+ */
+export function recalibrate(f: EnsembleForecast, map: RecalibrationMap, category: string, enabled: boolean): EnsembleForecast {
+  const raw = { p: f.p, ci: f.ci };
+  const applied = enabled && map.kind !== 'identity';
+  const calibration = { mapId: map.id, version: map.version, category, applied };
+  if (!applied) return { ...f, raw, calibration };
+  const p = round(applyMap(map, f.p));
+  return {
+    ...f,
+    p,
+    ci: applyMapToInterval(map, f.ci, p),
+    // Keep the interval width consistent with the slope so wide-CI sizing rules still trigger.
+    sigmaLogit: round(f.sigmaLogit * map.b),
+    raw,
+    calibration,
+  };
 }

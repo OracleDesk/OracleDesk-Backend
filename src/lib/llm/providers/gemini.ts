@@ -4,7 +4,7 @@ import { estimateTokens, withLease } from '../../llm-budget';
 import type { LlmErrorKind, LlmProvider, LlmRequest, ModelSpec, ProviderCompletion } from '../types';
 import { LlmError } from '../types';
 
-function mapError(err: unknown): LlmError {
+export function mapGeminiError(err: unknown): LlmError {
   const message = (err as Error)?.message ?? String(err);
   if (isDailyQuotaError(message)) {
     return new LlmError('quota_exhausted', 'gemini', message, 60 * 60 * 1000, [], err);
@@ -78,7 +78,7 @@ export const geminiProvider: LlmProvider = {
       };
     } catch (err) {
       if (err instanceof LlmError || err instanceof AppError) throw err;
-      throw mapError(err);
+      throw mapGeminiError(err);
     }
   },
 };

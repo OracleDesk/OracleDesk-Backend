@@ -1,0 +1,15 @@
+.git
+.github
+contracts/
+deploy/
+docs/
+node_modules
+dist
+dist-tests
+tests
+coverage
+*.env
+*.env.*
+!.env.example
+*.log
+.DS_Store

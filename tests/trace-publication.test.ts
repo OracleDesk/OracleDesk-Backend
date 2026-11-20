@@ -288,3 +288,90 @@ test('a paused agent defers its trace without burning an attempt (#79)', async (
   assert.equal(pub.attempts, 0);
   assert.ok(pub.nextAttemptAt.getTime() > before, 'retried later');
 });
+
+// ─── Payload validation (#227) ──────────────────────────────────────────────
+
+const V2_TRACE_ID = '55555555-5555-4555-8555-555555555555';
+async function v2Payload(onChainMarketId: bigint | null) {
+  const { buildTraceDocV2 } = await import('../src/schemas/trace');
+  return buildTraceDocV2({
+    traceId: V2_TRACE_ID,
+    agentType: 'TRADER', decisionType: 'OPEN_POSITION', action: 'open_position',
+    backendMarketId: '22222222-2222-4222-8222-222222222222', onChainMarketId,
+    probabilityEstimate: 0.6, marketProbability: 0.5, edge: 0.1,
+    confidenceInterval: { lower: 0.5, upper: 0.7 },
+    sourcesUsed: [{ source: 'FRED', weight: 0.9, signal: 'CPI', rawValue: 3.1 }],
+    provenance: {
+      schema: 'oracledesk.trace.provenance/1',
+      llm: [{ source: 'default', promptId: 'hedge-conditions', promptVersion: 1, reason: 'LLM_FAILED' }],
+      generator: { service: 'oracledesk-backend', version: '1.0.0' },
+    },
+  }, new Date('2026-10-17T00:00:00Z'));
+}
+
+function v2Db(payload: unknown, onChainMarketId: bigint | null) {
+  const db = makeDb({ onChainMarketId, marketStatus: 'ACTIVE' });
+  const t = db.store.traces.get('t1');
+  db.store.traces.delete('t1');
+  db.store.traces.set(V2_TRACE_ID, { ...t, id: V2_TRACE_ID });
+  Object.assign(db.store.pubs.get('p1'), { traceId: V2_TRACE_ID, payload });
+  return db;
+}
+
+test('a v2 payload pins exactly the stored document, then publishes', async () => {
+  const { processPublication } = await load();
+  const payload = await v2Payload(7n);
+  const { store, prisma } = v2Db(payload, 7n);
+  const pinned: unknown[] = [];
+  const publisher = fakePublisher();
+  await processPublication(row(store), deps(prisma, { publisher, pin: async (p: unknown) => { pinned.push(p); return pinOk(); } }));
+  assert.equal(pinned.length, 1);
+  assert.strictEqual(pinned[0], store.pubs.get('p1').payload, 'the stored object itself, unchanged');
+  assert.deepEqual(pinned[0], payload);
+  assert.equal(store.pubs.get('p1').status, 'SUBMITTED');
+  assert.equal(publisher.calls[0].market_id, 7n);
+});
+
+test('a v2 payload naming a different on-chain market fails with TRACE_MARKET_MISMATCH', async () => {
+  const { processPublication } = await load();
+  const { store, prisma } = v2Db(await v2Payload(8n), 7n);
+  const publisher = fakePublisher();
+  let pins = 0;
+  await processPublication(row(store), deps(prisma, { publisher, pin: async () => { pins++; return pinOk(); } }));
+  assert.equal(store.pubs.get('p1').status, 'FAILED');
+  assert.equal(store.pubs.get('p1').lastError, 'TRACE_MARKET_MISMATCH');
+  assert.equal(pins, 0, 'nothing is pinned');
+  assert.equal(publisher.calls.length, 0);
+});
+
+test('a mismatch that appears only once the market is on-chain fails before publishing', async () => {
+  const { processPublication } = await load();
+  const { store, prisma } = v2Db(await v2Payload(8n), null);
+  const publisher = fakePublisher();
+  await processPublication(row(store), deps(prisma, { publisher }));
+  assert.equal(store.pubs.get('p1').status, 'AWAITING_MARKET', 'no market id yet: nothing to compare');
+  store.markets.get('m1').onChainMarketId = 7n;
+  await processPublication(row(store), deps(prisma, { publisher }));
+  assert.equal(store.pubs.get('p1').status, 'FAILED');
+  assert.equal(store.pubs.get('p1').lastError, 'TRACE_MARKET_MISMATCH');
+  assert.equal(publisher.calls.length, 0);
+});
+
+test('a payload declaring schemaVersion 2 that fails the v2 schema fails with TRACE_PAYLOAD_INVALID', async () => {
+  const { processPublication } = await load();
+  const payload = { ...(await v2Payload(null)), onChainMarketId: '7' };
+  const { store, prisma } = v2Db(payload, 7n);
+  await processPublication(row(store), deps(prisma));
+  assert.equal(store.pubs.get('p1').status, 'FAILED');
+  assert.equal(store.pubs.get('p1').lastError, 'TRACE_PAYLOAD_INVALID');
+});
+
+test('a legacy payload still pins unchanged', async () => {
+  const { processPublication } = await load();
+  const legacy = { traceId: 't1', agentType: 'MARKET_MAKER', timestamp: '2026-01-01T00:00:00Z', onChainMarketId: '3' };
+  const { store, prisma } = makeDb({ onChainMarketId: 7n, marketStatus: 'ACTIVE', pub: { payload: legacy } });
+  const pinned: unknown[] = [];
+  await processPublication(row(store), deps(prisma, { pin: async (p: unknown) => { pinned.push(p); return pinOk(); } }));
+  assert.deepEqual(pinned, [legacy]);
+  assert.equal(store.pubs.get('p1').status, 'SUBMITTED');
+});

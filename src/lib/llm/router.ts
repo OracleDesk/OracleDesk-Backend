@@ -22,6 +22,8 @@ export interface ProviderHealth {
 export interface Router {
   complete(req: LlmRequest): Promise<LlmResult>;
   health(): Record<string, ProviderHealth>;
+  /** Provider health shared with the structured path (#218). */
+  readonly healthBook: ProviderHealthBook;
 }
 
 export interface RouterOptions {
@@ -48,7 +50,8 @@ function stripFences(text: string): string {
     .trim();
 }
 
-function asLlmError(err: unknown, provider: string): LlmError {
+/** Normalises any provider failure into an LlmError (router and structured path). */
+export function asLlmError(err: unknown, provider: string): LlmError {
   if (err instanceof LlmError) return err;
   const message = (err as Error)?.message ?? String(err);
   const status = (err as { status?: number })?.status;
@@ -60,6 +63,101 @@ function asLlmError(err: unknown, provider: string): LlmError {
   return new LlmError(kind, provider, message, undefined, [], err);
 }
 
+export interface HealthBookOptions {
+  clock: () => number;
+  quotaCooldownMs: number;
+  failureCooldownMs: number;
+  failureThreshold: number;
+}
+
+/**
+ * Per-provider health (#157), shared by `complete()` and the structured path
+ * (#218) so a provider cooled by one is skipped by the other. In-process only:
+ * the cross-instance breaker lives in the shared guards (src/lib/llm-budget.ts).
+ */
+export class ProviderHealthBook {
+  private readonly health = new Map<string, ProviderHealth>();
+
+  constructor(private readonly opts: HealthBookOptions) {}
+
+  /** Current state; an expired cooldown reads as healthy (failures are kept). */
+  stateOf(provider: string): ProviderHealth {
+    const current = this.health.get(provider);
+    if (!current) return { state: 'healthy', consecutiveFailures: 0 };
+    if (current.until !== undefined && current.until <= this.opts.clock() && current.state !== 'healthy') {
+      return { state: 'healthy', consecutiveFailures: current.consecutiveFailures };
+    }
+    return current;
+  }
+
+  /** True while the provider is cooling or open and its window has not passed. */
+  isSkippable(provider: string): { skip: boolean; state: ProviderHealth['state'] } {
+    const current = this.stateOf(provider);
+    const skip = (current.state === 'cooling' || current.state === 'open') && (current.until ?? 0) > this.opts.clock();
+    return { skip, state: current.state };
+  }
+
+  recordSuccess(provider: string): void {
+    this.health.set(provider, { state: 'healthy', consecutiveFailures: 0 });
+  }
+
+  /**
+   * A failed attempt. Rate limits cool the provider for their retry-after,
+   * quota exhaustion opens it, `failureThreshold` server/timeout failures in a
+   * row cool it; anything else only counts the failure. (Inline retries of a
+   * short rate limit are the caller's business and are not recorded.)
+   */
+  recordFailure(provider: string, err: LlmError): void {
+    const clock = this.opts.clock;
+    const currentHealth = this.stateOf(provider);
+
+    if (err.kind === 'rate_limited') {
+      const retryAfter = err.retryAfterMs ?? 30_000;
+      this.health.set(provider, {
+        state: 'cooling',
+        consecutiveFailures: currentHealth.consecutiveFailures + 1,
+        until: clock() + Math.max(retryAfter, 1_000),
+        lastError: err.kind,
+      });
+      return;
+    }
+
+    if (err.kind === 'quota_exhausted') {
+      this.health.set(provider, {
+        state: 'open',
+        consecutiveFailures: currentHealth.consecutiveFailures + 1,
+        until: clock() + this.opts.quotaCooldownMs,
+        lastError: err.kind,
+      });
+      return;
+    }
+
+    if (err.kind === 'server' || err.kind === 'timeout') {
+      const failures = currentHealth.consecutiveFailures + 1;
+      this.health.set(provider, {
+        state: failures >= this.opts.failureThreshold ? 'cooling' : 'healthy',
+        consecutiveFailures: failures,
+        until: failures >= this.opts.failureThreshold ? clock() + this.opts.failureCooldownMs : undefined,
+        lastError: err.kind,
+      });
+      return;
+    }
+
+    // auth / invalid_request / empty / parse / content_filtered: count only.
+    this.health.set(provider, {
+      state: currentHealth.state,
+      consecutiveFailures: currentHealth.consecutiveFailures + 1,
+      until: currentHealth.until,
+      lastError: err.kind,
+    });
+  }
+
+  /** Test seam: forget every provider's history. */
+  reset(): void {
+    this.health.clear();
+  }
+}
+
 export function createRouter(
   policies: LlmPolicies,
   providers: Partial<Record<ModelSpec['provider'], LlmProvider>>,
@@ -69,24 +167,18 @@ export function createRouter(
   const clock = options.clock ?? nowMs;
   const sleep = options.sleep ?? ((ms: number) => clockSleep(ms));
   const retryInlineMaxMs = options.retryInlineMaxMs ?? RETRY_INLINE_MAX_MS;
-  const quotaCooldownMs = options.quotaCooldownMs ?? QUOTA_COOLDOWN_MS;
-  const failureCooldownMs = options.failureCooldownMs ?? FAILURE_COOLDOWN_MS;
-  const failureThreshold = options.failureThreshold ?? FAILURE_THRESHOLD;
-
-  const health = new Map<string, ProviderHealth>();
-  const stateOf = (provider: string): ProviderHealth => {
-    const current = health.get(provider);
-    if (!current) return { state: 'healthy', consecutiveFailures: 0 };
-    if (current.until !== undefined && current.until <= clock() && current.state !== 'healthy') {
-      return { state: 'healthy', consecutiveFailures: current.consecutiveFailures };
-    }
-    return current;
-  };
-  const setHealth = (provider: string, next: ProviderHealth) => health.set(provider, next);
+  const healthBook = new ProviderHealthBook({
+    clock,
+    quotaCooldownMs: options.quotaCooldownMs ?? QUOTA_COOLDOWN_MS,
+    failureCooldownMs: options.failureCooldownMs ?? FAILURE_COOLDOWN_MS,
+    failureThreshold: options.failureThreshold ?? FAILURE_THRESHOLD,
+  });
 
   return {
+    healthBook,
+
     health() {
-      return Object.fromEntries(Object.keys(providers).map((name) => [name, stateOf(name)]));
+      return Object.fromEntries(Object.keys(providers).map((name) => [name, healthBook.stateOf(name)]));
     },
 
     async complete(req) {
@@ -107,8 +199,7 @@ export function createRouter(
           continue;
         }
 
-        const current = stateOf(spec.provider);
-        if ((current.state === 'cooling' || current.state === 'open') && (current.until ?? 0) > clock()) {
+        if (healthBook.isSkippable(spec.provider).skip) {
           previousProvider = spec.provider;
           continue;
         }
@@ -140,7 +231,7 @@ export function createRouter(
             };
             attempts.push(succeeded);
             options.onAttempt?.(succeeded);
-            setHealth(spec.provider, { state: 'healthy', consecutiveFailures: 0 });
+            healthBook.recordSuccess(spec.provider);
             return {
               text,
               provenance: {
@@ -167,7 +258,6 @@ export function createRouter(
             };
             attempts.push(failed);
             options.onAttempt?.(failed);
-            const currentHealth = stateOf(spec.provider);
 
             if (normalized.kind === 'rate_limited') {
               const retryAfter = normalized.retryAfterMs ?? 30_000;
@@ -179,34 +269,6 @@ export function createRouter(
                 await sleep(retryAfter);
                 continue;
               }
-              setHealth(spec.provider, {
-                state: 'cooling',
-                consecutiveFailures: currentHealth.consecutiveFailures + 1,
-                until: clock() + Math.max(retryAfter, 1_000),
-                lastError: normalized.kind,
-              });
-              break;
-            }
-
-            if (normalized.kind === 'quota_exhausted') {
-              setHealth(spec.provider, {
-                state: 'open',
-                consecutiveFailures: currentHealth.consecutiveFailures + 1,
-                until: clock() + quotaCooldownMs,
-                lastError: normalized.kind,
-              });
-              break;
-            }
-
-            if (normalized.kind === 'server' || normalized.kind === 'timeout') {
-              const failures = currentHealth.consecutiveFailures + 1;
-              setHealth(spec.provider, {
-                state: failures >= failureThreshold ? 'cooling' : 'healthy',
-                consecutiveFailures: failures,
-                until: failures >= failureThreshold ? clock() + failureCooldownMs : undefined,
-                lastError: normalized.kind,
-              });
-              break;
             }
 
             if (normalized.kind === 'auth' || normalized.kind === 'invalid_request') {
@@ -214,22 +276,10 @@ export function createRouter(
                 { provider: spec.provider, kind: normalized.kind, task: req.task },
                 'LLM provider rejected the request — failing over',
               );
-              setHealth(spec.provider, {
-                state: currentHealth.state,
-                consecutiveFailures: currentHealth.consecutiveFailures + 1,
-                until: currentHealth.until,
-                lastError: normalized.kind,
-              });
-              break;
             }
 
-            // empty / parse / content_filtered: try the next spec.
-            setHealth(spec.provider, {
-              state: currentHealth.state,
-              consecutiveFailures: currentHealth.consecutiveFailures + 1,
-              until: currentHealth.until,
-              lastError: normalized.kind,
-            });
+            // empty / parse / content_filtered also land here: try the next spec.
+            healthBook.recordFailure(spec.provider, normalized);
             break;
           }
         }

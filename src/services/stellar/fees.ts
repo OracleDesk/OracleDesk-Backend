@@ -92,8 +92,8 @@ export class FeeOracle {
   constructor(
     private networkPassphrase: string = config.STELLAR_NETWORK_PASSPHRASE,
     private rpcUrl: string = config.STELLAR_RPC_URL,
-    private cacheTtlMs: number = (config as any).FEE_STATS_CACHE_MS ?? 10_000,
-    private maxAgeMs: number = (config as any).FEE_STATS_MAX_AGE_MS ?? 60_000,
+    private cacheTtlMs: number = config.FEE_STATS_CACHE_MS,
+    private maxAgeMs: number = config.FEE_STATS_MAX_AGE_MS,
     customSource?: FeeStatsSource,
   ) {
     this.cacheKey = `${this.networkPassphrase}:${this.rpcUrl}`;
@@ -123,7 +123,7 @@ export class FeeOracle {
       maintenance: { ...DEFAULT_FEE_POLICIES.maintenance },
     };
 
-    const overrideJson = (config as any).FEE_POLICY_JSON;
+    const overrideJson: string = config.FEE_POLICY_JSON;
     if (overrideJson) {
       try {
         const overrides = typeof overrideJson === 'string' ? JSON.parse(overrideJson) : overrideJson;

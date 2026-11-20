@@ -152,6 +152,8 @@ interface GeminiCall {
   signal?: AbortSignal;
   /** Rough size of the prompt for the reservation. */
   promptChars: number;
+  /** Model id; defaults to GEMINI_MODEL. Structured calls pass the policy's (#218). */
+  model?: string;
 }
 
 export interface GeminiResult {
@@ -164,6 +166,7 @@ export interface GeminiResult {
 }
 
 async function runGemini(call: GeminiCall): Promise<GeminiResult> {
+  const modelId = call.model ?? GEMINI_MODEL;
   const handle = deadline('llm', call.signal);
   const tally = { attempts: 0 };
   try {
@@ -174,13 +177,13 @@ async function runGemini(call: GeminiCall): Promise<GeminiResult> {
         Math.ceil(call.promptChars / 4) + call.maxTokens,
         async () => {
           const model = getGeminiModel({
-            model: GEMINI_MODEL,
+            model: modelId,
             systemInstruction: call.system,
             generationConfig: { maxOutputTokens: call.maxTokens, ...call.generationConfig } as any,
           });
           const result = await model.generateContent(call.contents, { signal: handle.signal });
           const text: string = result.response.text();
-          const usage = usageOf(result.response, GEMINI_MODEL);
+          const usage = usageOf(result.response, modelId);
           const meta = result.response?.usageMetadata;
           const reportedUsage = meta
             ? { inputTokens: Number(meta.promptTokenCount ?? 0), outputTokens: Number(meta.candidatesTokenCount ?? 0) }
@@ -247,23 +250,31 @@ export async function callGeminiJSON(
 /**
  * Schema-constrained output (#65): `responseSchema` is the Gemini dialect of a
  * zod-derived schema (src/lib/llm-schema.ts). The text is returned verbatim;
- * the caller JSON-parses and validates it, with no fence stripping.
+ * the caller JSON-parses and validates it, with no fence stripping. `model`
+ * and `temperature` come from the task policy (#218); the defaults are the
+ * historical GEMINI_MODEL and GEMINI_STRUCTURED_TEMPERATURE.
  */
 export async function callGeminiStructured(
   systemPrompt: string,
   contents: Content[],
   responseSchema: Record<string, unknown>,
   maxTokens: number,
-  opts?: { signal?: AbortSignal; ctx?: CallContext },
+  opts?: { signal?: AbortSignal; ctx?: CallContext; model?: string; temperature?: number },
 ): Promise<GeminiResult> {
   return runGemini({
     system: systemPrompt,
     contents,
     maxTokens,
-    generationConfig: { responseMimeType: 'application/json', responseSchema, temperature: GEMINI_STRUCTURED_TEMPERATURE, topP: 0.9 },
+    generationConfig: {
+      responseMimeType: 'application/json',
+      responseSchema,
+      temperature: opts?.temperature ?? GEMINI_STRUCTURED_TEMPERATURE,
+      topP: 0.9,
+    },
     promptChars: systemPrompt.length + JSON.stringify(contents).length,
     ctx: opts?.ctx,
     signal: opts?.signal,
+    model: opts?.model,
   });
 }
 

@@ -15,6 +15,7 @@
  * event does not deliver it twice. Leadership is re-checked before delivering
  * (fencing) so a leader that lost the lock during a pause stops emitting.
  */
+import { randomUUID } from 'crypto';
 import type Redis from 'ioredis';
 import type { Server } from 'socket.io';
 import { config } from '../config';
@@ -55,7 +56,9 @@ const LOCAL_SEEN_MAX = 10_000;
 export function startFanout(bus: EventBus, io: Pick<Server, 'emit'>, opts: FanoutOptions = {}): () => Promise<void> {
   const redis = opts.redis ?? getRedis();
   const prefix = opts.prefix ?? 'oracledesk:fanout';
-  const instanceId = opts.instanceId ?? config.INSTANCE_ID;
+  // Per-boot UUID suffix prevents a restarted instance from colliding with its
+  // own still-TTL-alive leader key (#264).
+  const instanceId = opts.instanceId ?? `${config.INSTANCE_ID}:${randomUUID()}`;
   const leaseMs = opts.leaseMs ?? 15_000;
   const renewMs = opts.renewMs ?? 5_000;
   const seenTtl = opts.seenTtlSeconds ?? 3600;

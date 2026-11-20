@@ -87,9 +87,9 @@ test('a drawdown breach pauses TRADER until pauseUntil, then auto-expires with a
   const { prisma } = await import('../src/lib/prisma');
   const { checkDailyDrawdown } = await import('../src/services/hedging.service');
   const controls = await freshControls();
-  (prisma.position.findMany as any) = async () => [{ pnl: -400 }];
+  (prisma.position.findMany as any) = async () => [{ realisedPnlRaw: '-4000000000' }];
   (prisma.agentLog.create as any) = async () => ({});
-  const result = await checkDailyDrawdown(10_000);
+  const result = await checkDailyDrawdown(100_000_000_000n);
   assert.equal(result.isPaused, true);
   const row = store.rows.get('TRADER')!;
   assert.equal(row.source, 'drawdown');

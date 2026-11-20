@@ -179,3 +179,110 @@ test('an over-allowance payment is granted and flagged, never refused or dropped
 });
 
 test.todo('rolls back on mid-transaction failure (needs a fault-injection hook in recordPayment)');
+
+// ─── Allowance day buckets (#219) ─────────────────────────────────────────
+
+function verified(n: number, from: string, amount: bigint, closeIso: string) {
+  return {
+    txHash: n.toString(16).padStart(2, '0').repeat(32),
+    from,
+    to: recipient,
+    amount,
+    ledger: 1000 + n,
+    txSource: from,
+    memo: { type: 'none' } as any,
+    transfers: [],
+    toMuxedId: null,
+    createdAt: Math.floor(Date.parse(closeIso) / 1000),
+    envelopeMismatch: false,
+  };
+}
+
+test('concurrent pass claims and x402 commits never push spentRaw above dailyLimitRaw (#219)', { skip: skipReason() }, async () => {
+  const { settleVerifiedTransfer, userPaymentLockKey } = await import('../../src/services/subscription.service');
+  const { reserveAllowance, commitReservation } = await import('../../src/services/x402-allowance.service');
+  const { withAdvisoryLocksWait } = await import('../../src/lib/advisory-lock');
+  const user = await makeUser(prisma);
+  const dailyLimit = 12_000_000n;
+  await prisma.spendingAllowance.create({
+    data: {
+      userId: user.id, dailyLimit: 1.2, perTraceLimit: 0.3,
+      dailyLimitRaw: dailyLimit.toString(), perTraceLimitRaw: '3000000', windowStartedAt: new Date(),
+    },
+  });
+  const now = new Date();
+  const close = now.toISOString();
+  const reservations = await Promise.all(
+    [1, 2, 3].map((i) => reserveAllowance({ payer: user.walletAddress, traceId: `t${i}`, amountRaw: 2_000_000n, nonce: `n${i}` }, now)),
+  );
+  // Pass claims (advisory lock, as recordPayment) race x402 commits (no advisory lock).
+  await Promise.all([
+    ...[10, 11, 12].map((n) =>
+      withAdvisoryLocksWait([userPaymentLockKey(user.id)], (tx) =>
+        settleVerifiedTransfer(tx, { userId: user.id, type: 'DAILY_PASS', transfer: verified(n, user.walletAddress, PRICE, close), now }),
+      ),
+    ),
+    ...reservations.map((r, i) =>
+      commitReservation({ reservationId: r.reservationId!, txHash: (20 + i).toString(16).repeat(32), ledgerCloseTime: close, amountRaw: 2_000_000n }, now),
+    ),
+  ]);
+  const days = await prisma.allowanceDay.findMany({ where: { userId: user.id } });
+  assert.equal(days.length, 1);
+  const spent = BigInt(days[0].spentRaw.toString());
+  const overage = BigInt(days[0].overageRaw.toString());
+  assert.ok(spent <= dailyLimit, `spentRaw ${spent} exceeds the limit`);
+  assert.equal(days[0].reservedRaw.toString(), '0');
+  // Every unit of the 3 passes and 3 trace purchases is booked as spend or overage.
+  assert.equal(spent + overage, 3n * PRICE + 3n * 2_000_000n);
+  assert.equal(await prisma.allowanceCharge.count({ where: { userId: user.id, status: 'COMMITTED' } }), 6);
+});
+
+test('backfill builds per-day buckets that match payment_events (#219)', { skip: skipReason() }, async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const user = await makeUser(prisma);
+  const events = [
+    { n: 1, close: '2026-11-18T23:59:50Z', amountRaw: '5000000', overage: null },
+    { n: 2, close: '2026-11-19T10:00:00Z', amountRaw: '5000000', overage: '2000000' },
+    { n: 3, close: null, amountRaw: '3000000', overage: null },
+  ];
+  for (const e of events) {
+    await prisma.paymentEvent.create({
+      data: {
+        userId: user.id, txHash: e.n.toString(16).padStart(2, '0').repeat(32), type: 'DAILY_PASS', amount: Number(e.amountRaw) / 1e7,
+        amountRaw: e.amountRaw, status: 'CONFIRMED', ledgerCloseTime: e.close ? new Date(e.close) : null,
+        confirmedAt: new Date('2026-11-19T12:00:00Z'), allowanceOverage: e.overage != null, allowanceOverageRaw: e.overage,
+      },
+    });
+  }
+  // Re-run the migration's backfill statements against the seeded rows.
+  const sql = fs.readFileSync(
+    path.join(__dirname, '..', '..', '..', 'prisma', 'migrations', '20261120120000_allowance_day_buckets', 'migration.sql'),
+    'utf8',
+  );
+  const statements = sql
+    .slice(sql.indexOf('-- Backfill'))
+    .split(/;\s*\n/)
+    .map((s) => s.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n').trim())
+    .filter(Boolean);
+  for (const statement of statements) await prisma.$executeRawUnsafe(statement);
+
+  const perDay = await prisma.$queryRawUnsafe<Array<{ day: string; total: string }>>(
+    `SELECT COALESCE("ledgerCloseTime", "confirmedAt", "createdAt")::date::text AS day, SUM("amountRaw"::numeric)::text AS total
+     FROM "payment_events" WHERE "userId" = $1 AND "status" = 'CONFIRMED' GROUP BY 1 ORDER BY 1`,
+    user.id,
+  );
+  const buckets = await prisma.allowanceDay.findMany({ where: { userId: user.id }, orderBy: { day: 'asc' } });
+  assert.deepEqual(
+    buckets.map((b) => ({
+      day: b.day.toISOString().slice(0, 10),
+      total: (BigInt(b.spentRaw.toString()) + BigInt(b.overageRaw.toString())).toString(),
+    })),
+    perDay,
+  );
+  const d19 = buckets.find((b) => b.day.toISOString().startsWith('2026-11-19'))!;
+  assert.equal(d19.overageRaw.toString(), '2000000');
+  const inferred = await prisma.allowanceCharge.findMany({ where: { userId: user.id, dayInferred: true } });
+  assert.equal(inferred.length, 1);
+  assert.equal(inferred[0].txHash, '03'.repeat(32));
+});

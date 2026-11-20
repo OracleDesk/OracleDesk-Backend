@@ -287,6 +287,48 @@ test('aggregateSignals returns one representative per cluster ordered by relevan
   }
 });
 
+test('representatives() takes an injected weight table: publisher weight picks the cluster representative and scores it (#223)', async () => {
+  const { representatives } = await import('../src/services/ingestion.service');
+  const { SOURCE_WEIGHTS } = await import('../src/services/market-policy');
+  type SignalRow = import('../src/services/signal-store.service').SignalRow;
+  const row = (id: string, publisher: string, hoursAgo: number, over: Partial<SignalRow> = {}): SignalRow => ({
+    id, source: 'NEWSAPI', dedupKey: id, externalId: null, url: `https://${publisher}/${id}`, publisher,
+    title: `Fed holds rates (${publisher})`, summary: null, category: 'FED', categoryConfidence: 1, numericValue: null, simhash: null,
+    publishedAt: new Date(NOW.getTime() - hoursAgo * 3_600_000), firstSeenAt: NOW, lastSeenAt: NOW, seenCount: 1, clusterId: 'c1',
+    ...over,
+  });
+  const rows = [row('a', 'Wire Copy', 1), row('b', 'Reuters', 3), row('z', 'Solo', 2, { clusterId: null, title: 'Unrelated story' })];
+  const decay = (h: number) => Math.pow(0.5, h / 12);
+
+  // No table: today's behaviour, equal source weight so the newest copy represents the cluster.
+  const plain = representatives(rows, NOW);
+  assert.equal(plain.find((s) => s.clusterSize === 2)!.signalId, 'a');
+  // The compiled table as a table changes nothing.
+  const { COMPILED_WEIGHT_TABLE } = await import('../src/services/source-weights.service');
+  assert.deepEqual(representatives(rows, NOW, COMPILED_WEIGHT_TABLE), plain);
+
+  // A learned set that trusts Reuters: it represents the cluster, scored at its own weight.
+  const table = { id: 'set-1', version: 1, weights: { 'source:NEWSAPI': 0.4, 'publisher:reuters': 0.95 } };
+  const learned = representatives(rows, NOW, table);
+  const cluster = learned.find((s) => s.clusterSize === 2)!;
+  assert.equal(cluster.signalId, 'b');
+  assert.ok(Math.abs(cluster.relevanceScore - 0.95 * decay(3) * Math.log2(3)) < 1e-3);
+  const solo = learned.find((s) => s.signalId === 'z')!;
+  assert.ok(Math.abs(solo.relevanceScore - 0.4 * decay(2) * Math.log2(2)) < 1e-3, 'unknown publisher falls back to the source weight');
+  assert.ok(Math.abs(plain.find((s) => s.signalId === 'z')!.relevanceScore - SOURCE_WEIGHTS.NEWSAPI * decay(2)) < 1e-3);
+});
+
+test('aggregateSignals stamps the weight set it scored with (compiled table when none is active)', async () => {
+  const h = await harness();
+  try {
+    const { aggregateSignals } = await import('../src/services/ingestion.service');
+    const agg = await aggregateSignals();
+    assert.deepEqual(agg.weightSet, { id: null, version: 0 });
+  } finally {
+    h.restore();
+  }
+});
+
 test('missing keys are recorded as skipped_no_key and nothing is fetched', async () => {
   const h = await harness({ keys: false });
   try {
@@ -351,7 +393,9 @@ test('trace sourcesUsed carries signalId/url and previewSources omits url', asyn
   const llm = await import('../src/lib/llm');
   const created: any[] = [];
   const origCreate = prisma.reasoningTrace.create;
-  (prisma.reasoningTrace.create as any) = async ({ data }: any) => { created.push(data); return { id: 'trace-1', ...data }; };
+  const origFindMarket = prisma.market.findUnique;
+  (prisma.reasoningTrace.create as any) = async ({ data }: any) => { created.push(data); return { ...data }; };
+  (prisma.market.findUnique as any) = async () => null;
   const prevCaller = llm.setLlmJsonCaller(async () => JSON.stringify({
     hedge_conditions: ['Close if the Fed signals another hike'],
     reasoning_summary: 'Rates are on hold and inflation is cooling.',
@@ -364,7 +408,7 @@ test('trace sourcesUsed carries signalId/url and previewSources omits url', asyn
     const agg = await aggregateSignals();
     const sources = evidenceFromSignals(agg.news.slice(0, 3));
     const { tracePayload } = await generateReasoningTrace({
-      marketId: 'm1', agentType: 'MARKET_MAKER', decisionType: 'MARKET_CREATION',
+      marketId: '77777777-7777-4777-8777-777777777777', agentType: 'MARKET_MAKER', decisionType: 'MARKET_CREATION',
       sourcesUsed: sources, probabilityEstimate: 0.4, marketProbability: 0.4, edge: 0,
       confidenceInterval: { lower: 0.3, upper: 0.5 },
     });
@@ -374,22 +418,27 @@ test('trace sourcesUsed carries signalId/url and previewSources omits url', asyn
       assert.match(s.signalId, /^sig-/);
       assert.match(s.url, /^https:\/\//);
       assert.ok('publisher' in s && s.publishedAt);
-      assert.equal(s.weight, agg.news.find((n) => n.signalId === s.signalId)!.relevanceScore);
+      // relevanceScore can exceed 1 (cluster boost); the document clamps weight to [0, 1].
+      assert.equal(s.weight, Math.min(1, agg.news.find((n) => n.signalId === s.signalId)!.relevanceScore));
     }
-    assert.equal((tracePayload as any).timestamp, NOW.toISOString(), 'trace time comes from the clock');
+    assert.equal(tracePayload.createdAt, NOW.toISOString(), 'trace time comes from the clock');
     const preview = created[0].previewSources as any[];
     assert.equal(preview.length, 2);
     for (const p of preview) assert.deepEqual(Object.keys(p).sort(), ['publisher', 'signal', 'source']);
 
     // A pre-#73 trace (no signalId) still parses through the same code.
     const legacy = await generateReasoningTrace({
-      marketId: 'm1', agentType: 'TRADER', decisionType: 'OPEN_POSITION',
+      marketId: '77777777-7777-4777-8777-777777777777', agentType: 'TRADER', decisionType: 'OPEN_POSITION',
       sourcesUsed: [{ source: 'NEWSAPI', weight: 0.7, signal: 'Old headline' }],
       probabilityEstimate: 0.5, marketProbability: 0.4, edge: 0.1, confidenceInterval: { lower: 0.4, upper: 0.6 },
     });
-    assert.deepEqual((legacy.tracePayload as any).sourcesUsed, [{ source: 'NEWSAPI', weight: 0.7, signal: 'Old headline' }]);
+    // Missing evidence fields are explicit nulls in the v2 document (#227).
+    assert.deepEqual(legacy.tracePayload.sourcesUsed, [{
+      source: 'NEWSAPI', weight: 0.7, signal: 'Old headline', rawValue: null, signalId: null, url: null, publisher: null, publishedAt: null,
+    }]);
   } finally {
     (prisma.reasoningTrace.create as any) = origCreate;
+    (prisma.market.findUnique as any) = origFindMarket;
     llm.setLlmJsonCaller(prevCaller);
     h.restore();
   }

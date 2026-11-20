@@ -20,8 +20,14 @@
  * carry reason codes and hashes, never the raw attacker text.
  */
 import { randomBytes } from 'node:crypto';
-import type { MarketProposal, RawSignal } from '../types';
+import type { AggregatedSignal, MarketProposal, RawSignal } from '../types';
 import { ALLOWED_ORACLES, meaningfulTokens } from './market-policy';
+import { extractEntities } from './dedup-entities';
+import { fingerprintText, hammingDistance, simhash64 } from './signal-normalize';
+import { fredSeriesFor, type SourceId } from './resolvability.service';
+import type { MeetingDef } from './resolvability.calendar';
+import type { SignalRow } from './signal-store.service';
+import { publisherDomain } from '../lib/domains';
 
 export interface SanitizedSignal extends RawSignal {
   /** Citable id (n1, f1, m1, e1…) assigned when the signal is sent to a model. */
@@ -291,4 +297,196 @@ export function checkProposal(
   if (prose.some((t) => CONTROL_RE.test(t))) reasons.add('NON_ASCII_CONTROL');
 
   return reasons.size === 0 ? { ok: true } : { ok: false, reasons: [...reasons], detail };
+}
+
+// ─── Cross-source corroboration (#228) ────────────────────────────────────────
+//
+// The injection guard above checks that a proposal cites signals that were
+// really sent. It cannot tell a real story from a planted one: one article is
+// enough to pass it. This gate asks for the proposal's claim to be reported by
+// independent publishers, or to be backed by an authoritative structured
+// source. Independence is counted in clusters merged by registrable domain and
+// rewrite distance, never in URLs, because wire copy is syndicated under many
+// mastheads. Pure: the service wrapper (corroboration.service.ts) does the I/O.
+
+export interface CorroborationPolicy {
+  /** Independent units needed for CORROBORATED. */
+  minPublishers: number;
+  /** Candidates must be published within this many hours before `now`. */
+  windowHours: number;
+  /** Clusters whose texts are within this SimHash distance are one unit (looser than clustering). */
+  simhashRewrite: number;
+}
+
+export interface CorroboratorRef {
+  signalId: string;
+  clusterId: string;
+  domain: string;
+  source: string;
+  publishedAt: string;
+}
+
+export type CorroborationVerdict =
+  | { ok: true; kind: 'CORROBORATED' | 'AUTHORITATIVE'; corroborators: CorroboratorRef[]; detail: Record<string, unknown> }
+  | { ok: false; kind: 'UNCORROBORATED'; corroborators: CorroboratorRef[]; detail: Record<string, unknown> };
+
+/** The SignalRow fields the check reads. */
+export type CorroborationCandidate = Pick<
+  SignalRow,
+  'id' | 'source' | 'clusterId' | 'url' | 'publisher' | 'title' | 'summary' | 'publishedAt' | 'simhash'
+>;
+
+export interface CorroborationInput {
+  /** The sanitised question text (model output: never the raw proposal). */
+  question: string;
+  category: string;
+  grounding: AggregatedSignal[];
+  candidates: CorroborationCandidate[];
+  resolutionSourceId: SourceId | null;
+  meeting: MeetingDef | null;
+  now: Date;
+}
+
+const HOUR_MS = 3_600_000;
+
+/** FRED series id of a FRED signal ("FEDFUNDS: 4.33", …/series/FEDFUNDS). */
+function fredSeriesOf(s: Pick<AggregatedSignal, 'title' | 'url'>): string | null {
+  const fromUrl = /\/series\/([A-Z0-9]+)/.exec(s.url ?? '')?.[1];
+  if (fromUrl) return fromUrl;
+  return /^([A-Z0-9]+):/.exec(s.title)?.[1] ?? null;
+}
+
+/** Grounding signals as store-shaped candidates, so they count like any other row. */
+function groundingCandidate(s: AggregatedSignal): CorroborationCandidate {
+  return {
+    id: s.signalId,
+    source: s.source,
+    clusterId: null,
+    url: s.url ?? null,
+    publisher: s.publisher,
+    title: s.title,
+    summary: s.content || null,
+    publishedAt: new Date(s.publishedAt),
+    simhash: simhash64(fingerprintText(s.title, s.content)),
+  };
+}
+
+const byIdAsc = <T extends { id: string }>(a: T, b: T) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+
+export function checkCorroboration(input: CorroborationInput, policy: CorroborationPolicy): CorroborationVerdict {
+  const { now } = input;
+  const windowStart = now.getTime() - policy.windowHours * HOUR_MS;
+
+  // Claim: gazetteer entities must all be covered; without any, two proper nouns.
+  const questionEntities = extractEntities(input.question);
+  const gazetteer = [...questionEntities].filter((e) => !e.startsWith('NAME:')).sort();
+  const names = [...questionEntities].filter((e) => e.startsWith('NAME:'));
+  const questionTokens = new Set(meaningfulTokens(input.question));
+
+  // Store rows first; a grounding signal the store no longer returns is added
+  // from the aggregated copy. Sorted by id so input order never matters.
+  const pool = new Map<string, CorroborationCandidate>();
+  for (const c of input.candidates) pool.set(c.id, c);
+  for (const g of input.grounding) if (g.signalId && !pool.has(g.signalId)) pool.set(g.signalId, groundingCandidate(g));
+
+  const matches = (c: CorroborationCandidate): boolean => {
+    // FRED rows have no URL and cluster per series: never news corroboration.
+    if (c.source === 'FRED') return false;
+    const at = c.publishedAt.getTime();
+    if (!Number.isFinite(at) || at < windowStart || at > now.getTime()) return false;
+    const text = `${c.title} ${c.summary ?? ''}`;
+    const entities = extractEntities(text);
+    const claim = gazetteer.length > 0
+      ? gazetteer.every((e) => entities.has(e))
+      : names.filter((e) => entities.has(e)).length >= 2;
+    if (!claim) return false;
+    return meaningfulTokens(text).filter((t) => questionTokens.has(t)).length >= MIN_GROUNDING_TOKEN_OVERLAP;
+  };
+  const matched = [...pool.values()].filter(matches).sort(byIdAsc);
+
+  // Independence. A group is a near-duplicate cluster (or a lone row); groups
+  // that share a registrable domain or are light rewrites of each other are
+  // one unit. Union-find, so the result does not depend on candidate order.
+  const groups = new Map<string, CorroborationCandidate[]>();
+  for (const c of matched) {
+    const key = c.clusterId ?? c.id;
+    groups.set(key, [...(groups.get(key) ?? []), c]);
+  }
+  const keys = [...groups.keys()].sort();
+  const domainsOf = new Map(keys.map((k) => [
+    k,
+    new Set(groups.get(k)!.map((c) => publisherDomain(c.url, c.publisher)).filter((d): d is string => Boolean(d))),
+  ]));
+  const parent = new Map(keys.map((k) => [k, k]));
+  const find = (k: string): string => {
+    let r = k;
+    while (parent.get(r) !== r) r = parent.get(r)!;
+    parent.set(k, r);
+    return r;
+  };
+  const union = (a: string, b: string) => {
+    const [ra, rb] = [find(a), find(b)];
+    if (ra !== rb) parent.set(ra < rb ? rb : ra, ra < rb ? ra : rb);
+  };
+  for (let i = 0; i < keys.length; i++) {
+    for (let j = i + 1; j < keys.length; j++) {
+      const [a, b] = [keys[i], keys[j]];
+      const sharedDomain = [...domainsOf.get(a)!].some((d) => domainsOf.get(b)!.has(d));
+      const rewrite = !sharedDomain && groups.get(a)!.some((x) => groups.get(b)!.some((y) =>
+        x.simhash !== null && y.simhash !== null && hammingDistance(x.simhash, y.simhash) <= policy.simhashRewrite));
+      if (sharedDomain || rewrite) union(a, b);
+    }
+  }
+  const units = new Set(keys.map(find));
+  const allDomains = [...new Set(keys.flatMap((k) => [...domainsOf.get(k)!]))].sort();
+  // Distinct domains across units: each unit contributes its domains.
+  const unitDomains = new Set([...units].flatMap((u) => keys.filter((k) => find(k) === u).flatMap((k) => [...domainsOf.get(k)!])));
+
+  // One reference per group: its earliest article (ties by id).
+  const corroborators: CorroboratorRef[] = keys.map((k) => {
+    const rep = [...groups.get(k)!].sort((a, b) => a.publishedAt.getTime() - b.publishedAt.getTime() || byIdAsc(a, b))[0];
+    return {
+      signalId: rep.id,
+      clusterId: k,
+      domain: [...domainsOf.get(k)!].sort()[0] ?? 'unknown',
+      source: rep.source,
+      publishedAt: rep.publishedAt.toISOString(),
+    };
+  }).sort((a, b) => (a.publishedAt < b.publishedAt ? -1 : a.publishedAt > b.publishedAt ? 1 : a.signalId < b.signalId ? -1 : 1));
+
+  const detail: Record<string, unknown> = {
+    units: units.size,
+    domains: allDomains,
+    matched: matched.length,
+    entities: gazetteer.length > 0 ? gazetteer : names.sort(),
+    windowHours: policy.windowHours,
+    minPublishers: policy.minPublishers,
+  };
+
+  // Authoritative: a FRED series that measures the question…
+  if (input.resolutionSourceId === 'FRED') {
+    const series = fredSeriesFor(input.question);
+    const backing = input.grounding
+      .filter((g) => g.source === 'FRED' && series.includes(fredSeriesOf(g) ?? ''))
+      .sort((a, b) => (a.signalId < b.signalId ? -1 : 1));
+    if (backing.length > 0) {
+      const fred = backing.map((g): CorroboratorRef => ({
+        signalId: g.signalId,
+        clusterId: `FRED:${fredSeriesOf(g)}`,
+        domain: 'stlouisfed.org',
+        source: 'FRED',
+        publishedAt: new Date(g.publishedAt).toISOString(),
+      }));
+      return { ok: true, kind: 'AUTHORITATIVE', corroborators: [...fred, ...corroborators], detail: { ...detail, authority: 'FRED_SERIES', series: fred.map((f) => f.clusterId) } };
+    }
+  }
+  // …or a scheduled central-bank meeting the question names, with coverage.
+  if ((input.resolutionSourceId === 'FRED' || input.resolutionSourceId === 'ECB') && input.meeting && matched.length > 0) {
+    return { ok: true, kind: 'AUTHORITATIVE', corroborators, detail: { ...detail, authority: 'MEETING_CALENDAR', meeting: input.meeting.date } };
+  }
+
+  if (units.size >= policy.minPublishers && unitDomains.size >= 2) {
+    return { ok: true, kind: 'CORROBORATED', corroborators, detail };
+  }
+  return { ok: false, kind: 'UNCORROBORATED', corroborators, detail };
 }

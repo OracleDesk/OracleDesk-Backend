@@ -1,14 +1,20 @@
 /**
- * Guardian alerts (#92).
+ * Guardian (#92) and operational (#226) alerts.
  *
  * Sinks are pluggable (AlertSink). Two ship: a generic JSON webhook, signed
  * with HMAC-SHA256 so the receiver can verify the sender, and a
  * Slack-compatible incoming webhook. Email can be added as another sink.
  *
- * Delivery is deduplicated by AlertDelivery.dedupeKey = reviewId:level:sink,
- * stored in Postgres, so a restart or a second instance never re-sends an
- * alert that already went out. A failed delivery is retried with backoff and,
- * if it still fails, left FAILED so the next pass tries again.
+ * Two payloads share the sinks: dispute alerts (DisputeAlert, unchanged
+ * since #92, `type: oracledesk.dispute_alert`) and operational incidents
+ * (OpsAlert, `type: oracledesk.ops_alert`).
+ *
+ * Delivery is deduplicated by AlertDelivery.dedupeKey, stored in Postgres, so
+ * a restart or a second instance never re-sends an alert that already went
+ * out. Disputes key on reviewId:level:sink; incidents on
+ * inc:<incidentId>:<episode>:<kind>:<severity>:<sink>. A failed delivery is
+ * retried with backoff and, if it still fails, left FAILED so the next pass
+ * tries again.
  *
  * Webhook URLs carry tokens. They are never logged, never put in an error
  * message and never stored: a sink is identified by a short hash of its URL.
@@ -21,7 +27,9 @@ import { logger } from '../lib/logger';
 
 export type AlertLevel = 'INFO' | 'WARN' | 'CRITICAL';
 
-export interface Alert {
+/** A dispute review alert (#92). Its serialised form must not change. */
+export interface DisputeAlert {
+  kind?: undefined;
   level: AlertLevel;
   title: string;
   marketId: string;
@@ -34,6 +42,30 @@ export interface Alert {
   /** Free-text detail for humans: why this level, what to do. */
   detail?: string;
 }
+
+export type OpsNotificationKind = 'open' | 'escalate' | 'resolve';
+
+/** An operational incident notification (#226). */
+export interface OpsAlert {
+  kind: 'ops';
+  /** Same as severity, so sinks written for dispute alerts can read `level`. */
+  level: AlertLevel;
+  severity: AlertLevel;
+  subjectType: string;
+  subjectKey: string;
+  summary: string;
+  detail?: Record<string, unknown> | null;
+  state: 'OPEN' | 'RESOLVED';
+  incidentId: string;
+  episode: number;
+  notification: OpsNotificationKind;
+  /** Admin API link for the incident (list + ack/silence). */
+  adminUrl: string;
+}
+
+export type Alert = DisputeAlert | OpsAlert;
+
+export const isOpsAlert = (a: Alert): a is OpsAlert => a.kind === 'ops';
 
 export interface AlertSink {
   /** Stable, secret-free identifier; part of the dedupe key. */
@@ -88,7 +120,10 @@ export function webhookSink(url: string, secret = config.ALERT_WEBHOOK_SECRET): 
   return {
     name: `webhook-${urlTag(url)}`,
     async send(alert) {
-      const body = JSON.stringify({ type: 'oracledesk.dispute_alert', sentAt: new Date().toISOString(), alert });
+      // Dispute bodies are byte-for-byte what #92 sent.
+      const body = isOpsAlert(alert)
+        ? JSON.stringify({ type: 'oracledesk.ops_alert', sentAt: new Date().toISOString(), alert })
+        : JSON.stringify({ type: 'oracledesk.dispute_alert', sentAt: new Date().toISOString(), alert });
       await post(url, body, secret ? { [SIGNATURE_HEADER]: sign(secret, body) } : {});
     },
   };
@@ -100,6 +135,10 @@ export function slackSink(url: string): AlertSink {
   return {
     name: 'slack',
     async send(alert) {
+      if (isOpsAlert(alert)) {
+        await post(url, JSON.stringify({ text: slackOpsText(alert) }), {});
+        return;
+      }
       const remaining = alert.windowRemainingSecs === null ? 'unknown' : `${Math.max(0, Math.floor(alert.windowRemainingSecs / 60))} min`;
       const lines = [
         `${EMOJI[alert.level]} *${alert.level}* ${alert.title}`,
@@ -112,10 +151,34 @@ export function slackSink(url: string): AlertSink {
   };
 }
 
+const OPS_VERB: Record<OpsNotificationKind, string> = { open: 'OPEN', escalate: 'STILL OPEN (unacknowledged)', resolve: 'RESOLVED' };
+
+function slackOpsText(alert: OpsAlert): string {
+  const icon = alert.notification === 'resolve' ? ':white_check_mark:' : EMOJI[alert.severity];
+  return [
+    `${icon} *${alert.severity}* ${OPS_VERB[alert.notification]} · ${alert.summary}`,
+    `Subject ${alert.subjectType} / ${alert.subjectKey} · episode ${alert.episode}`,
+    `Acknowledge or silence: ${alert.adminUrl}`,
+  ].join('\n');
+}
+
 export function sinksFromConfig(): AlertSink[] {
   const sinks: AlertSink[] = config.ALERT_WEBHOOK_URLS.map((url) => webhookSink(url));
   if (config.ALERT_SLACK_WEBHOOK_URL) sinks.push(slackSink(config.ALERT_SLACK_WEBHOOK_URL));
   return sinks;
+}
+
+/**
+ * Sink names allowed for `severity` by ALERT_ROUTES_JSON. A route entry
+ * matches a sink by exact name or by family (`webhook` matches every
+ * webhook-<tag>, `slack` the Slack sink). Without a route, WARN and CRITICAL
+ * go to every sink and INFO to none.
+ */
+export function routeSinks(sinks: AlertSink[], severity: AlertLevel, routesJson = config.ALERT_ROUTES_JSON): AlertSink[] {
+  if (!routesJson) return severity === 'INFO' ? [] : sinks;
+  const routes = JSON.parse(routesJson) as Partial<Record<AlertLevel, string[]>>;
+  const allowed = routes[severity] ?? [];
+  return sinks.filter((s) => allowed.some((r) => r === s.name || s.name.startsWith(`${r}-`)));
 }
 
 export interface AlertServiceOptions {
@@ -152,17 +215,48 @@ export class AlertService {
   }
 
   /**
-   * Sends `alert` through every sink that has not delivered it yet.
+   * Sends a dispute `alert` through every sink that has not delivered it yet.
    * Returns the sink names it newly delivered to.
    */
-  async send(reviewId: string, alert: Alert): Promise<string[]> {
+  async send(reviewId: string, alert: DisputeAlert): Promise<string[]> {
     if (this.sinks.length === 0) {
       logger.warn({ reviewId, level: alert.level, verdict: alert.verdict }, 'Dispute alert not delivered: no alert sinks configured');
       return [];
     }
+    return this.deliver(
+      this.sinks,
+      (sink) => `${reviewId}:${alert.level}:${sink.name}`,
+      alert,
+      { reviewId, level: alert.level },
+    );
+  }
+
+  /**
+   * Sends one incident notification (#226) through the sinks routed for its
+   * severity. `step` numbers escalations so each one sends exactly once.
+   */
+  async sendOps(alert: OpsAlert, step = 0): Promise<string[]> {
+    const sinks = routeSinks(this.sinks, alert.severity);
+    if (sinks.length === 0) return [];
+    const kindKey = alert.notification === 'escalate' ? `escalate-${step}` : alert.notification;
+    return this.deliver(
+      sinks,
+      (sink) => `inc:${alert.incidentId}:${alert.episode}:${kindKey}:${alert.severity}:${sink.name}`,
+      alert,
+      { incidentId: alert.incidentId, kind: alert.notification, level: alert.severity },
+    );
+  }
+
+  /** Per-sink retry and dedupe loop shared by both payloads. */
+  private async deliver(
+    sinks: AlertSink[],
+    dedupeKeyFor: (sink: AlertSink) => string,
+    alert: Alert,
+    meta: { reviewId?: string; incidentId?: string; kind?: OpsNotificationKind; level: AlertLevel },
+  ): Promise<string[]> {
     const delivered: string[] = [];
-    for (const sink of this.sinks) {
-      const dedupeKey = `${reviewId}:${alert.level}:${sink.name}`;
+    for (const sink of sinks) {
+      const dedupeKey = dedupeKeyFor(sink);
       const existing = await prisma.alertDelivery.findUnique({ where: { dedupeKey } });
       if (existing?.status === 'SENT') continue;
 
@@ -183,13 +277,16 @@ export class AlertService {
       const data = failure === null
         ? { status: 'SENT', attempts, sentAt: new Date(), error: null }
         : { status: 'FAILED', attempts, error: failure };
+      const ids = meta.incidentId
+        ? { incidentId: meta.incidentId, kind: meta.kind ?? 'open' }
+        : { reviewId: meta.reviewId };
       await prisma.alertDelivery.upsert({
         where: { dedupeKey },
-        create: { reviewId, level: alert.level, sink: sink.name, dedupeKey, ...data },
+        create: { ...ids, level: meta.level, sink: sink.name, dedupeKey, ...data },
         update: data,
       });
       if (failure === null) delivered.push(sink.name);
-      else logger.warn({ reviewId, level: alert.level, sink: sink.name, reason: failure }, 'Dispute alert delivery failed');
+      else logger.warn({ ...ids, level: meta.level, sink: sink.name, reason: failure }, meta.incidentId ? 'Ops alert delivery failed' : 'Dispute alert delivery failed');
     }
     return delivered;
   }

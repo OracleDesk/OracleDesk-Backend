@@ -1,0 +1,70 @@
+{
+  "name": "same-domain-clusters",
+  "now": "2026-10-18T12:00:00.000Z",
+  "description": "Two clusters on one registrable domain (www./uk.reuters.com) merge into one unit.",
+  "question": "Will the US impose new tariffs on Japan by December 31, 2026?",
+  "category": "GEOPOLITICAL",
+  "resolutionSourceId": "AP_POLITICS",
+  "meeting": null,
+  "grounding": [
+    {
+      "signalId": "sig-rt-1",
+      "source": "NEWSAPI",
+      "url": "https://www.reuters.com/world/us-japan-tariffs",
+      "publisher": null,
+      "title": "US to impose sweeping new tariffs on Japan, officials say",
+      "content": "Washington will announce new tariffs on Japanese cars and electronics within weeks, according to officials.",
+      "publishedAt": "2026-10-18T08:00:00.000Z",
+      "relevanceScore": 0.8,
+      "category": "GEOPOLITICAL",
+      "sanitizedFlags": [],
+      "clusterSize": 1
+    }
+  ],
+  "candidates": [
+    {
+      "id": "sig-rt-1",
+      "source": "NEWSAPI",
+      "clusterId": "cluster-a",
+      "url": "https://www.reuters.com/world/us-japan-tariffs",
+      "publisher": null,
+      "title": "US to impose sweeping new tariffs on Japan, officials say",
+      "summary": "Washington will announce new tariffs on Japanese cars and electronics within weeks, according to officials.",
+      "publishedAt": "2026-10-18T08:00:00.000Z"
+    },
+    {
+      "id": "sig-rt-2",
+      "source": "NEWSAPI",
+      "clusterId": "cluster-b",
+      "url": "https://uk.reuters.com/markets/japan-trade",
+      "publisher": null,
+      "title": "Japan braces for US tariff move on exports",
+      "summary": "Tokyo officials prepared a response as the United States readied tariffs on Japanese goods.",
+      "publishedAt": "2026-10-18T06:00:00.000Z"
+    },
+    {
+      "id": "sig-noise-1",
+      "source": "NEWSAPI",
+      "clusterId": null,
+      "url": "https://sport.example.net/derby",
+      "publisher": null,
+      "title": "Derby ends in a late draw",
+      "summary": "The visitors equalised in stoppage time.",
+      "publishedAt": "2026-10-18T07:00:00.000Z"
+    },
+    {
+      "id": "sig-noise-2",
+      "source": "NEWSAPI",
+      "clusterId": null,
+      "url": "https://arts.example.org/box-office",
+      "publisher": null,
+      "title": "Box office weekend led by an animated sequel",
+      "summary": "The sequel opened above forecasts.",
+      "publishedAt": "2026-10-18T03:00:00.000Z"
+    }
+  ],
+  "expected": {
+    "kind": "UNCORROBORATED",
+    "units": 1
+  }
+}

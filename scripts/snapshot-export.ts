@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { PrismaClient } from '@prisma/client';
-import { EXCLUDED_TABLES, RULES, assertNoSecrets, anonymizeRow, buildWalletMap, jsonSafe, SnapshotExportError } from '../src/lib/snapshot';
+import { EXCLUDED_TABLES, RULES, assertNoSecrets, anonymizeRow, buildWalletMap, jsonSafe, selectFor, SnapshotExportError } from '../src/lib/snapshot';
 
 interface Args {
   out: string;
@@ -32,7 +32,7 @@ export async function exportSnapshot(prisma: PrismaClient, args: Args, salt: str
   if (excluded.length > 0) {
     throw new SnapshotExportError(`Tables are excluded from snapshots: ${excluded.join(', ')}`);
   }
-  const users = await prisma.user.findMany({ take: args.limitPerTable });
+  const users = await prisma.user.findMany({ take: args.limitPerTable, select: selectFor('user') });
   const wallets = buildWalletMap(salt, users);
   const selected = args.tables.length
     ? Object.keys(RULES).filter((model) => args.tables.includes(RULES[model].output))
@@ -41,7 +41,9 @@ export async function exportSnapshot(prisma: PrismaClient, args: Args, salt: str
   const written: string[] = [];
 
   for (const model of selected) {
-    const rows = await (prisma as any)[model].findMany({ take: args.limitPerTable });
+    // Select only classified columns, so unexported ones (e.g. the #224 Float
+    // money mirrors) are never read; anonymizeRow still rejects anything else.
+    const rows = await (prisma as any)[model].findMany({ take: args.limitPerTable, select: selectFor(model) });
     const rule = RULES[model];
     const file = path.join(args.out, `${rule.output}.ndjson`);
     const lines = rows.map((row: Record<string, any>) => jsonSafe(anonymizeRow(model, row, wallets, salt)));

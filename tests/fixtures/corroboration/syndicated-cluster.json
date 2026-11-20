@@ -1,0 +1,170 @@
+{
+  "name": "syndicated-cluster",
+  "now": "2026-10-18T12:00:00.000Z",
+  "description": "Twelve syndicated copies under twelve mastheads, one near-duplicate cluster: one unit.",
+  "question": "Will the US impose new tariffs on Japan by December 31, 2026?",
+  "category": "GEOPOLITICAL",
+  "resolutionSourceId": "AP_POLITICS",
+  "meeting": null,
+  "grounding": [
+    {
+      "signalId": "sig-synd-00",
+      "source": "NEWSAPI",
+      "url": "https://news0.example-0.com/wire/us-japan-tariffs",
+      "publisher": null,
+      "title": "US to impose sweeping new tariffs on Japan, officials say",
+      "content": "Washington will announce new tariffs on Japanese cars and electronics within weeks, according to officials.",
+      "publishedAt": "2026-10-18T09:00:00.000Z",
+      "relevanceScore": 0.8,
+      "category": "GEOPOLITICAL",
+      "sanitizedFlags": [],
+      "clusterSize": 1
+    }
+  ],
+  "candidates": [
+    {
+      "id": "sig-synd-00",
+      "source": "NEWSAPI",
+      "clusterId": "cluster-wire",
+      "url": "https://news0.example-0.com/wire/us-japan-tariffs",
+      "publisher": "Masthead 0",
+      "title": "US to impose sweeping new tariffs on Japan, officials say",
+      "summary": "Washington will announce new tariffs on Japanese cars and electronics within weeks, according to officials.",
+      "publishedAt": "2026-10-18T09:00:00.000Z"
+    },
+    {
+      "id": "sig-synd-01",
+      "source": "NEWSAPI",
+      "clusterId": "cluster-wire",
+      "url": "https://news1.example-1.com/wire/us-japan-tariffs",
+      "publisher": "Masthead 1",
+      "title": "US to impose sweeping new tariffs on Japan, officials say",
+      "summary": "Washington will announce new tariffs on Japanese cars and electronics within weeks, according to officials.",
+      "publishedAt": "2026-10-18T08:54:00.000Z"
+    },
+    {
+      "id": "sig-synd-02",
+      "source": "NEWSAPI",
+      "clusterId": "cluster-wire",
+      "url": "https://news2.example-2.com/wire/us-japan-tariffs",
+      "publisher": "Masthead 2",
+      "title": "US to impose sweeping new tariffs on Japan, officials say",
+      "summary": "Washington will announce new tariffs on Japanese cars and electronics within weeks, according to officials.",
+      "publishedAt": "2026-10-18T08:48:00.000Z"
+    },
+    {
+      "id": "sig-synd-03",
+      "source": "NEWSAPI",
+      "clusterId": "cluster-wire",
+      "url": "https://news3.example-3.com/wire/us-japan-tariffs",
+      "publisher": "Masthead 3",
+      "title": "US to impose sweeping new tariffs on Japan, officials say",
+      "summary": "Washington will announce new tariffs on Japanese cars and electronics within weeks, according to officials.",
+      "publishedAt": "2026-10-18T08:42:00.000Z"
+    },
+    {
+      "id": "sig-synd-04",
+      "source": "NEWSAPI",
+      "clusterId": "cluster-wire",
+      "url": "https://news4.example-4.com/wire/us-japan-tariffs",
+      "publisher": "Masthead 4",
+      "title": "US to impose sweeping new tariffs on Japan, officials say",
+      "summary": "Washington will announce new tariffs on Japanese cars and electronics within weeks, according to officials.",
+      "publishedAt": "2026-10-18T08:36:00.000Z"
+    },
+    {
+      "id": "sig-synd-05",
+      "source": "NEWSAPI",
+      "clusterId": "cluster-wire",
+      "url": "https://news5.example-5.com/wire/us-japan-tariffs",
+      "publisher": "Masthead 5",
+      "title": "US to impose sweeping new tariffs on Japan, officials say",
+      "summary": "Washington will announce new tariffs on Japanese cars and electronics within weeks, according to officials.",
+      "publishedAt": "2026-10-18T08:30:00.000Z"
+    },
+    {
+      "id": "sig-synd-06",
+      "source": "NEWSAPI",
+      "clusterId": "cluster-wire",
+      "url": "https://news6.example-6.com/wire/us-japan-tariffs",
+      "publisher": "Masthead 6",
+      "title": "US to impose sweeping new tariffs on Japan, officials say",
+      "summary": "Washington will announce new tariffs on Japanese cars and electronics within weeks, according to officials.",
+      "publishedAt": "2026-10-18T08:24:00.000Z"
+    },
+    {
+      "id": "sig-synd-07",
+      "source": "NEWSAPI",
+      "clusterId": "cluster-wire",
+      "url": "https://news7.example-7.com/wire/us-japan-tariffs",
+      "publisher": "Masthead 7",
+      "title": "US to impose sweeping new tariffs on Japan, officials say",
+      "summary": "Washington will announce new tariffs on Japanese cars and electronics within weeks, according to officials.",
+      "publishedAt": "2026-10-18T08:18:00.000Z"
+    },
+    {
+      "id": "sig-synd-08",
+      "source": "NEWSAPI",
+      "clusterId": "cluster-wire",
+      "url": "https://news8.example-8.com/wire/us-japan-tariffs",
+      "publisher": "Masthead 8",
+      "title": "US to impose sweeping new tariffs on Japan, officials say",
+      "summary": "Washington will announce new tariffs on Japanese cars and electronics within weeks, according to officials.",
+      "publishedAt": "2026-10-18T08:12:00.000Z"
+    },
+    {
+      "id": "sig-synd-09",
+      "source": "NEWSAPI",
+      "clusterId": "cluster-wire",
+      "url": "https://news9.example-9.com/wire/us-japan-tariffs",
+      "publisher": "Masthead 9",
+      "title": "US to impose sweeping new tariffs on Japan, officials say",
+      "summary": "Washington will announce new tariffs on Japanese cars and electronics within weeks, according to officials.",
+      "publishedAt": "2026-10-18T08:06:00.000Z"
+    },
+    {
+      "id": "sig-synd-10",
+      "source": "NEWSAPI",
+      "clusterId": "cluster-wire",
+      "url": "https://news10.example-10.com/wire/us-japan-tariffs",
+      "publisher": "Masthead 10",
+      "title": "US to impose sweeping new tariffs on Japan, officials say",
+      "summary": "Washington will announce new tariffs on Japanese cars and electronics within weeks, according to officials.",
+      "publishedAt": "2026-10-18T08:00:00.000Z"
+    },
+    {
+      "id": "sig-synd-11",
+      "source": "NEWSAPI",
+      "clusterId": "cluster-wire",
+      "url": "https://news11.example-11.com/wire/us-japan-tariffs",
+      "publisher": "Masthead 11",
+      "title": "US to impose sweeping new tariffs on Japan, officials say",
+      "summary": "Washington will announce new tariffs on Japanese cars and electronics within weeks, according to officials.",
+      "publishedAt": "2026-10-18T07:54:00.000Z"
+    },
+    {
+      "id": "sig-noise-1",
+      "source": "NEWSAPI",
+      "clusterId": null,
+      "url": "https://sport.example.net/derby",
+      "publisher": null,
+      "title": "Derby ends in a late draw",
+      "summary": "The visitors equalised in stoppage time.",
+      "publishedAt": "2026-10-18T07:00:00.000Z"
+    },
+    {
+      "id": "sig-noise-2",
+      "source": "NEWSAPI",
+      "clusterId": null,
+      "url": "https://arts.example.org/box-office",
+      "publisher": null,
+      "title": "Box office weekend led by an animated sequel",
+      "summary": "The sequel opened above forecasts.",
+      "publishedAt": "2026-10-18T03:00:00.000Z"
+    }
+  ],
+  "expected": {
+    "kind": "UNCORROBORATED",
+    "units": 1
+  }
+}

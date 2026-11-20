@@ -55,6 +55,14 @@ export interface AggregatedSignals {
   macro: AggregatedSignal[];
   aggregatedAt: Date;
   signalCount: number;
+  /** The source weight set the relevance scores were computed with (#223); version 0 = compiled table. */
+  weightSet?: SourceWeightSetRef;
+}
+
+/** Identifies a source weight set (#223); `{ id: null, version: 0 }` is the compiled SOURCE_WEIGHTS. */
+export interface SourceWeightSetRef {
+  id: string | null;
+  version: number;
 }
 
 // ─── Market generation types ───
@@ -132,6 +140,10 @@ export interface EnsembleForecast {
   members: Array<ModelForecast & { weight: number }>;
   /** sha256 of the ForecastInput (the cache key's input half). */
   inputsDigest: string;
+  /** The ensemble before recalibration (#244). Absent on forecasts cached before #244. */
+  raw?: { p: number; ci: ConfidenceInterval };
+  /** The recalibration map behind p and ci; applied=false when CALIBRATION_SHRINKAGE_ENABLED is off. */
+  calibration?: { mapId: string; version: number; category: string; applied: boolean } | null;
 }
 
 export interface Forecaster {
@@ -161,8 +173,12 @@ export interface TradePayload {
   kellyFraction: number;
   edgeDetected: number;
   traceId?: string;
-  /** Trace document to pin and publish once the trade is on-chain. */
-  tracePayload?: Record<string, unknown>;
+  /** Trace document to pin and publish once the trade is on-chain (#227). */
+  tracePayload?: import('../schemas/trace').TraceDocV2;
+  /** Average-price limit and deadline from the decision (#245). */
+  bounds?: import('../services/trade-bounds').TradeBounds;
+  /** Conservative probability of the side bought; a re-quote at or above it cancels the order (#225). */
+  conservativeProb?: number;
 }
 
 export interface CopyTradePayload {
@@ -187,6 +203,8 @@ export interface TraceInput {
   decisionType: string;
   sourcesUsed: WeightedSignal[];
   probabilityEstimate: number;
+  /** The forecaster's probability before recalibration (#244). Defaults to probabilityEstimate. */
+  rawProbabilityEstimate?: number;
   marketProbability: number;
   edge: number;
   confidenceInterval: ConfidenceInterval;
@@ -205,6 +223,8 @@ export interface TraceInput {
   forecast?: Record<string, unknown>;
   /** Treasury-aware sizing: Kelly/correlation/final sizes, binding constraint, budget snapshot (#76). */
   sizing?: Record<string, unknown>;
+  /** Weight set behind the evidence's relevance scores (#223). */
+  sourceWeightSet?: SourceWeightSetRef;
 }
 
 export interface TraceVerification {
@@ -269,6 +289,7 @@ export interface HedgeRecommendation {
   hedgeMarketId: string;
   hedgeDirection: TradeDirection;
   hedgeSize: number;
+  hedgeSizeRaw: bigint;
   rationale: string;
 }
 

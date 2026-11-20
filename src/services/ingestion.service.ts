@@ -19,7 +19,9 @@ import {
   simhash64,
   sourceWeight,
   type SignalSource,
+  type SourceWeightTable,
 } from './signal-normalize';
+import { getActiveWeightTable } from './source-weights.service';
 import {
   assignClusters,
   getSignalStore,
@@ -426,8 +428,9 @@ const LIMITS: Record<SignalSource, number> = { NEWSAPI: 50, FRED: 10, GDELT: 30 
  *
  * relevanceScore = sourceWeight × recencyDecay × log2(1 + clusterSize); see
  * signal-normalize.ts. Results are sorted by relevance, highest first.
+ * `table` is the cycle's weight set (#223); omitted, the compiled table.
  */
-export function representatives(rows: SignalRow[], now: Date): AggregatedSignal[] {
+export function representatives(rows: SignalRow[], now: Date, table?: SourceWeightTable): AggregatedSignal[] {
   const groups = new Map<string, SignalRow[]>();
   for (const r of rows) {
     const key = r.source === 'FRED' ? `FRED:${r.externalId ?? r.id}` : r.clusterId ?? r.id;
@@ -438,10 +441,10 @@ export function representatives(rows: SignalRow[], now: Date): AggregatedSignal[
     const rep = [...members].sort((a, b) =>
       a.source === 'FRED'
         ? b.publishedAt.getTime() - a.publishedAt.getTime()
-        : sourceWeight(b.source) - sourceWeight(a.source) || b.publishedAt.getTime() - a.publishedAt.getTime() || (a.id < b.id ? -1 : 1),
+        : sourceWeight(b.source, b.publisher, table) - sourceWeight(a.source, a.publisher, table) || b.publishedAt.getTime() - a.publishedAt.getTime() || (a.id < b.id ? -1 : 1),
     )[0];
     const clusterSize = rep.source === 'FRED' ? 1 : members.length;
-    const relevance = relevanceScore(rep.source, rep.source === 'FRED' ? rep.lastSeenAt : rep.publishedAt, clusterSize, now);
+    const relevance = relevanceScore(rep.source, rep.source === 'FRED' ? rep.lastSeenAt : rep.publishedAt, clusterSize, now, table, rep.publisher);
     out.push({
       ...toSanitized(rep, relevance),
       signalId: rep.id,
@@ -459,6 +462,10 @@ export function representatives(rows: SignalRow[], now: Date): AggregatedSignal[
  * The three refreshes run in parallel via Promise.allSettled so one slow
  * source never blocks the others; GDELT is the most likely to fail and the
  * cycle proceeds with news + FRED alone.
+ *
+ * The weight table (#223) is loaded once and stamped on the result as
+ * `weightSet`, so one aggregation never mixes tables and an activation
+ * mid-cycle only affects the next aggregation.
  */
 export async function aggregateSignals(signal?: AbortSignal): Promise<AggregatedSignals> {
   const refreshed = await Promise.allSettled((Object.keys(FETCHERS) as SignalSource[]).map((s) => ensureFresh(s, signal)));
@@ -470,15 +477,23 @@ export async function aggregateSignals(signal?: AbortSignal): Promise<Aggregated
   }
 
   const now = clockNow();
+  const table = await getActiveWeightTable();
   const rows = await getSignalStore().recent(new Date(now.getTime() - AGGREGATE_WINDOW_HOURS * 3_600_000));
-  const reps = representatives(rows, now);
+  const reps = representatives(rows, now, table);
   const pick = (source: SignalSource) => reps.filter((r) => r.source === source).slice(0, LIMITS[source]);
   const news = pick('NEWSAPI');
   const fed = pick('FRED');
   const macro = pick('GDELT');
 
   logger.info({ news: news.length, fed: fed.length, macro: macro.length, rows: rows.length }, 'Signals aggregated');
-  return { news, fed, macro, aggregatedAt: now, signalCount: news.length + fed.length + macro.length };
+  return {
+    news,
+    fed,
+    macro,
+    aggregatedAt: now,
+    signalCount: news.length + fed.length + macro.length,
+    weightSet: { id: table.id, version: table.version },
+  };
 }
 
 export { classifyNewsCategory };

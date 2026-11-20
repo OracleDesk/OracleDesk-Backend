@@ -27,6 +27,7 @@ jobs:
     outputs:
       digest: ${{ steps.build.outputs.digest }}
       tag: ${{ steps.meta.outputs.tag }}
+      image_ref: ${{ steps.meta.outputs.image_ref }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,7 +39,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
-        run: echo "tag=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "image_ref=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "tag=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
       - id: build
         uses: docker/build-push-action@v6
         with:
@@ -69,7 +72,7 @@ jobs:
     with:
       environment: staging
       namespace: oracledesk-staging
-      image: ghcr.io/${{ github.repository }}@${{ needs.image.outputs.digest }}
+      image: ${{ needs.image.outputs.image_ref }}@${{ needs.image.outputs.digest }}
       digest: ${{ needs.image.outputs.digest }}
       values_file: values-staging.yaml
     secrets: inherit
@@ -105,7 +108,7 @@ jobs:
     with:
       environment: production
       namespace: oracledesk
-      image: ghcr.io/${{ github.repository }}@${{ needs.image.outputs.digest }}
+      image: ${{ needs.image.outputs.image_ref }}@${{ needs.image.outputs.digest }}
       digest: ${{ needs.image.outputs.digest }}
       values_file: values-production.yaml
     secrets: inherit

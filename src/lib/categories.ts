@@ -1,6 +1,9 @@
-import type { MarketCategory } from '@prisma/client';
+import { MarketCategory } from '@prisma/client';
 import type { Category } from '../generated/market-core';
 
+// Re-export MarketCategory as both a value (for `z.enum`) and a type, so
+// consumers can derive runtime enums from the single Prisma source of truth.
+export { MarketCategory };
 export type ContractCategoryTag = Category['tag'];
 
 /**

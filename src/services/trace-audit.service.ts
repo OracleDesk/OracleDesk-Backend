@@ -8,6 +8,11 @@ import { agentSigner } from './stellar/clients';
 import { sha256Hex } from '../utils/hash.util';
 import { fetchIpfsBytes } from './ipfs.service';
 import {
+  traceAttestationMessage,
+  verifyTraceSignatureLocal,
+  type ChainTraceAction,
+} from '../lib/trace-signing';
+import {
   traceCount,
   marketTraceCount,
   marketTraceAt,
@@ -59,6 +64,61 @@ export interface ClassifyResult {
   detail?: Record<string, unknown>;
   computedHash?: string;
   onChainHash?: string;
+}
+
+/**
+ * Classifies an attested trace signature (#273):
+ * - Missing signature on legacy pre-cutover traces -> `UNSIGNED`
+ * - Local Ed25519 verification failure or `ed25519_verify` contract trap -> `SIGNATURE_INVALID`
+ * - Key bound to a foreign agent (`verify_trace_signature` returning `false`) -> `FOREIGN_AGENT`
+ */
+export function classifyTraceSignature(input: {
+  signatureBase64?: string | null;
+  signingKeyHex?: string | null;
+  networkPassphrase?: string;
+  registry?: string;
+  agent: string;
+  marketId: bigint;
+  action: ChainTraceAction;
+  traceHashHex: string;
+  onChainVerify?: { ok: true; value: boolean } | { ok: false; trapped: boolean; error?: string };
+}): { status: 'VERIFIED' | 'UNSIGNED' | 'SIGNATURE_INVALID' | 'FOREIGN_AGENT'; detail?: Record<string, unknown> } {
+  if (!input.signatureBase64 || !input.signingKeyHex) {
+    return { status: 'UNSIGNED', detail: { reason: 'No detached Ed25519 signature recorded (pre-cutover trace)' } };
+  }
+
+  const sigBytes = Buffer.from(input.signatureBase64, 'base64');
+  const hashBytes = Buffer.from(input.traceHashHex.replace(/^0x/, ''), 'hex');
+  const msg = traceAttestationMessage({
+    networkPassphrase: input.networkPassphrase ?? config.STELLAR_NETWORK_PASSPHRASE,
+    registry: input.registry ?? CONTRACTS.reasoningRegistry,
+    agent: input.agent,
+    marketId: input.marketId,
+    action: input.action,
+    traceHash: hashBytes,
+  });
+
+  if (!verifyTraceSignatureLocal(input.signingKeyHex.trim(), msg, sigBytes)) {
+    return { status: 'SIGNATURE_INVALID', detail: { reason: 'Local Ed25519 verification failed', signingKey: input.signingKeyHex.trim() } };
+  }
+
+  if (input.onChainVerify) {
+    if (!input.onChainVerify.ok) {
+      if (input.onChainVerify.trapped) {
+        return {
+          status: 'SIGNATURE_INVALID',
+          detail: { reason: 'verify_trace_signature trapped in ed25519_verify', error: input.onChainVerify.error },
+        };
+      }
+    } else if (input.onChainVerify.value === false) {
+      return {
+        status: 'FOREIGN_AGENT',
+        detail: { reason: 'Signing key is bound to a different agent on-chain', signingKey: input.signingKeyHex.trim() },
+      };
+    }
+  }
+
+  return { status: 'VERIFIED' };
 }
 
 /**

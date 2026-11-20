@@ -3,17 +3,22 @@ import crypto from 'node:crypto';
 import { z } from 'zod';
 import { config } from '../config';
 import { prisma } from '../lib/prisma';
+import { logger } from '../lib/logger';
 import { sendSuccess, sendError, parsePagination, buildPaginationMeta } from '../utils/response.util';
 import { summarizeProvenance } from '../lib/llm/provenance';
 import { verifyTraceOnChain } from '../services/trace-publish.service';
 import { unwrapKey } from '../services/trace-crypto.service';
+import { parseUsdc } from '../lib/amounts';
 import {
   DAILY_PASS_PRICE_RAW,
+  checkAccess,
   getTracWithAccessControl,
   getSpendingAllowance,
   listPaymentEvents,
   preauthorizeSpending,
   recordPayment,
+  toAllowanceDto,
+  toSubscriptionDto,
   upsertSpendingAllowance,
 } from '../services/subscription.service';
 import {
@@ -162,7 +167,32 @@ export async function unlockTrace(req: Request, res: Response): Promise<void> {
   });
 
   const trace = await getTracWithAccessControl(traceId, req.user.userId).catch(() => null);
-  sendSuccess(res, { subscription, trace }, 201);
+  sendSuccess(res, { subscription: toSubscriptionDto(subscription), trace }, 201);
+}
+
+type AllowanceAmount = { ok: true; value: bigint; deprecated: boolean } | { ok: false; message: string };
+
+/**
+ * One allowance limit from the request body (#224): `<field>Raw` as integer
+ * base units wins; otherwise `<field>` as a decimal USDC string. A JSON number
+ * is still accepted for one release (flagged deprecated) and goes through
+ * parseUsdc(String(n)), never through a float conversion.
+ */
+function allowanceAmount(field: string, raw: unknown, decimal: unknown): AllowanceAmount {
+  if (raw !== undefined) {
+    if (typeof raw !== 'string' || !/^\d+$/.test(raw)) {
+      return { ok: false, message: `${field}Raw must be an integer base-unit string` };
+    }
+    return { ok: true, value: BigInt(raw), deprecated: false };
+  }
+  if (typeof decimal === 'string' || typeof decimal === 'number') {
+    try {
+      return { ok: true, value: parseUsdc(String(decimal)), deprecated: typeof decimal === 'number' };
+    } catch {
+      return { ok: false, message: `${field} must be a decimal USDC string with at most 7 decimal places` };
+    }
+  }
+  return { ok: false, message: `${field}Raw (base units) or ${field} (decimal string) is required` };
 }
 
 export async function setSpendingAllowance(req: Request, res: Response): Promise<void> {
@@ -171,25 +201,15 @@ export async function setSpendingAllowance(req: Request, res: Response): Promise
     return;
   }
 
-  const { dailyLimit, perTraceLimit, dailyLimitRaw, perTraceLimitRaw, currency } = req.body as {
-    dailyLimit?: number;
-    perTraceLimit?: number;
-    dailyLimitRaw?: string;
-    perTraceLimitRaw?: string;
-    currency?: string;
-  };
-
-  if (typeof dailyLimit !== 'number' || typeof perTraceLimit !== 'number') {
-    sendError(res, 400, 'MISSING_ALLOWANCE_FIELDS', 'dailyLimit and perTraceLimit are required numbers');
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const daily = allowanceAmount('dailyLimit', body.dailyLimitRaw, body.dailyLimit);
+  const perTrace = allowanceAmount('perTraceLimit', body.perTraceLimitRaw, body.perTraceLimit);
+  if (!daily.ok || !perTrace.ok) {
+    const messages = [daily, perTrace].flatMap((r) => (r.ok ? [] : [r.message]));
+    sendError(res, 400, 'VALIDATION_ERROR', messages.join('; '));
     return;
   }
-  if (
-    (dailyLimitRaw !== undefined && !/^\d+$/.test(dailyLimitRaw)) ||
-    (perTraceLimitRaw !== undefined && !/^\d+$/.test(perTraceLimitRaw))
-  ) {
-    sendError(res, 400, 'VALIDATION_ERROR', 'dailyLimitRaw and perTraceLimitRaw must be integer base-unit strings');
-    return;
-  }
+  const currency = typeof body.currency === 'string' ? body.currency : undefined;
 
   // Ensure the user record exists before creating the FK-linked spending
   // allowance. Key on the user id: walletAddress is no longer unique (#46),
@@ -211,14 +231,16 @@ export async function setSpendingAllowance(req: Request, res: Response): Promise
 
   const allowance = await upsertSpendingAllowance({
     userId: req.user.userId,
-    dailyLimit,
-    perTraceLimit,
-    dailyLimitRaw,
-    perTraceLimitRaw,
+    dailyLimitRaw: daily.value,
+    perTraceLimitRaw: perTrace.value,
     currency,
   });
 
-  sendSuccess(res, allowance, 200);
+  if (daily.deprecated || perTrace.deprecated) {
+    // Numeric limits are accepted for one release only (#224); see docs/api.md.
+    res.setHeader('Deprecation', 'true');
+  }
+  sendSuccess(res, toAllowanceDto(allowance), 200);
 }
 
 export async function getMySpendingAllowance(req: Request, res: Response): Promise<void> {
@@ -309,4 +331,122 @@ export async function submitIntent(req: Request, res: Response): Promise<void> {
     txHash: parsed.data.txHash,
   });
   sendSuccess(res, result, result.status === 'CONFIRMED' ? 201 : 202);
+}
+
+// Restored from #154 (0fbe386); dropped by the 3756171 merge.
+
+const usedNonces = new Set<string>();
+
+/**
+ * GET /traces/:id/key
+ * Returns decryption key for entitled users (daily pass / subscription).
+ */
+export async function getTraceKey(req: Request, res: Response): Promise<void> {
+  if (!req.user) {
+    sendError(res, 401, 'UNAUTHORIZED', 'Authentication required');
+    return;
+  }
+
+  const traceId = String(req.params.id);
+  const access = await checkAccess(req.user.userId, traceId);
+  if (!access.hasAccess) {
+    sendError(res, 403, 'FORBIDDEN', 'Active pass or subscription required to access trace key');
+    return;
+  }
+
+  const traceKey = await prisma.traceKey.findUnique({
+    where: { traceId },
+  });
+
+  if (!traceKey) {
+    sendError(res, 404, 'TRACE_KEY_NOT_FOUND', 'No encryption key found for this trace');
+    return;
+  }
+
+  const dataKey = unwrapKey(Buffer.from(traceKey.wrappedKey), traceKey.kid);
+
+  logger.info({ traceId, userId: req.user.userId, kid: traceKey.kid }, 'Trace key released');
+
+  sendSuccess(res, {
+    kid: traceKey.kid,
+    dataKey: dataKey.toString('base64'),
+    plaintextHash: traceKey.plaintextHash,
+  });
+}
+
+/**
+ * POST /internal/traces/:onChainTraceId/key
+ * Secure x402 trace key release with shared HMAC and replay protection.
+ */
+export async function releaseTraceKeyInternal(req: Request, res: Response): Promise<void> {
+  const secret = config.X402_KEY_RELEASE_SECRET;
+  if (!secret) {
+    sendError(res, 503, 'FEATURE_DISABLED', 'Internal key release is not configured');
+    return;
+  }
+
+  const signature = req.get('x-signature');
+  const timestamp = req.get('x-timestamp');
+  const nonce = req.get('x-nonce');
+
+  if (!signature || !timestamp || !nonce) {
+    sendError(res, 401, 'UNAUTHORIZED', 'Missing authentication headers (x-signature, x-timestamp, x-nonce required)');
+    return;
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const ts = parseInt(timestamp, 10);
+  if (isNaN(ts) || Math.abs(now - ts) > 300) {
+    sendError(res, 401, 'EXPIRED_REQUEST', 'Request timestamp is outside the allowed window');
+    return;
+  }
+
+  if (usedNonces.has(nonce)) {
+    sendError(res, 401, 'REPLAYED_NONCE', 'Nonce has already been used');
+    return;
+  }
+  usedNonces.add(nonce);
+  if (usedNonces.size > 10000) {
+    usedNonces.clear();
+  }
+
+  const onChainTraceId = String(req.params.onChainTraceId);
+  const expectedSig = crypto
+    .createHmac('sha256', secret)
+    .update(`${timestamp}:${nonce}:${onChainTraceId}`)
+    .digest('hex');
+
+  if (signature.toLowerCase() !== expectedSig.toLowerCase()) {
+    sendError(res, 401, 'INVALID_SIGNATURE', 'HMAC signature verification failed');
+    return;
+  }
+
+  let onChainBigInt: bigint;
+  try {
+    onChainBigInt = BigInt(onChainTraceId);
+  } catch {
+    sendError(res, 400, 'INVALID_TRACE_ID', 'Invalid onChainTraceId format');
+    return;
+  }
+
+  const trace = await prisma.reasoningTrace.findFirst({
+    where: { onChainTraceId: onChainBigInt },
+    include: { traceKey: true },
+  });
+
+  if (!trace || !trace.traceKey) {
+    sendError(res, 404, 'TRACE_NOT_FOUND', 'Trace or encryption key not found');
+    return;
+  }
+
+  const traceKey = trace.traceKey;
+  const dataKey = unwrapKey(Buffer.from(traceKey.wrappedKey), traceKey.kid);
+
+  sendSuccess(res, {
+    onChainTraceId,
+    traceId: trace.id,
+    kid: traceKey.kid,
+    dataKey: dataKey.toString('base64'),
+    plaintextHash: traceKey.plaintextHash,
+  });
 }

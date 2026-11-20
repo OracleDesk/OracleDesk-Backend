@@ -91,6 +91,7 @@ the same key on every retry of it.
 | `POST /traces/verify` | optional |
 | `POST /traces/:id/unlock` | optional |
 | `POST /traces/payment-intents/:id/submit` | optional (idempotent by txHash) |
+| `POST /x402/allowance/reserve`, `/commit`, `/release` | **required** (service calls, scope `anon`) |
 | `POST /auth/challenge`, `POST /auth/verify` | not supported (the handshake is single-use, and `/auth/verify` returns a JWT that is never stored) |
 
 - **Format:** 1–255 printable ASCII characters. A UUID (`crypto.randomUUID()`) is recommended.
@@ -135,9 +136,23 @@ useMutation({
 
 `GET /readyz` → `200 { status: "ready", checks }` when every critical dependency is up, `503 NOT_READY` with `status: "not_ready"` otherwise, or `status: "draining"` once shutdown has begun. Each check is `{ name, ok, critical, latencyMs, error? }` for `database`, `redis`, `rpc` and `indexer`; `error` is one of `timeout`, `connection_refused`, `rpc_unhealthy`, `lagging`, `unavailable`. Probes time out after `HEALTH_PROBE_TIMEOUT_MS`, results are cached for `HEALTH_CACHE_TTL_MS` (failures for 500 ms) and concurrent calls share one run. `HEALTH_CRITICAL` (default `database,redis`) picks which dependencies fail readiness. Both endpoints bypass the rate limiter.
 
+Chain-write probes (#220): `outbox`, `signers` and `channels` are also listed. Each check is tri-state: ok, **degraded** (`ok: true`, `state: "degraded"`, an `error` class naming why) or failing (`ok: false`). Only a failing critical check returns 503; when any check is degraded and none critical is failing, `/readyz` returns `200` with `status: "degraded"`. On an instance that does not write (dry-run, or a `PROCESS_ROLE` without the outbox worker; see `HEALTH_CHAIN_WRITER`) the three probes are always ok and never critical, even when listed in `HEALTH_CRITICAL`. Additional `error` classes:
+
+| Probe | Class | Failing | Degraded |
+| --- | --- | --- | --- |
+| `outbox` | `backlog` | in-flight rows > `HEALTH_OUTBOX_MAX_INFLIGHT` | > half of it |
+| `outbox` | `stuck` | oldest in-flight row older than `HEALTH_OUTBOX_MAX_AGE_MS`, or any SUBMITTED/PENDING row past its `maxTime` | older than half of it |
+| `outbox` | `handler_failing` | a kind's completion handler failed `HEALTH_HANDLER_MAX_STREAK` times in a row on this instance, or a terminal row has waited for its handler longer than `HEALTH_OUTBOX_MAX_AGE_MS` | |
+| `signers` | `low_balance` | agent or fee payer below reserve (`(2 + subentries) × 0.5 XLM + 1 XLM`) | runway below `HEALTH_BALANCE_MIN_RUNWAY_HOURS` |
+| `signers` | `account_missing` | agent or fee payer account does not exist (unfunded) | |
+| `channels` | `channels_exhausted` | channels configured and none healthy (all below `CHANNEL_MIN_BALANCE_XLM`) | |
+| `channels` | `low_balance` | | some channels unhealthy |
+
 `GET /health` → `{ status: "healthy", uptime: number }`. Deprecated: it sends `Deprecation: true` and `Link: </readyz>; rel="successor-version"`.
 
 `GET /api/v1/admin/status` (admin JWT) → probe details with latencies, indexer cursor vs RPC latest ledger and lag, last success/failure per cron job (in memory, reset on restart), chain execution mode, agent public key, LLM provider configuration and Gemini breaker state, and process info.
+
+`chainWrites` (#220): `{ writer, outbox, handlers, balances, channels }`. `outbox` is the row count per status (terminal statuses count only rows whose handler has not run) plus `inFlight`, `oldestInFlightMs`, `pastMaxTime` and `oldestUnhandledMs`. `handlers` is `{ scope: "instance", kinds: { <kind>: { count, lastErrorClass, since } } }` (error class only, never the message). `balances` is the cached snapshot `{ stale, takenAt, accounts: [{ publicKey, role: agent|feePayer|channel, stroops, minStroops, runwayHours, estimated?, checkedAt, error? }] }` with stroops as decimal strings; `runwayHours` is `(stroops − minStroops) / (24 h spend / 24)` and `null` with no spend history; `estimated` means part of the spend is `total_fee` (no `fee_charged`) or a bump's bid fee. `channels` is `{ total, healthy, leased, accounts: [{ publicKey, healthy, stroops, checkedAt }] }`. Public keys only, never secrets.
 
 `GET /api/v1/admin/chain/spec-compat` (admin JWT) → `{ mode, report }`: the contract spec compatibility report from the boot gate (#34). `report` lists, per contract, the deployed wasm hash against the pinned one and every spec difference with its `breaking`/`compatible` classification; it is `null` when the gate has not run (`SPEC_COMPAT_ENFORCE=off`). See "Contract compatibility" in `docs/architecture.md`.
 
@@ -567,14 +582,15 @@ entry for the call that proposed the market.
 | `schema` | Version string of this block. Check it before reading the rest. |
 | `llm[]` | One entry per generation step, in order: the market proposal (creation traces only), then the hedge conditions. |
 | `source` | `llm`: a model produced the output. `default`: a hard-coded safe default was used (`reason` is `LLM_FAILED` or `LLM_BUDGET_EXCEEDED`); such an entry has no model fields. |
-| `provider`, `model` | Who answered. When Gemini served the call, `fallbackFrom` names the provider that failed first. |
+| `provider`, `model` | Who answered: `anthropic`, `gemini` or (since #218) `openai`. When a later policy entry served the call, `fallbackFrom` names the one that failed first. |
 | `promptId`, `promptVersion`, `promptHash` | The registered prompt (`src/lib/prompts`). `promptHash = sha256(canonicalJson({ id, version, system, user }))` over the *template*, not the rendered text. `adhoc`/`0` marks a call that did not use the registry. |
 | `params` | Sampling temperature and the `max_tokens` the serving provider was finally given. |
 | `usage` | Tokens summed over the serving provider's requests; `null` when the SDK reported none. |
 | `latencyMs` | Wall time of the whole call, fallback and repair rounds included. Differs on every run. |
 | `attempts` | Provider requests made, repair rounds and Gemini 429 retries included. |
-| `fallbackFrom` | `{ provider, model, errorClass }`; `errorClass` is one of `validation`, `rate_limited`, `timeout`, `auth`, `circuit_open`, `budget`, `unavailable`, `server_error`, `error`. Provider messages are never recorded. |
-| `outputSha256` | sha256 of the raw model output (canonical JSON of the tool input for Anthropic, the response text for Gemini). Raw prompts and outputs are never stored. |
+| `fallbackFrom` | `{ provider, model, errorClass }`: the first policy entry that was attempted and failed. `errorClass` is one of `validation`, `rate_limited`, `timeout`, `auth`, `circuit_open`, `budget`, `unavailable`, `server_error`, `error`. Provider messages are never recorded. |
+| `route` | Optional (#218): `{ task, chain: [{ provider, model, decision }] }`, the task's policy chain as evaluated, in order. `decision` is `served`, one of the `errorClass` values, `unconfigured` (no key), `cooling` or `open` (skipped by the router's provider health). Absent on older traces. |
+| `outputSha256` | sha256 of the raw model output (canonical JSON of the tool input for Anthropic, the response text for Gemini and OpenAI). Raw prompts and outputs are never stored. |
 | `generator` | The service and its `package.json` version; `commit` appears when `GIT_SHA` is set. |
 
 The block is optional: traces created before #66 have none, and consumers must
@@ -658,7 +674,8 @@ if **all** of these hold:
 There is no development bypass: an unverifiable payment never grants
 access. Tests inject a fake RPC client.
 
-Response `201`: `{ subscription, trace }`.
+Response `201`: `{ subscription, trace }`, where `subscription` is the
+subscription DTO below (#224).
 Errors: `400 VALIDATION_ERROR`, `402 PAYMENT_NOT_FOUND`,
 `402 PAYMENT_FAILED`, `402 PAYMENT_WRONG_TOKEN`, `402 PAYMENT_WRONG_SENDER`,
 `402 PAYMENT_WRONG_RECIPIENT`, `402 PAYMENT_INSUFFICIENT`,
@@ -670,18 +687,74 @@ Errors: `400 VALIDATION_ERROR`, `402 PAYMENT_NOT_FOUND`,
 > revenue account is probably wanted. This is flagged in `docs/STATUS.md`
 > and not decided here.
 
+#### Money in payment responses (#224)
+
+Payment, subscription and allowance responses carry exact amounts only: each
+amount is a base-unit decimal string (`…Raw`, 7-decimal USDC) plus a display
+string derived from it with `formatUsdc` (`"0.5"`, never a float). The Float
+columns `amountPaid`, `amount`, `dailyLimit`, `perTraceLimit` and `spentToday`
+are no longer returned; they are dropped from the database in a later release.
+A legacy row the raw backfill has not reached yet has `…Raw: null` and
+`…Display: null` rather than a guessed value. Responses replayed by the
+`Idempotency-Key` middleware may still show the old shape until the key
+expires (24 h).
+
+Subscription:
+
+```json
+{
+  "id": "…", "userId": "…", "traceId": null, "type": "DAILY_PASS", "status": "ACTIVE",
+  "amountPaidRaw": "5000000", "amountDisplay": "0.5", "currency": "USDC",
+  "txHash": "…", "purchaseLedger": 123, "startsAt": "…", "endsAt": "…", "expiresAt": "…",
+  "paymentIntentId": null, "createdAt": "…", "updatedAt": "…"
+}
+```
+
+Payment event: `{ id, userId, txHash, type, amountRaw, amountDisplay,
+fromAddress, currency, status, traceId, ledger, ledgerCloseTime,
+allowanceOverage, allowanceOverageRaw, paymentIntentId, metadata, createdAt,
+confirmedAt }`.
+
+Allowance: `{ id, userId, dailyLimitRaw, perTraceLimitRaw, spentTodayRaw,
+overageRaw, dailyLimitDisplay, perTraceLimitDisplay, spentTodayDisplay,
+overageDisplay, windowStartedAt, currency, lastResetAt, isActive, createdAt,
+updatedAt }`.
+
 #### `GET /traces/access/allowance`, `PUT /traces/access/allowance` (auth)
 
-`PUT` body `{ dailyLimit: number, perTraceLimit: number, dailyLimitRaw?: "base units", perTraceLimitRaw?: "base units", currency?: "USDC" }`.
-The float fields are display mirrors; enforcement uses the raw `NUMERIC(39,0)`
-columns (#53). Response: `SpendingAllowance | null`.
+`PUT` body: each limit as base units or as a decimal USDC string.
+
+```json
+{ "dailyLimitRaw": "50000000", "perTraceLimitRaw": "5000000", "currency": "USDC" }
+{ "dailyLimit": "5", "perTraceLimit": "0.5" }
+```
+
+`dailyLimitRaw` wins over `dailyLimit` (likewise `perTraceLimit…`). Decimal
+strings are parsed exactly (at most 7 decimal places, no exponents). JSON
+numbers are still accepted for one release: they are converted with
+`parseUsdc(String(n))` (so `1e-7` is rejected) and the response carries
+`Deprecation: true`. Enforcement uses the raw `NUMERIC(39,0)` columns (#53).
+`perTraceLimit` must be positive and at most `dailyLimit`. Response: the
+allowance DTO above, or `null` from `GET` when none is set. Errors:
+`400 VALIDATION_ERROR`, `400 INVALID_ALLOWANCE`.
+
+`GET` reports today's figures from the UTC day bucket (#219), not the
+deprecated single-day columns: `spentTodayRaw` / `spentToday` are what was
+booked to today's bucket, plus `dayStart` (ISO, the UTC day reported),
+`reservedRaw` (held by open x402 reservations), `todayOverageRaw` and
+`remainingRaw` (`dailyLimitRaw − spentTodayRaw − reservedRaw`, floored at 0;
+`null` without a daily limit). `overageRaw` stays the lifetime total.
 
 #### `POST /traces/access/preauthorize` (auth)
 
 Advisory-only allowance check (#53). Body
 `{ type?: "DAILY_PASS" | "PER_TRACE", amountRaw?: "base units" }`; for
 `DAILY_PASS` the price defaults to `DAILY_PASS_PRICE_RAW` and for `PER_TRACE`
-`amountRaw` is required. It never writes or reserves budget. Response:
+`amountRaw` is required. It never writes or reserves budget. It checks today's
+UTC bucket (`dayStart`) and counts open x402 reservations (`reservedRaw`)
+against the daily limit as well as spend (#219). The payment itself is charged
+to the UTC day its ledger closes, so a transfer signed at 23:59:58 that closes
+at 00:00:03 is checked against today but booked to tomorrow. Response:
 
 ```json
 {
@@ -690,9 +763,11 @@ Advisory-only allowance check (#53). Body
   "active": true,
   "allowed": false,
   "reason": "ALLOWANCE_DAILY_LIMIT",
+  "dayStart": "2026-11-20T00:00:00.000Z",
   "dailyLimitRaw": "5000000",
   "perTraceLimitRaw": "5000000",
-  "spentTodayRaw": "4000000",
+  "spentTodayRaw": "3000000",
+  "reservedRaw": "1000000",
   "remainingRaw": "1000000",
   "overageRaw": "0",
   "wouldOverflowRaw": "4000000"
@@ -700,8 +775,82 @@ Advisory-only allowance check (#53). Body
 ```
 
 An over-limit payment is still accepted on-chain and flagged
-(`allowanceOverage` on the `PaymentEvent`, `overageRaw` on the allowance); it is
-never refused and never silently dropped.
+(`allowanceOverage` on the `PaymentEvent`, `overageRaw` on the allowance and on
+the day bucket); it is never refused and never silently dropped. Reservations
+never make a pass claim fail: they only reduce the remaining budget, so a claim
+may be flagged as overage instead.
+
+#### x402 allowance reservations (#219, service-to-service)
+
+`POST /x402/allowance/reserve`, `/commit` and `/release` are called by the x402
+trace service (contracts repo) around each per-trace settlement, so per-trace
+purchases are held to the same per-trace and daily limits as passes. They are
+not for browsers.
+
+**Authentication.** HMAC-SHA256 with the shared secret
+`X402_ALLOWANCE_HMAC_SECRET` (32+ characters, loaded through the secret store,
+`_FILE` supported, never `X402_KEY_RELEASE_SECRET`). Every request carries:
+
+| Header | Value |
+|---|---|
+| `X-OracleDesk-Timestamp` | Unix seconds; rejected when more than 60 s from server time |
+| `X-OracleDesk-Signature` | lowercase hex `HMAC-SHA256(secret, METHOD + "\n" + path + "\n" + timestamp + "\n" + hex(SHA-256(body)))` |
+| `Idempotency-Key` | required on all three routes (see Idempotency) |
+
+`path` is the request target exactly as sent, e.g.
+`/api/v1/x402/allowance/reserve` (with any query string); `body` is the exact
+request bytes (hash of the empty string when there is none). A missing, stale
+or wrong signature, or a body changed after signing, is
+`401 SERVICE_AUTH_INVALID`; an unconfigured secret is
+`503 SERVICE_AUTH_NOT_CONFIGURED`. During a secret rotation the previous value
+is accepted for the secret store's grace window.
+
+```ts
+const ts = Math.floor(Date.now() / 1000).toString();
+const body = JSON.stringify(payload);
+const sig = createHmac('sha256', secret)
+  .update(`POST\n${path}\n${ts}\n${createHash('sha256').update(body).digest('hex')}`)
+  .digest('hex');
+```
+
+**`POST /x402/allowance/reserve`** — body
+`{ payer: "G…|M…", subId?: "digits", subIdKind?: "MUXED" | "MEMO", traceId, amountRaw: "base units", nonce }`.
+The payer is resolved to a user by `identityKey` only (the login derivation:
+`G…`, or `G…#muxed:<id>` / `G…#memo:<id>`; an `M…` payer carries its muxed id),
+never by `walletAddress`. Checks `amountRaw` against the per-trace limit and
+against `dailyLimitRaw − spentRaw − reservedRaw` of today's UTC bucket.
+
+| Outcome | Response |
+|---|---|
+| Unknown payer, or no active allowance | `200 { allowed: true, active: false, reservationId: null }` (nothing to enforce; settle normally) |
+| Fits | `201 { allowed: true, active: true, reservationId, dayStart, expiresAt, remainingRaw, replay }`; the amount is held for `X402_ALLOWANCE_RESERVATION_TTL_SECONDS` (default 120) |
+| Over the per-trace limit | `403 ALLOWANCE_PER_TRACE_LIMIT` (`details.perTraceLimitRaw`) |
+| Over the remaining daily budget | `403 ALLOWANCE_DAILY_LIMIT` (`details.dayStart`, `details.remainingRaw`) |
+| Same `(payer, nonce)` again | the same reservation (`replay: true`); with a different amount or trace, `409 ALLOWANCE_NONCE_REUSED` |
+
+Do not settle on a `403`.
+
+**`POST /x402/allowance/commit`** — after settlement, body
+`{ reservationId, txHash: "64-hex", ledgerCloseTime?: unixSeconds | "ISO-8601", amountRaw, payer?, subId?, subIdKind?, traceId? }`.
+Books the settled amount on the UTC day of `ledgerCloseTime` (which may be the
+day after the reservation) and returns the reservation's hold to its own day.
+The money already moved, so a commit is always booked: an expired, released or
+unknown reservation (`late: true`) is charged like a claim, with whatever no
+longer fits the day recorded as overage. An unknown `reservationId` needs
+`payer` to be attributed, otherwise `404 ALLOWANCE_RESERVATION_NOT_FOUND`.
+Without `ledgerCloseTime` the current UTC day is used and `dayInferred: true`.
+Idempotent per `txHash`. Response `200`:
+`{ committed, active, reservationId, chargeId, day: "YYYY-MM-DD", dayInferred, overageRaw, perTraceExceeded, late, replay }`.
+Errors: `409 ALLOWANCE_RESERVATION_COMMITTED` (already committed with another
+`txHash`).
+
+**`POST /x402/allowance/release`** — body `{ reservationId }`, when settlement
+did not happen. Returns `{ reservationId, status, released }`; releasing a
+reservation that is no longer `RESERVED` changes nothing. Errors:
+`404 ALLOWANCE_RESERVATION_NOT_FOUND`.
+
+Reservations not committed or released are expired by the payment-intent cron
+(`PAYMENT_INTENT_CONFIRM_CRON`), which returns their budget.
 
 #### `POST /traces/payment-intents` (auth)
 
@@ -739,7 +888,7 @@ coverage (`EXPIRED`).
 
 #### `GET /traces/payments` (auth)
 
-The user's last 100 `PaymentEvent`s, newest first.
+The user's last 100 payment events as payment event DTOs (#224), newest first.
 
 ### Agent calibration (#68)
 
@@ -751,7 +900,8 @@ traces written before resolution and stores metrics per slice.
 
 Query (all optional): `window` (`30d`, `90d`, `all`; default `90d`),
 `groupBy` (`agentType`, `category`, `decisionType`, `promptVersion`, `model`,
-`agentType_category`; default `agentType`), `agentType` (`MARKET_MAKER` or
+`agentType_category`, `sourceWeightSet` (keys `v0`, `v1`, …; v0 = compiled
+weights, #223); default `agentType`), `agentType` (`MARKET_MAKER` or
 `TRADER`) and `category`. The two filters only apply to the groupings that
 contain them (`agentType`, `category`, `agentType_category`); otherwise `400
 VALIDATION_ERROR`. The response carries `Cache-Control: public, max-age=300`.
@@ -892,9 +1042,11 @@ the snapshot. The trader's reasoning traces carry the same
 
 Query `status`, `page`, `limit`. Response: `Position[]` with
 `market { question, category, settlementCurrency, expiryTimestamp, onChainMarketId }`,
-`trade { direction, amount, edgeDetected, kellyFraction, txHash }` and `lastExit`
+`trade { direction, amount, amountRaw, collateralRaw, sharesRaw, feeRaw, price,
+priceBps, fillPriceBps, edgeDetected, edgeBps, kellyFraction, txHash }` and `lastExit`
 (the newest `PositionExit`: `status`, `reason`, `mode`, `sharesSoldRaw`,
-`collateralOutRaw`, `effectivePrice`, `txHash`, `error`, `createdAt`, or `null`).
+`collateralOutRaw`, `effectivePrice`, `effectivePriceBps`, `txHash`, `error`,
+`createdAt`, or `null`).
 
 Positions are denominated in **shares** (#77/#78). Raw fields are base-unit
 decimal strings (7-decimal USDC, `NUMERIC(39,0)`), never floats:
@@ -906,12 +1058,18 @@ decimal strings (7-decimal USDC, `NUMERIC(39,0)`), never floats:
 | `feesPaidRaw` | Fee paid on the buy (`ceil(collateral_in × fee_bps / 10000)`). |
 | `realisedCollateralRaw`, `realisedPnlRaw` | Collateral received and PnL realised by confirmed exits. |
 | `markPriceBps` | Mid price of the held outcome, in basis points. |
+| `entryPriceBps` | Fill price of the held outcome in basis points. |
 | `markValueRaw` | **Mid value**: `shares × markPriceBps / 10000`. Overstates what a large position can realise. |
 | `liquidationValueRaw` | **Liquidation value**: what selling all shares into the pool returns now (`collateralOutForShares`, fee included, rounded down). `0` with `illiquid: true` if the pool can't absorb the sale. **This drives risk.** |
 | `unrealisedPnlRaw` | `liquidationValueRaw − costBasisRaw`. Stop-loss (−15% of cost) and hedge detection (−10%) use it. |
 | `markedAt`, `valuationSource` | When and from where the mark came: `indexed` (newest indexed `Trade` event), `rpc` (`get_market`) or `estimated` (backfill). |
-| `entryPrice` | Effective price paid per share (`collateralIn / sharesOut`), display only. |
-| `currentPrice`, `pnl`, `size` | Float display fields derived from the raw values (`pnl` = realised + unrealised). |
+| `entryPrice`, `currentPrice`, `pnl`, `size` | Deprecated float compatibility projections; not used for accounting or agent risk decisions. |
+
+Trade and copy-trade responses also expose raw collateral/shares/fees and
+basis-point prices. Their legacy float amount, price, edge, and PnL fields are
+deprecated compatibility projections. They remain during the API deprecation
+window; a later contract migration will remove them after consumers have moved
+to the raw fields.
 
 Several open positions in one market are valued by their own shares; selling
 them together returns less than the sum because each sale moves the pool.
@@ -1014,6 +1172,73 @@ Query parameters: `page`, `limit`, `status`.
 Schedules a trace audit run asynchronously in the background.
 Response `202 Accepted`: `{ "runId": "uuid", "message": "Trace audit run scheduled" }`.
 
+#### Outbox console (#221)
+
+`GET /admin/fees` (`admin.read`) aggregates `chain_fees` per day; the outbox
+console exposes the individual chain writes behind it: every live write is a
+`chain_transactions` row moving `BUILT → SIGNED → SUBMITTED → PENDING →
+SUCCESS | FAILED | EXPIRED` (#35). Reads need `chain.outbox.read` (granted to
+`operator` and `auditor`); actions need `chain.outbox.operate` (`operator`) and
+step-up (`403 STEP_UP_REQUIRED`). Both permissions reach existing databases
+through the `20261120100000_outbox_console_permissions` migration.
+
+No response or log line carries the signed envelope XDR, transaction or
+auth-entry signature bytes, or fee-bump envelopes.
+
+- `GET /admin/chain/transactions?status&kind&refId&hash&unhandled&olderThanSecs&page&limit`
+  — newest first. `status` is a comma-separated list of the statuses above;
+  `hash` (64 hex) matches the inner, landed or any fee-bump hash; `unhandled=true`
+  lists terminal rows whose completion handler has not run (`false` excludes
+  them); `olderThanSecs` keeps rows created at least that long ago. Rows carry
+  ids, kind, refId, status, hashes, bump/attempt counts, `submitLedger`,
+  `ledger`, timebounds, `error` and `handledAt`.
+- `GET /admin/chain/transactions/:id` — the row plus:
+  - `envelope`: `{ source, sequence, fee, timeBounds, operations: [{ type, contract, function, args }], authEntries: [{ address, nonce, signatureExpirationLedger }], signatureCount }`
+    (args decoded with `scValToNative`, BigInt as decimal strings);
+  - `feeBumps`: `[{ hash, fee, inclusionPerOp, at }]`;
+  - `rpc`: `getTransaction` for the inner hash and every fee-bump hash
+    (`status`, `ledger`, `latestLedgerCloseTime`, `oldestLedger`, decoded
+    `error` for `FAILED`). `resultXdr` is never stored, so results only exist
+    while RPC retains them;
+  - `expiry` (in-flight rows nothing landed for): the ledger-time expiry
+    decision `PENDING | EXPIRED | UNKNOWN` and its reason;
+  - `linked`: `market.create` → `{ market, creationAttempt }`, `trade.buy` →
+    `{ trade }`, `trade.sell` → `{ positionExit }`, `trace.publish` →
+    `{ reasoningTrace, tracePublication }`, other kinds `null`.
+
+Actions take `{ "reason": "10-500 chars" }`, run under the per-row Redis lease
+`outbox:row:<id>` that the recovery worker also takes, and each writes one
+`admin_audit_logs` row (`CHAIN_OUTBOX_RECOVER | CHAIN_OUTBOX_RERUN_HANDLER |
+CHAIN_OUTBOX_ABANDON`, metadata `{ outboxId, kind, fromStatus, toStatus,
+reason, hashes, outcome }`). Response: `{ id, kind, fromStatus, toStatus, handled, stats? }`.
+
+| Action | Preconditions | Effect |
+|---|---|---|
+| `POST /admin/chain/transactions/:id/recover` | non-terminal, or terminal with `handledAt` unset. `BUILT`/`SIGNED` rows younger than the 30 s signing grace belong to the live writer and are refused. | One recovery pass for the row (resolve by hash, resubmit `SIGNED`, expire by ledger time, fee-bump), or the missing completion handler. |
+| `POST /admin/chain/transactions/:id/rerun-handler` | `SUCCESS`, `FAILED` or `EXPIRED`. | Clears `handledAt` by compare-and-set, re-runs the kind's handler from the stored outcome (handlers are idempotent; `market.create` only links, never creates, a market) and marks it handled again. |
+| `POST /admin/chain/transactions/:id/abandon` | `SIGNED`, `SUBMITTED` or `PENDING`; no hash (inner or fee bump) landed; the latest ledger closed after `maxTime` + 60 s **and** `submitLedger` is inside RPC retention (`>= oldestLedger`). | `→ EXPIRED` with `error: "abandoned by admin: <reason>"`, then the `EXPIRED` handler. A `SIGNED` row may already have been sent, so it is judged exactly like `SUBMITTED`. |
+
+Errors:
+
+| Status | Code | When |
+|---|---|---|
+| 409 | `OUTBOX_ROW_BUSY` | The recovery worker or another operator holds the row lease; retry shortly. |
+| 409 | `OUTBOX_ROW_LANDED` | Abandon found a landed hash; the row was resolved by normal recovery instead (`details.landedHash`, `details.status`). |
+| 409 | `OUTBOX_NOT_PROVABLE` | Abandon cannot prove the envelope is dead: ledger time not past `maxTime` + skew (`decision: PENDING`), submission outside RPC retention or `submitLedger` unknown (`UNKNOWN`), or no `maxTime` (rows written before #42). |
+| 409 | `OUTBOX_INVALID_STATE` | The status does not allow the action, or the row moved concurrently. |
+| 404 | `OUTBOX_NOT_FOUND` | No such row. |
+| 500 | `OUTBOX_HANDLER_FAILED` | The completion handler threw; the row stays unhandled and the worker retries it. |
+| 503 | `OUTBOX_LEASE_UNAVAILABLE` | Redis is down; actions fail closed. |
+| 503 | `OUTBOX_RPC_UNAVAILABLE` | Abandon could not query every hash. |
+
+The recovery worker decides expiry the same way (ledger close time and RPC
+retention, never the host clock); when expiry is unprovable it leaves the row
+in flight with the reason in `error`. After an abandon, the agent's cached
+sequence (`stellar/sequence.ts`) is one ahead of the account: the next live
+write is rejected `tx_bad_seq` before submission, resyncs the sequence from
+RPC and is rebuilt by the retry loop (`BAD_SEQUENCE → resync-rebuild`), so no
+manual repair is needed.
+
 ### Agent controls (admin auth, #79)
 
 A persistent kill switch and pause shared by every backend instance. Scopes:
@@ -1051,6 +1276,34 @@ Body `{ reason?: string }`. Clears only the named row: resuming `TRADER` does no
 clear an `ALL` pause. Every pause, resume and automatic expiry writes an
 `agent_control_events` row (`before`, `after`, `actor`, `source`).
 
+### Operational alerts (admin auth, #226)
+
+#### `GET /admin/alerts?id=&state=&severity=&page=&limit=` (`admin.read`)
+
+Incidents, most recently updated first, with pagination meta. `state` is
+`PENDING | OPEN | RESOLVED`, `severity` `INFO | WARN | CRITICAL`, `id` one
+incident (the `adminUrl` in every notification links here). Each row:
+`{ id, subjectType, subjectKey, severity, state, episode, summary, detail,
+badStreak, goodStreak, openedAt, resolvedAt, ackedAt, ackedBy, silencedUntil,
+lastNotifiedAt, escalations }`. `400 VALIDATION_ERROR` for an unknown filter value.
+
+#### `POST /admin/alerts/:id/ack` (`alerts.manage`, audited)
+
+Acknowledges the current episode and stops its escalation. A later episode
+starts unacknowledged. `409 ALERT_NOT_OPEN` unless the incident is OPEN,
+`404 ALERT_NOT_FOUND`.
+
+#### `POST /admin/alerts/:id/silence` (`alerts.manage`, audited)
+
+Body `{ untilMinutes: 1..1440 }`. No notification (open, escalation or resolve)
+is sent for the incident until then; state transitions continue.
+
+Notification payloads (generic webhook, signed like dispute alerts):
+`{ type: "oracledesk.ops_alert", sentAt, alert: { kind: "ops", level, severity,
+subjectType, subjectKey, summary, detail, state, incidentId, episode,
+notification: "open" | "escalate" | "resolve", adminUrl } }`. Dispute alerts
+keep `type: "oracledesk.dispute_alert"` and their payload unchanged.
+
 #### `GET /admin/reconciliation/runs?limit=` (admin)
 
 Latest market-lifecycle reconciliation runs (#83), newest first (`limit` ≤ 100,
@@ -1076,6 +1329,42 @@ Body `{ "dryRun"?: boolean, "maxMarkets"?: number }`. Starts a run in the
 background, under the same advisory lock as the cron (a run that cannot take
 the lock records itself as skipped). Response `202 Accepted`:
 `{ "runId": "uuid", "message": "Reconciliation run scheduled" }`.
+
+#### `GET /admin/money-audit/runs?limit=` (admin, `reconciliation.run`)
+
+Latest money-audit runs (#222), newest first (`limit` ≤ 100, default 20):
+`{ id, startedAt, finishedAt, snapshotAt, observedLedger, checked, findings, repaired, rpcCalls, error }`.
+`findings` counts `REPORTED`, `REPAIRED` and `ACKED` rows; deferred and in-flight rows are not drift.
+
+#### `GET /admin/money-audit/runs/:id/findings?severity=&invariant=&page=&limit=` (admin, `reconciliation.run`)
+
+`{ run, findings }`, with `findings` paginated and optionally filtered by
+`severity` (`CRITICAL`, `HIGH`, `MEDIUM`, `INFO`) and `invariant`. Each finding is
+`{ id, runId, invariant, severity, subjectType, subjectId, evidence, suggestedRepair, action, fingerprint, firstSeenRunId, ackedBy, ackedAt, createdAt }`.
+
+`invariant`: `TRADE_EXECUTED_WITHOUT_OUTBOX`, `POSITION_WITHOUT_EXECUTED_TRADE`,
+`EXECUTED_TRADE_WITHOUT_POSITION`, `OUTBOX_TERMINAL_UNHANDLED`, `TRADE_STUCK_PENDING`,
+`EXIT_CONFIRMED_NOT_LANDED`, `SHARES_MISMATCH`, `SHARES_UNKNOWN_LEGACY`, `TRACE_WITHOUT_TRADE`
+(see [architecture.md](architecture.md#money-audit-222)). `subjectType`: `trade`,
+`position`, `exit`, `outbox`, `market_side` (`subjectId` = `<onChainMarketId>:<YES|NO>`)
+or `trace`. `action`: `REPORTED`, `REPAIRED` (auto-repair on), `SKIPPED_IN_FLIGHT`
+(work in flight; not drift), `DEFERRED` (`SHARES_MISMATCH` waiting for a second
+agreeing run or for the indexer; `evidence.deferReason`) or `ACKED` (the
+fingerprint was acknowledged). Amounts in `evidence` are base-unit decimal strings.
+
+#### `POST /admin/money-audit/run` (admin, `reconciliation.run`)
+
+Body `{ "dryRun"?: boolean }`. Starts a run in the background under the same
+advisory lock as the cron (a run that cannot take the lock records itself as
+skipped). A dry run records findings but never repairs. Response `202 Accepted`:
+`{ "runId": "uuid", "message": "Money audit run scheduled" }`.
+
+#### `POST /admin/money-audit/findings/:id/ack` (admin, `reconciliation.run`, step-up)
+
+Acknowledges a finding: sets `action = ACKED`, `ackedBy` (the admin's wallet) and
+`ackedAt`. Later runs that see the same fingerprint record it as `ACKED` and do
+not alert again. Requires a fresh wallet proof (`403 STEP_UP_REQUIRED` otherwise);
+`404 FINDING_NOT_FOUND` for an unknown id. Acknowledging twice returns the row unchanged.
 
 ### Oracle / resolution
 
@@ -1667,13 +1956,58 @@ Internal endpoint for x402 services to obtain data keys after verifying on-chain
 ## Admin Generation Runs (auth, admin)
 
 #### `GET /admin/generation-runs`
-Lists saga generation runs with status, inputs, outputs, and lock details. Query: `state`, `page`, `limit`.
+Permission `markets.generate`. Lists saga generation runs, newest first. Query: `state` (any `GenerationRunState`), `page`, `limit` (max 100). `outputs.proposal` is reduced to `outputs.question`; `proposalProvenance`, `evidence` and `tracePayload` are omitted. Response: `data: MarketGenerationRun[]`, `meta: { page, limit, total, totalPages }`.
 
 #### `GET /admin/generation-runs/:id`
-Inspects a specific saga generation run.
+Permission `markets.generate`. The full run: `state`, `attempts`, `nextAttemptAt`, `lockedBy`, `lockedUntil`, `fence`, `outputs` (every step's recorded output) and `lastError` (`{ step, message, code }`). 404 `RUN_NOT_FOUND`.
+
+#### `POST /admin/generation-runs`
+Permission `markets.generate` + step-up. Starts an admin-triggered saga run in the background. 202 `{ runId }`.
 
 #### `POST /admin/generation-runs/:id/cancel`
-Cancels an incomplete run in `NEEDS_ATTENTION` before on-chain submission, safely setting associated pending market to `CANCELLED`.
+Permission `markets.generate` + step-up. Body: `{ reason? }`. Allowed while the run (or, for `NEEDS_ATTENTION`, its failed step) is before `MARKET_PERSISTED`, i.e. before anything is pinned or submitted. A linked `PENDING` market is set to `CANCELLED`; an uncommitted dedup reservation is released. Otherwise 400 `CANNOT_CANCEL_AFTER_PIN`.
+
+#### `POST /admin/generation-runs/:id/retry`
+Permission `markets.generate` + step-up. Resets a `NEEDS_ATTENTION` run to `lastError.step` with `attempts = 0` and resumes it in the background. 202 with the run. 400 `RUN_NOT_RETRYABLE` for any other state.
+
+## Source Weight Sets (auth, admin, #223)
+
+Learned signal source/publisher weights; see docs/architecture.md ("Learned
+source weights"). Sets are created by `npm run weights:estimate -- --save`.
+A set: `{ id, version, status: DRAFT|APPROVED|ACTIVE|RETIRED, weights:
+{ "source:NEWSAPI": 0.64, "publisher:reuters": 0.81 }, intervals: { key:
+{ lower, upper, nEff, nMarkets, insufficient, current, beta, betaSd } },
+method: { priorSd, window, cutoff, inputDigest, heldOutDeltaLogLoss,
+regression, heldOut, fit, counts, notes, … }, parentId, createdBy,
+approvedBy, activatedAt, createdAt }`. The approve, activate and rollback
+endpoints write their own `admin_audit_logs` row in the same transaction.
+
+#### `GET /admin/source-weights`
+Permission `admin.read`. Every set, newest version first.
+
+#### `GET /admin/source-weights/:id`
+Permission `admin.read`. `{ set, active: { id, version }, diff: [{ key, from, to, delta }] }`;
+`active` is `{ id: null, version: 0 }` (the compiled table) when no set is active, and
+`diff` compares its weights with this set's. 404 `WEIGHT_SET_NOT_FOUND`.
+
+#### `POST /admin/source-weights/:id/approve`
+Permission `agents.weights.approve` (super_admin only) + step-up. DRAFT → APPROVED.
+403 `SELF_APPROVAL` when the caller created the set; 409 `WEIGHT_SET_REGRESSION`
+when `method.regression` is true (worse than its parent on held-out log loss);
+409 `WEIGHT_SET_NOT_DRAFT`.
+
+#### `POST /admin/source-weights/:id/activate`
+Permission `agents.weights.approve` + step-up. In one transaction: the ACTIVE set
+becomes RETIRED, this APPROVED set becomes ACTIVE (`activatedAt` = now), audit row
+`SOURCE_WEIGHTS_ACTIVATED`. Aggregations already running keep their table; new
+ones pick it up within 60 s. 409 `WEIGHT_SET_NOT_APPROVED`.
+
+#### `POST /admin/source-weights/rollback`
+Permission `agents.weights.approve` + step-up. Retires the ACTIVE set and
+reactivates the RETIRED set with the latest `activatedAt` before it (repeated
+rollbacks walk further back); with none, the compiled table applies again.
+Response `{ retired: { id, version }, active: { id, version } }`. 409
+`NO_ACTIVE_WEIGHT_SET`.
 
 ---
 

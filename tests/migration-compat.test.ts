@@ -42,3 +42,36 @@ test('migration linter accepts expand/contract-safe SQL', () => {
   assert.equal(result.status, 0, result.output);
   assert.equal(result.output.trim(), '');
 });
+
+const ROOT = path.resolve(__dirname, '../..');
+const EXPAND = path.join(ROOT, 'prisma/migrations/20261120020000_payments_raw_expand/migration.sql');
+const CONTRACT = path.join(ROOT, 'prisma/migrations-pending/20261120030000_payments_float_contract/migration.sql');
+
+function checkFile(file: string, ...flags: string[]): { status: number | null; output: string } {
+  const result = spawnSync(process.execPath, [SCRIPT, file, ...flags], { encoding: 'utf8' });
+  return { status: result.status, output: `${result.stdout}${result.stderr}` };
+}
+
+test('#224 payments expand migration passes the compat linter', () => {
+  const result = checkFile(EXPAND);
+  assert.equal(result.status, 0, result.output);
+  assert.equal(result.output.trim(), '');
+});
+
+test('#224 payments contract migration is breaking: fails without --allow-breaking, passes with it', () => {
+  const blocked = checkFile(CONTRACT);
+  assert.equal(blocked.status, 1);
+  assert.match(blocked.output, /drop-column/);
+  assert.match(blocked.output, /migration:breaking/);
+
+  const allowed = checkFile(CONTRACT, '--allow-breaking');
+  assert.equal(allowed.status, 0, allowed.output);
+  assert.match(allowed.output, /drop-column/, 'findings are still printed');
+});
+
+test('#224 contract migration is staged outside prisma/migrations', () => {
+  const applied = fs.readdirSync(path.join(ROOT, 'prisma/migrations'));
+  assert.equal(applied.some((name) => name.endsWith('_payments_float_contract')), false,
+    'prisma migrate deploy must not apply the contract alongside phase A');
+  assert.ok(fs.existsSync(CONTRACT));
+});

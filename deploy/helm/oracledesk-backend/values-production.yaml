@@ -1,0 +1,20 @@
+existingSecret: oracledesk-backend-production-secrets
+
+config:
+  NODE_ENV: production
+  EVENT_BUS_ENABLED: "true"
+  INDEXER_ENABLED: "true"
+  SHUTDOWN_DRAIN_MS: "10000"
+
+shutdownDrainSeconds: 10
+
+roles:
+  api:
+    replicas: 2
+    strategy: RollingUpdate
+  indexer:
+    replicas: 1
+    strategy: Recreate
+  worker:
+    replicas: 1
+    strategy: Recreate

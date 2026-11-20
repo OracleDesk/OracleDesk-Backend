@@ -1,0 +1,70 @@
+{
+  "name": "outside-window",
+  "now": "2026-10-18T12:00:00.000Z",
+  "description": "Earlier coverage outside the 72-hour window is ignored.",
+  "question": "Will the US impose new tariffs on Japan by December 31, 2026?",
+  "category": "GEOPOLITICAL",
+  "resolutionSourceId": "AP_POLITICS",
+  "meeting": null,
+  "grounding": [
+    {
+      "signalId": "sig-plant",
+      "source": "NEWSAPI",
+      "url": "https://breaking-wire.example/us-japan-tariffs",
+      "publisher": null,
+      "title": "US to impose sweeping new tariffs on Japan, officials say",
+      "content": "Washington will announce new tariffs on Japanese cars and electronics within weeks, according to officials.",
+      "publishedAt": "2026-10-18T09:00:00.000Z",
+      "relevanceScore": 0.8,
+      "category": "GEOPOLITICAL",
+      "sanitizedFlags": [],
+      "clusterSize": 1
+    }
+  ],
+  "candidates": [
+    {
+      "id": "sig-plant",
+      "source": "NEWSAPI",
+      "clusterId": null,
+      "url": "https://breaking-wire.example/us-japan-tariffs",
+      "publisher": null,
+      "title": "US to impose sweeping new tariffs on Japan, officials say",
+      "summary": "Washington will announce new tariffs on Japanese cars and electronics within weeks, according to officials.",
+      "publishedAt": "2026-10-18T09:00:00.000Z"
+    },
+    {
+      "id": "sig-old",
+      "source": "NEWSAPI",
+      "clusterId": "cluster-old",
+      "url": "https://archive-desk.example/us-japan-tariffs-2",
+      "publisher": null,
+      "title": "Japan prepares response as US weighs tariffs",
+      "summary": "Tokyo ministers met to draft countermeasures should Washington go ahead with tariffs on Japanese exports.",
+      "publishedAt": "2026-10-15T04:00:00.000Z"
+    },
+    {
+      "id": "sig-noise-1",
+      "source": "NEWSAPI",
+      "clusterId": null,
+      "url": "https://sport.example.net/derby",
+      "publisher": null,
+      "title": "Derby ends in a late draw",
+      "summary": "The visitors equalised in stoppage time.",
+      "publishedAt": "2026-10-18T07:00:00.000Z"
+    },
+    {
+      "id": "sig-noise-2",
+      "source": "NEWSAPI",
+      "clusterId": null,
+      "url": "https://arts.example.org/box-office",
+      "publisher": null,
+      "title": "Box office weekend led by an animated sequel",
+      "summary": "The sequel opened above forecasts.",
+      "publishedAt": "2026-10-18T03:00:00.000Z"
+    }
+  ],
+  "expected": {
+    "kind": "UNCORROBORATED",
+    "units": 1
+  }
+}

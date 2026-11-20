@@ -21,6 +21,20 @@ test('USDC amounts use 7 decimals and never go through floats', async () => {
   assert.equal(parseU64('-1'), null);
 });
 
+test('allowance limits parse exactly from decimal strings (#224)', async () => {
+  const { parseUsdc } = await import('../src/lib/amounts');
+  assert.equal(parseUsdc('5'), 50_000_000n);
+  assert.equal(parseUsdc('0.5'), 5_000_000n);
+  assert.equal(parseUsdc(' 12.3456789 '), 123_456_789n);
+  assert.equal(parseUsdc('0.3'), 3_000_000n, 'no 0.1 + 0.2 drift');
+  // What the deprecated numeric path does: String(n), then exact parsing.
+  assert.equal(parseUsdc(String(0.5)), 5_000_000n);
+  assert.throws(() => parseUsdc(String(1e-7)), /Invalid USDC amount/, 'exponent form is rejected');
+  assert.throws(() => parseUsdc('0.12345678'), /Invalid USDC amount/, 'more than 7 decimals is rejected');
+  assert.throws(() => parseUsdc('1,5'));
+  assert.throws(() => parseUsdc(''));
+});
+
 test('canonical JSON sorts nested keys and hashes the exact bytes', async () => {
   const { canonicalJson, canonicalBytes, sha256Hex, verifyTraceHash } = await import('../src/utils/hash.util');
   assert.equal(canonicalJson({ b: 1, a: { d: 2n, c: [3, { f: 1, e: 2 }] } }), '{"a":{"c":[3,{"e":2,"f":1}],"d":"2"},"b":1}');

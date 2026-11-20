@@ -1,0 +1,74 @@
+[
+  {
+    "from": "20261017000008_idempotency_keys",
+    "to":   "20261017000008_idempotency_keys"
+  },
+  {
+    "from": "20261017000008_trace_publications",
+    "to":   "20261017000009_trace_publications"
+  },
+  {
+    "from": "20261018000000_correlation_snapshots",
+    "to":   "20261018000000_correlation_snapshots"
+  },
+  {
+    "from": "20261018000000_llm_provenance",
+    "to":   "20261018000001_llm_provenance"
+  },
+  {
+    "from": "20261018000000_position_shares_resolvability_agent_controls",
+    "to":   "20261018000002_position_shares_resolvability_agent_controls"
+  },
+  {
+    "from": "20261018000001_calibration_snapshots",
+    "to":   "20261018000003_calibration_snapshots"
+  },
+  {
+    "from": "20261018000001_market_seed_policy",
+    "to":   "20261018000004_market_seed_policy"
+  },
+  {
+    "from": "20261018000001_socket_private_events",
+    "to":   "20261018000005_socket_private_events"
+  },
+  {
+    "from": "20261018000002_chain_event_published",
+    "to":   "20261018000006_chain_event_published"
+  },
+  {
+    "from": "20261018000002_market_embeddings",
+    "to":   "20261018000007_market_embeddings"
+  },
+  {
+    "from": "20261018000002_market_reconciler",
+    "to":   "20261018000008_market_reconciler"
+  },
+  {
+    "from": "20261018000003_signer_attestations",
+    "to":   "20261018000009_signer_attestations"
+  },
+  {
+    "from": "20261019000000_chain_fees",
+    "to":   "20261019000000_chain_fees"
+  },
+  {
+    "from": "20261019000000_fee_bump",
+    "to":   "20261019000001_fee_bump"
+  },
+  {
+    "from": "20261019000001_chain_submissions",
+    "to":   "20261019000002_chain_submissions"
+  },
+  {
+    "from": "20261019000002_market_creation_attempts",
+    "to":   "20261019000003_market_creation_attempts"
+  },
+  {
+    "from": "20261019020000_chain_outbox",
+    "to":   "20261019020000_chain_outbox"
+  },
+  {
+    "from": "20261019020000_signal_store",
+    "to":   "20261019020001_signal_store"
+  }
+]

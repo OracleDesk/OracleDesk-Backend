@@ -83,7 +83,9 @@ export class FakeDb {
   }
 
   insert(name: string, data: Row): Row {
-    const id = data.id ?? `${name}-${String(++this.seq).padStart(4, '0')}`;
+    // UUID-shaped, as Postgres' uuid() defaults are: trace documents (#227)
+    // validate market.backendId as a UUID. Deterministic so cassettes replay.
+    const id = data.id ?? `00000000-0000-4000-8000-${String(++this.seq).padStart(12, '0')}`;
     const row = { ...(DEFAULTS[name]?.() ?? {}), createdAt: new Date(NOW.getTime() + this.seq), updatedAt: NOW, ...data, id };
     this.table(name).set(id, row);
     return row;
@@ -161,7 +163,7 @@ export class FakeDb {
 
 const MODELS = [
   'agentControl', 'agentControlEvent', 'agentLog', 'market', 'reasoningTrace', 'tracePublication', 'position',
-  'positionExit', 'trade', 'ipfsContent', 'chainEvent', 'correlationSnapshot', 'signalCache',
+  'positionExit', 'trade', 'ipfsContent', 'chainEvent', 'correlationSnapshot', 'signalCache', 'marketReservation', 'ipfsPin',
 ];
 
 export interface FakeAgentsEnv {
@@ -187,6 +189,7 @@ export async function installFakeAgentsEnv(opts: {
   const { MemoryGuardStore, setLlmGuardStore } = await import('../../src/lib/llm-budget');
   const { MemoryForecastCache, setForecastCache } = await import('../../src/services/forecast.service');
   const { FakeClock, setClock } = await import('../../src/lib/clock');
+  const { fakeEmbeddingProvider, setEmbeddingProvider, resetEmbeddingProvider } = await import('../../src/services/embeddings.service');
   const { setSecretsForTest, SECRET_NAMES } = await import('../../src/config/secrets');
 
   const p: any = prisma;
@@ -199,7 +202,14 @@ export async function installFakeAgentsEnv(opts: {
   }
   // Raw SQL on these paths: market-creation claims (dry-run never needs one) and chain_events scans.
   replace(p, '$executeRaw', async () => 0);
-  replace(p, '$queryRaw', async () => []);
+  // Advisory locks (the dedup reservation, #283) are uncontended in a single-process test.
+  // applyConfirmedExit re-reads its position FOR UPDATE inside the transaction (#229).
+  replace(p, '$queryRaw', async (strings: TemplateStringsArray, ...values: unknown[]) => {
+    const sql = Array.isArray(strings) ? strings.join('?') : '';
+    if (sql.includes('pg_try_advisory_xact_lock')) return [{ locked: true }];
+    if (sql.includes('FROM positions') && sql.includes('FOR UPDATE')) return db.rows('position').filter((r: any) => r.id === values[0]);
+    return [];
+  });
   replace(p, '$queryRawUnsafe', async () => []);
   replace(p, '$transaction', async (arg: any) => (typeof arg === 'function' ? arg(p) : Promise.all(arg)));
 
@@ -231,6 +241,8 @@ export async function installFakeAgentsEnv(opts: {
   const prevGuard = setLlmGuardStore(new MemoryGuardStore());
   const prevForecast = setForecastCache(new MemoryForecastCache());
   const prevClock = setClock(new FakeClock(NOW));
+  // Dedup embeddings (#69/#283) are deterministic and local, never a provider call.
+  setEmbeddingProvider(fakeEmbeddingProvider());
 
   // Data-source keys present so ingestion calls out (the cassette answers);
   // fake values, never real ones.
@@ -252,6 +264,7 @@ export async function installFakeAgentsEnv(opts: {
       setLlmGuardStore(prevGuard);
       setForecastCache(prevForecast);
       setClock(prevClock);
+      resetEmbeddingProvider();
       setSecretsForTest(Object.fromEntries(SECRET_NAMES.map((n) => [n, ''])) as any);
     },
   };

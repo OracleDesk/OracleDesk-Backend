@@ -28,9 +28,19 @@ done
 if [[ "$ready" -eq "$READY_CHECKS" ]]; then ok "readiness held ${READY_CHECKS}/${READY_CHECKS}"; else bad "readiness did not hold (${ready}/${READY_CHECKS})"; fi
 
 if [[ "$SKIP_KUBE" != "1" && -n "$KUBE_NAMESPACE" && -n "$DIGEST" ]]; then
+  NORMALIZED_DIGEST="${DIGEST#sha256:}"
   for deployment in $DEPLOYMENTS; do
     image="$(kubectl -n "$KUBE_NAMESPACE" get deployment "$deployment" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
-    if [[ "$image" == *"@sha256:${DIGEST}" ]]; then ok "$deployment runs digest ${DIGEST:0:12}"; else bad "$deployment image '$image' does not match digest ${DIGEST:0:12}"; fi
+    if [[ "$image" == *"@sha256:${NORMALIZED_DIGEST}" ]]; then
+      ok "$deployment runs digest ${NORMALIZED_DIGEST:0:12}"
+    else
+      bad "$deployment image '$image' does not match digest ${NORMALIZED_DIGEST:0:12}"
+    fi
+    if kubectl -n "$KUBE_NAMESPACE" rollout status "deployment/$deployment" --timeout=60s >/dev/null 2>&1; then
+      ok "$deployment rollout ready"
+    else
+      bad "$deployment rollout not ready"
+    fi
   done
 fi
 

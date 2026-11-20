@@ -8,7 +8,7 @@
  *
  * Modes, from CASSETTE_MODE (default `replay`, the only mode CI uses):
  *
- *   replay  every Anthropic, Gemini and data-source request is matched by a
+ *   replay  every Anthropic, Gemini, OpenAI and data-source request is matched by a
  *           stable fingerprint and served from tests/cassettes/<name>.json. An
  *           unmatched request throws CassetteMiss with a diff against the
  *           closest recorded request; an interaction left unused fails the
@@ -28,7 +28,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSy
 import { dirname, join } from 'node:path';
 import { canonicalJson, sha256Hex } from '../../src/utils/hash.util';
 
-export type InteractionKind = 'anthropic' | 'gemini' | 'http';
+export type InteractionKind = 'anthropic' | 'gemini' | 'openai' | 'http';
 
 export interface RecordedError {
   status?: number;
@@ -112,6 +112,8 @@ export const SECRET_ENV = ['ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'NEWSAPI_KEY',
 const SECRET_PATTERNS: Array<[string, RegExp]> = [
   ['anthropic key', /sk-ant-[A-Za-z0-9_-]{10,}/],
   ['google key', /AIza[0-9A-Za-z_-]{20,}/],
+  // sk-..., sk-proj-..., sk-svcacct-... (#218); sk-ant- is matched above.
+  ['openai key', /\bsk-(?!ant-)(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}/],
   ['32-hex key in a key-like field', /"(?:api_?key|apikey|key|token|secret|authorization)"\s*:\s*"[0-9a-fA-F]{32}"/i],
   ['32-hex key in a query string', /[?&](?:api_?key|apikey|key|token)=[0-9a-fA-F]{32}\b/i],
 ];
@@ -358,17 +360,23 @@ export function loadCassette(name: string, mode: CassetteMode = cassetteMode()):
 export interface Upstream {
   anthropic?: (req: any) => Promise<any>;
   gemini?: (req: any) => Promise<{ text: string; usage?: object }>;
+  openai?: (req: any) => Promise<any>;
   http?: (url: string, opts: { params?: Record<string, unknown> }) => Promise<{ data: unknown }>;
 }
 
 async function liveUpstream(): Promise<Upstream> {
   const Anthropic = (await import('@anthropic-ai/sdk')).default;
   const { GoogleGenerativeAI } = await import('@google/generative-ai');
+  const OpenAI = (await import('openai')).default;
   const axios = (await import('axios')).default;
   const anthropicKey = process.env.ANTHROPIC_API_KEY ?? '';
   const geminiKey = process.env.GEMINI_API_KEY ?? '';
   const anthropic = anthropicKey ? new Anthropic({ apiKey: anthropicKey, maxRetries: 0 }) : null;
   const genAI = geminiKey ? new GoogleGenerativeAI(geminiKey) : null;
+  const openaiKey = process.env.OPENAI_API_KEY ?? '';
+  const openai = openaiKey
+    ? new OpenAI({ apiKey: openaiKey, maxRetries: 0, ...(process.env.OPENAI_BASE_URL ? { baseURL: process.env.OPENAI_BASE_URL } : {}) })
+    : null;
   return {
     anthropic: async (req) => {
       if (!anthropic) throw Object.assign(new Error('ANTHROPIC_API_KEY is not set'), { status: 401 });
@@ -380,6 +388,10 @@ async function liveUpstream(): Promise<Upstream> {
       const res = await model.generateContent(req.prompt);
       return { text: res.response.text(), usage: res.response.usageMetadata };
     },
+    openai: async (req) => {
+      if (!openai) throw Object.assign(new Error('OPENAI_API_KEY is not set'), { status: 401 });
+      return openai.chat.completions.create(req);
+    },
     http: (url, opts) => axios.get(url, { params: opts.params, timeout: 10_000 }),
   };
 }
@@ -389,8 +401,22 @@ function toMessage(raw: any): any {
   return { id: raw?.id ?? 'msg_cassette', type: 'message', role: 'assistant', model: raw?.model, content: raw?.content ?? [], stop_reason: raw?.stop_reason ?? 'end_turn', usage: raw?.usage ?? { input_tokens: 0, output_tokens: 0 } };
 }
 
+/** Keeps the slice of a Chat Completion the code reads; drops ids and fingerprints that vary per call. */
+function toCompletion(raw: any): any {
+  return {
+    object: 'chat.completion',
+    model: raw?.model,
+    choices: (raw?.choices ?? []).map((c: any) => ({
+      index: c?.index ?? 0,
+      finish_reason: c?.finish_reason ?? 'stop',
+      message: { role: 'assistant', content: c?.message?.content ?? null, refusal: c?.message?.refusal ?? null },
+    })),
+    usage: raw?.usage ? { prompt_tokens: raw.usage.prompt_tokens ?? 0, completion_tokens: raw.usage.completion_tokens ?? 0 } : undefined,
+  };
+}
+
 /**
- * Installs the Anthropic, Gemini and data-source seams for the duration of
+ * Installs the Anthropic, Gemini, OpenAI and data-source seams for the duration of
  * `fn`, then restores them. In replay mode every interaction must be used.
  */
 export async function useCassette<T>(
@@ -412,6 +438,9 @@ export async function useCassette<T>(
   const prevGemini = llm.setGeminiTransport({
     generate: (req) => cassette.serve('gemini', req, () => (upstream.gemini ?? missing('gemini'))(req)),
   });
+  const prevOpenAI = llm.setOpenAITransport({
+    create: (req) => cassette.serve('openai', req, async () => toCompletion(await (upstream.openai ?? missing('openai'))(req))),
+  });
   // The provider's JSON body is what gets recorded (and trimmed), not the wrapper.
   const prevHttp = ingestion.setSignalHttp({
     get: async (url, o) => ({
@@ -419,6 +448,10 @@ export async function useCassette<T>(
         (await (upstream.http ?? missing('http'))(url, { params: o.params })).data),
     }) as any,
   });
+  // Provider cooldowns are process-wide and shared by every LLM path (#218):
+  // each scenario starts and ends with fresh health so recordings replay the
+  // same whatever ran before.
+  llm.llmRouter.healthBook.reset();
   try {
     const result = await fn(cassette);
     cassette.finish({ synthetic: opts.synthetic ?? useScripted, note: opts.note, extraSecrets: opts.extraSecrets });
@@ -426,6 +459,8 @@ export async function useCassette<T>(
   } finally {
     llm.setAnthropicTransport(prevAnthropic);
     llm.setGeminiTransport(prevGemini);
+    llm.setOpenAITransport(prevOpenAI);
     ingestion.setSignalHttp(prevHttp);
+    llm.llmRouter.healthBook.reset();
   }
 }

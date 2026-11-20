@@ -15,7 +15,9 @@
 import { prisma } from '../lib/prisma';
 import { config } from '../config';
 import { now as clockNow } from '../lib/clock';
-import { usdcFromNumber } from '../lib/amounts';
+import { decimalToBigint } from '../lib/amounts';
+import { AppError } from '../middlewares/error.middleware';
+import { logger } from '../lib/logger';
 import { treasuryAvailableCapital, treasuryDailyUsage, treasuryRiskConfig } from './chain.service';
 
 const DAY_SECONDS = 86_400n;
@@ -129,17 +131,31 @@ export async function marketExposureRaw(marketId: string, onChainMarketId: bigin
   }
 
   const [trades, market] = await Promise.all([
-    prisma.trade.findMany({ where: { marketId, status: 'EXECUTED' }, select: { amount: true } }),
+    prisma.trade.findMany({
+      where: { marketId, status: 'EXECUTED' },
+      select: { amountRaw: true, collateralRaw: true },
+    }),
     prisma.market.findUnique({ where: { id: marketId }, select: { seedAmountRaw: true } }),
   ]);
-  const traded = trades.reduce((acc, t) => acc + usdcFromNumber(t.amount), 0n);
+  if (trades.some((trade) => trade.collateralRaw == null && trade.amountRaw == null)) {
+    logger.error({ marketId }, 'Cannot estimate market exposure: an executed trade has no raw collateral');
+    throw new AppError(503, 'MARKET_EXPOSURE_RAW_UNAVAILABLE', 'Market exposure is missing exact trade collateral');
+  }
+  const traded = trades.reduce(
+    (acc, trade) => acc + decimalToBigint(trade.collateralRaw ?? trade.amountRaw!),
+    0n,
+  );
   const seed = market?.seedAmountRaw && /^\d+$/.test(market.seedAmountRaw) ? BigInt(market.seedAmountRaw) : 0n;
   return { totalRaw: traded + seed, estimated: true };
 }
 
 // ─── Clamp ────────────────────────────────────────────────────────────────────
 
-export type SizingBinding = 'KELLY' | 'CORRELATION' | 'MAX_TRADE' | 'MAX_MARKET' | 'DAILY' | 'AVAILABLE';
+/**
+ * What set an order's size. 'IMPACT' (#225): the FPMM sizer's interior
+ * optimum, below every cap; 'KELLY': the 2.5% single-position cap.
+ */
+export type SizingBinding = 'KELLY' | 'IMPACT' | 'CORRELATION' | 'MAX_TRADE' | 'MAX_MARKET' | 'DAILY' | 'AVAILABLE';
 
 /** Smallest order worth sending: 1 USDC. */
 export const MIN_TRADE_RAW = 10_000_000n;
@@ -161,15 +177,15 @@ export function clampSize(
   b: TreasuryBudget,
   marketHeadroomRaw: bigint,
   safetyBps: number = config.TREASURY_HEADROOM_SAFETY_BPS,
-): { sizeRaw: bigint; binding: Exclude<SizingBinding, 'CORRELATION'> } {
-  const limits: Array<[Exclude<SizingBinding, 'KELLY' | 'CORRELATION'>, bigint]> = [
+): { sizeRaw: bigint; binding: Exclude<SizingBinding, 'CORRELATION' | 'IMPACT'> } {
+  const limits: Array<[Exclude<SizingBinding, 'KELLY' | 'CORRELATION' | 'IMPACT'>, bigint]> = [
     ['MAX_TRADE', b.maxTradeRaw],
     ['MAX_MARKET', withSafetyMargin(marketHeadroomRaw, safetyBps)],
     ['DAILY', withSafetyMargin(b.dailyRemainingRaw, safetyBps)],
     ['AVAILABLE', b.availableRaw],
   ];
   let sizeRaw = maxBig(0n, desiredRaw);
-  let binding: Exclude<SizingBinding, 'CORRELATION'> = 'KELLY';
+  let binding: Exclude<SizingBinding, 'CORRELATION' | 'IMPACT'> = 'KELLY';
   for (const [name, limit] of limits) {
     const cap = maxBig(0n, limit);
     if (cap < sizeRaw) {

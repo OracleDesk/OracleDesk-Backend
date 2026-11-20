@@ -2,7 +2,7 @@ import type { KellyResult, KellyInput } from '../types';
 
 // ─── Risk constants ───
 const MAX_SINGLE_POSITION_PCT  = 0.025;  // 2.5% of bankroll per position
-const MIN_EDGE_THRESHOLD       = 0.08;   // 8 percentage points minimum edge
+export const MIN_EDGE_THRESHOLD = 0.08;   // 8 percentage points minimum edge
 
 /**
  * Implements the Half-Kelly Criterion for position sizing.

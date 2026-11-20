@@ -194,10 +194,61 @@ test('a fake key fed through every transport never reaches disk', async () => {
   }
 });
 
+test('openai traffic is recorded, replayed and redacted (#218)', async () => {
+  const { useCassette, CASSETTE_DIR, CassetteSecretError } = await import('./helpers/cassettes');
+  const { clientFor } = await import('../src/lib/llm/providers/openai');
+  const KEY = 'sk-proj-FAKEFAKEFAKEFAKEFAKEFAKEFAKE';
+  const saved = { ...process.env };
+  Object.assign(process.env, { OPENAI_API_KEY: KEY, CASSETTE_MODE: 'record', CASSETTE_RECORD: '1', CASSETTE_UPSTREAM: 'scripted' });
+  delete process.env.CI;
+  const name = `__tmp__/openai-${process.pid}`;
+  const path = join(CASSETTE_DIR, `${name}.json`);
+  const spec = { provider: 'openai', model: 'gpt-4o-mini', temperature: 0, maxTokens: 10, timeoutMs: 1000 } as const;
+  const req = { model: 'gpt-4o-mini', max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] };
+  const answer = {
+    id: 'chatcmpl-abc', object: 'chat.completion', model: 'gpt-4o-mini', system_fingerprint: 'fp_123',
+    choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: '{"ok":true}', refusal: null } }],
+    usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 },
+  };
+  try {
+    // A key echoed back by the provider: the guard refuses to write.
+    await assert.rejects(
+      useCassette(name, async () => {
+        await clientFor(spec).chat.completions.create(req);
+      }, { upstream: { openai: async () => ({ ...answer, choices: [{ ...answer.choices[0], message: { role: 'assistant', content: `leak ${KEY}` } }] }) } }),
+      (e: any) => e instanceof CassetteSecretError,
+    );
+    assert.equal(existsSync(path), false, 'nothing written');
+
+    // A key only in the request is stripped by normalisation; ids and fingerprints are not kept.
+    await useCassette(name, async () => {
+      await clientFor(spec).chat.completions.create({ ...req, api_key: KEY } as any);
+    }, { upstream: { openai: async () => answer } });
+    const written = readFileSync(path, 'utf8');
+    assert.ok(!written.includes(KEY));
+    const file = JSON.parse(written);
+    assert.deepEqual(file.interactions.map((i: any) => i.kind), ['openai']);
+    assert.equal(file.interactions[0].response.id, undefined);
+    assert.equal(file.interactions[0].response.system_fingerprint, undefined);
+
+    // Replay serves the recorded completion with no upstream.
+    process.env.CASSETTE_MODE = 'replay';
+    const replayed = await useCassette(name, async () => clientFor(spec).chat.completions.create(req));
+    assert.equal(replayed.choices[0].message.content, '{"ok":true}');
+    assert.deepEqual(replayed.usage, { prompt_tokens: 3, completion_tokens: 4 });
+  } finally {
+    rmSync(join(CASSETTE_DIR, '__tmp__'), { recursive: true, force: true });
+    for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+    Object.assign(process.env, saved);
+  }
+});
+
 test('scanForSecrets flags configured values and key-shaped strings', async () => {
   const { scanForSecrets } = await import('./helpers/cassettes');
   assert.deepEqual(scanForSecrets('{"text":"hello"}'), []);
   assert.ok(scanForSecrets('{"text":"sk-ant-api03-abcdefghijklmnop"}').length > 0);
+  assert.ok(scanForSecrets('{"text":"sk-proj-abcdefghijklmnopqrstuvwx"}').length > 0, 'an OpenAI project key (#218)');
+  assert.deepEqual(scanForSecrets('{"text":"a risk-adjusted-return-on-capital-figure"}'), [], 'not a key: no word boundary before sk-');
   assert.ok(scanForSecrets('{"text":"AIzaSyAbcdefghijklmnopqrstuv"}').length > 0);
   assert.ok(scanForSecrets('{"api_key":"0123456789abcdef0123456789abcdef"}').length > 0);
   assert.ok(scanForSecrets('GET /x?apiKey=0123456789abcdef0123456789abcdef').length > 0);

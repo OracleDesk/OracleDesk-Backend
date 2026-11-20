@@ -83,5 +83,47 @@
     ],
     "reason": "chain_transactions has had no writers since #38 shipped (the write path was never wired to it), so the table is empty in every deployment: the enum conversion rewrites nothing, the dropped NOT NULLs affect no rows (BUILT rows legitimately precede a hash/envelope), and the index builds on an empty table. CREATE INDEX CONCURRENTLY cannot run inside Prisma's migration transaction; lock_timeout = 5s bounds any wait.",
     "approvedBy": "pending maintainer review on the PR that adds this migration"
+  },
+  {
+    "migration": "20261119040100_generation_run_fence",
+    "rules": [
+      "prefer-bigint-over-int"
+    ],
+    "reason": "fence is a per-run claim counter (one increment per lease), never near 2^31, and must stay INTEGER to match the Prisma Int field and the existing attempts column.",
+    "approvedBy": "pending maintainer review on the PR that adds this migration"
+  },
+  {
+    "migration": "20261119050000_recalibration_maps",
+    "rules": [
+      "prefer-bigint-over-int",
+      "require-concurrent-index-creation"
+    ],
+    "reason": "recalibration_maps is created empty in this same migration, so a plain CREATE INDEX takes no lock anyone waits on (CONCURRENTLY is not allowed inside Prisma's migration transaction); version is a per-slice refit counter that stays far below 2^31 and matches the Prisma Int field.",
+    "approvedBy": "pending maintainer review on the PR that adds this migration"
+  },
+  {
+    "migration": "20261119060000_trade_bounds",
+    "rules": [
+      "prefer-bigint-over-int"
+    ],
+    "reason": "limitPriceBps is bounded to 1..10000 by its CHECK and decisionLedger is a Stellar ledger sequence (u32); both match Prisma Int fields.",
+    "approvedBy": "pending maintainer review on the PR that adds this migration"
+  },
+  {
+    "migration": "20261120110000_outbox_unhandled_index",
+    "rules": [
+      "require-concurrent-index-creation"
+    ],
+    "reason": "chain_transactions holds only outbox rows (one per live write), so the build is short; CREATE INDEX CONCURRENTLY is not allowed inside Prisma's migration transaction, and lock_timeout = 5s bounds the SHARE lock wait (#220).",
+    "approvedBy": "pending maintainer review on the PR that adds this migration"
+  },
+  {
+    "migration": "20261120120000_allowance_day_buckets",
+    "rules": [
+      "adding-foreign-key-constraint",
+      "prefer-timestamptz"
+    ],
+    "reason": "allowance_days and allowance_charges are created empty in this same migration, so their users FKs scan nothing and lock no table anyone else writes to; the timestamp columns are TIMESTAMP(3) to match every other Prisma DateTime column (stored as UTC by the client).",
+    "approvedBy": "pending maintainer review on the PR that adds this migration"
   }
 ]

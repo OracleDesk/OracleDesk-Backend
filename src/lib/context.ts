@@ -9,7 +9,64 @@ export interface RequestContext {
   jobId?: string;
   userId?: string;
   job?: string;
+  /**
+   * Inbound `X-Request-Id` from the client, retained for log search only.
+   * The durable `requestId` above is always server-generated (#236), so an
+   * untrusted inbound id is never written to a database column.
+   */
+  clientRequestId?: string;
+  /**
+   * The root of the correlation chain when a worker resumes work another
+   * cycle or request created. Workers set this to the row's `correlationId`
+   * so logs can be joined back to the originating cycle/request even after
+   * the resume has moved to its own `requestId`.
+   */
+  rootCorrelationId?: string;
   startedAt: number;
+}
+
+export interface Durable {
+  correlationId: string | null;
+  causationId: string | null;
+}
+
+/**
+ * The correlation pair to stamp onto a durable row created in the current
+ * context. `correlationId` is the root of the chain (`cycleId` for cron
+ * work, the server-generated `requestId` for HTTP; never the inbound
+ * `clientRequestId`); `causationId` is the immediate parent record or job.
+ */
+export function durableCorrelation(causation?: string | null): Durable {
+  const ctx = als.getStore();
+  if (!ctx) return { correlationId: null, causationId: causation ?? null };
+  const correlationId = ctx.cycleId ?? ctx.rootCorrelationId ?? ctx.requestId;
+  return { correlationId, causationId: causation ?? ctx.jobId ?? null };
+}
+
+/**
+ * Run `fn` with a fresh context that resumes work another request/cycle
+ * created. The row's `correlationId` becomes the root; `fn` runs under its
+ * own `requestId` so its logs are distinguishable from the originator, but
+ * `rootCorrelationId` keeps a database join back to it.
+ */
+export function resumeContext<T>(
+  row: { id: string; correlationId: string | null },
+  job: string,
+  fn: () => T,
+): T {
+  const rootCorrelationId = row.correlationId ?? undefined;
+  const cycleId = rootCorrelationId?.startsWith('cyc_') ? rootCorrelationId : undefined;
+  return runWithContext(
+    {
+      kind: 'job',
+      job,
+      requestId: newId('job'),
+      cycleId,
+      jobId: row.id,
+      rootCorrelationId,
+    },
+    fn,
+  );
 }
 
 const als = new AsyncLocalStorage<RequestContext>();
@@ -39,13 +96,21 @@ export function newId(prefix: 'req' | 'cyc' | 'job'): string {
 }
 
 /** The ids to stamp onto log lines and AgentLog rows. */
-export function correlation(): { requestId?: string; cycleId?: string; jobId?: string } {
+export function correlation(): {
+  requestId?: string;
+  cycleId?: string;
+  jobId?: string;
+  clientRequestId?: string;
+  rootCorrelationId?: string;
+} {
   const ctx = als.getStore();
   if (!ctx) return {};
   return {
     requestId: ctx.requestId,
     ...(ctx.cycleId ? { cycleId: ctx.cycleId } : {}),
     ...(ctx.jobId ? { jobId: ctx.jobId } : {}),
+    ...(ctx.clientRequestId ? { clientRequestId: ctx.clientRequestId } : {}),
+    ...(ctx.rootCorrelationId ? { rootCorrelationId: ctx.rootCorrelationId } : {}),
   };
 }
 

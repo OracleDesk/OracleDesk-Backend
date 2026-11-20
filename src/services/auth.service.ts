@@ -306,7 +306,7 @@ export function parseLoginIdentity(address: unknown, memo?: unknown): LoginIdent
 }
 
 /** Unique per (base account, sub-identity); the value behind `users.identityKey`. */
-export function identityKeyFor(identity: LoginIdentity): string {
+export function identityKeyFor(identity: Pick<LoginIdentity, 'account' | 'subId' | 'subIdKind'>): string {
   if (identity.subId == null) return identity.account;
   const kind = identity.subIdKind === 'MUXED' ? 'muxed' : 'memo';
   return `${identity.account}#${kind}:${identity.subId}`;

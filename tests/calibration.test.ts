@@ -219,6 +219,18 @@ test('sliceRows groups by agent, category, decision, prompt version and model', 
   assert.deepEqual([...sliceRows(rows, 'decisionType').keys()].sort(), ['MARKET_CREATION', 'OPEN_POSITION']);
 });
 
+test('sliceKey groups by source weight set version, with pre-#223 traces as v0', async () => {
+  const { GROUP_BYS, sliceKey, sliceRows } = await import('../src/services/calibration.service');
+  assert.ok((GROUP_BYS as readonly string[]).includes('sourceWeightSet'));
+  assert.equal(sliceKey(market(1, { sourceWeightSetVersion: 3 }), 'sourceWeightSet'), 'v3');
+  assert.equal(sliceKey(market(2, { sourceWeightSetVersion: null }), 'sourceWeightSet'), 'v0');
+  assert.equal(sliceKey(market(3), 'sourceWeightSet'), 'v0');
+  const rows = [market(1, { sourceWeightSetVersion: 2 }), market(2, { sourceWeightSetVersion: 2 }), market(3), market(4, { sourceWeightSetVersion: 0 })];
+  const slices = sliceRows(rows, 'sourceWeightSet');
+  assert.deepEqual([...slices.keys()].sort(), ['v0', 'v2']);
+  assert.equal(slices.get('v0')!.length, 2);
+});
+
 // ─── trader shrinkage ────────────────────────────────────────────────────────
 test('shrinkage applies only when enabled and the fit rests on enough markets', async () => {
   const { calibrationShrinkage, MIN_SHRINKAGE_MARKETS } = await import('../src/services/calibration.service');

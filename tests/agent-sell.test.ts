@@ -51,6 +51,11 @@ async function harness(opts: { shares?: bigint; held?: bigint; direction?: 'YES'
   };
   // Supports both the array form and the interactive callback form (#35).
   (prisma.$transaction as any) = async (ops: any) => (typeof ops === 'function' ? ops(prisma) : Promise.all(ops));
+  // applyConfirmedExit re-reads the position FOR UPDATE inside its transaction (#229).
+  (prisma.$queryRaw as any) = async () => [{
+    sharesRaw: state.position.sharesRaw, costBasisRaw: state.position.costBasisRaw,
+    realisedCollateralRaw: state.position.realisedCollateralRaw, realisedPnlRaw: state.position.realisedPnlRaw,
+  }];
   (prisma.agentLog.create as any) = async () => ({});
 
   (chain as any).getPosition = async () => (direction === 'YES' ? { yes: state.held, no: 0n } : { yes: 0n, no: state.held });

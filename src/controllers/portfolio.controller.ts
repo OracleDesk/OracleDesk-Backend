@@ -7,6 +7,7 @@ import { treasuryAvailableCapitalCached } from '../services/chain.service';
 import { readTreasuryBudget } from '../services/treasury-budget.service';
 import { toDisplayUsdc } from '../lib/amounts';
 import { logger } from '../lib/logger';
+import { freshnessMeta } from '../lib/freshness';
 
 /**
  * GET /portfolio
@@ -43,7 +44,7 @@ export async function getPortfolio(req: Request, res: Response): Promise<void> {
     availableCapitalRaw,
     availableCapitalLedger: capRes.ledger,
     latestReport,
-  });
+  }, 200, await freshnessMeta(capRes.ledger === null ? 'mixed' : 'mixed', capRes.ledger));
 }
 
 /**
@@ -68,12 +69,38 @@ export async function getPositions(req: Request, res: Response): Promise<void> {
           select: { question: true, category: true, settlementCurrency: true, expiryTimestamp: true, onChainMarketId: true },
         },
         trade: {
-          select: { direction: true, amount: true, edgeDetected: true, kellyFraction: true, txHash: true },
+          select: {
+            direction: true,
+            amount: true,
+            amountRaw: true,
+            collateralRaw: true,
+            sharesRaw: true,
+            feeRaw: true,
+            price: true,
+            priceBps: true,
+            fillPriceBps: true,
+            edgeDetected: true,
+            edgeBps: true,
+            kellyFraction: true,
+            txHash: true,
+          },
         },
         exits: {
           orderBy: { createdAt: 'desc' },
           take: 1,
-          select: { id: true, status: true, reason: true, mode: true, sharesSoldRaw: true, collateralOutRaw: true, effectivePrice: true, txHash: true, error: true, createdAt: true },
+          select: {
+            id: true,
+            status: true,
+            reason: true,
+            mode: true,
+            sharesSoldRaw: true,
+            collateralOutRaw: true,
+            effectivePrice: true,
+            effectivePriceBps: true,
+            txHash: true,
+            error: true,
+            createdAt: true,
+          },
         },
       },
     }),
@@ -93,18 +120,20 @@ export async function getPositions(req: Request, res: Response): Promise<void> {
  * endpoint, commit 207464d, padded them with constants; this one doesn't.)
  */
 export async function getPlatformStats(_req: Request, res: Response): Promise<void> {
-  const [subscriberCount, copyVolume, rawSumResult, marketCount, onChainMarketCount, traceCount] = await Promise.all([
+  const [subscriberCount, rawSumResult, marketCount, onChainMarketCount, traceCount] = await Promise.all([
     prisma.user.count(),
-    prisma.copyTrade.aggregate({ _sum: { amount: true }, where: { status: 'EXECUTED' } }),
     prisma.$queryRawUnsafe<Array<{ sum: string | null }>>(
       `SELECT COALESCE(SUM("collateralRaw"::numeric), 0)::text as sum FROM copy_trades WHERE status = 'EXECUTED' AND "collateralRaw" IS NOT NULL`
-    ).catch(() => [{ sum: '0' }]),
+    ),
     prisma.market.count(),
     prisma.market.count({ where: { onChainMarketId: { not: null } } }),
     prisma.reasoningTrace.count(),
   ]);
-  const totalCopyVolume = copyVolume._sum.amount ?? 0;
-  const totalCopyVolumeRaw = rawSumResult[0]?.sum ?? '0';
+  const totalCopyVolumeRaw = rawSumResult[0]?.sum;
+  if (totalCopyVolumeRaw === undefined || totalCopyVolumeRaw === null) {
+    throw new Error('Copy-trade volume query returned no raw total');
+  }
+  const totalCopyVolume = toDisplayUsdc(BigInt(totalCopyVolumeRaw));
   sendSuccess(res, {
     subscriberCount,
     totalCopyVolume,

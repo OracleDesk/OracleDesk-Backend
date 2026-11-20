@@ -12,6 +12,7 @@ import { existsSync, readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { config } from '../../config';
 import { assertCanonicalSafe } from '../../utils/hash.util';
+import type { LlmTask } from './types';
 
 export const PROVENANCE_SCHEMA = 'oracledesk.trace.provenance/1';
 
@@ -27,10 +28,25 @@ export type ErrorClass =
   | 'server_error'
   | 'error';
 
+export type ProvenanceProvider = 'anthropic' | 'gemini' | 'openai';
+
+/**
+ * What the structured path did with one policy entry (#218): served the
+ * output, failed with a category, or was skipped because the provider has no
+ * key (`unconfigured`) or the router had it `cooling`/`open`.
+ */
+export type RouteDecision = 'served' | ErrorClass | 'unconfigured' | 'cooling' | 'open';
+
+/** The task's policy chain as evaluated, in order. Categories only, never messages. */
+export interface LlmRoute {
+  task: LlmTask;
+  chain: Array<{ provider: ProvenanceProvider; model: string; decision: RouteDecision }>;
+}
+
 /** A model produced the output. */
 export interface LlmProvenance {
   source: 'llm';
-  provider: 'anthropic' | 'gemini';
+  provider: ProvenanceProvider;
   model: string;
   promptId: string;
   promptVersion: number;
@@ -42,8 +58,13 @@ export interface LlmProvenance {
   latencyMs: number;
   /** Provider requests made, repairs and 429 retries included. */
   attempts: number;
-  /** Set when another provider failed first. `errorClass` is a category only. */
-  fallbackFrom?: { provider: 'anthropic' | 'gemini'; model: string; errorClass: ErrorClass };
+  /**
+   * The first policy entry that was attempted and failed, when another one
+   * served. `errorClass` is a category only.
+   */
+  fallbackFrom?: { provider: ProvenanceProvider; model: string; errorClass: ErrorClass };
+  /** The evaluated policy chain (#218). Optional: traces before #218 have none. */
+  route?: LlmRoute;
   /** sha256 of the raw model output (canonical JSON of a tool input). */
   outputSha256: string;
 }

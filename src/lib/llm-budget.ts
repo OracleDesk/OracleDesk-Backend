@@ -75,20 +75,20 @@ export class LlmCircuitOpen extends AppError {
 }
 
 /**
- * Estimated prices in USD micro-units (1e-6 USD) per 1K tokens. These are
- * ESTIMATES kept in code for budgeting; check the providers' pricing pages and
- * update when models or prices change. Unknown models are priced like the
- * most expensive entry so the budget errs on the side of stopping.
+ * LLM prices live in `./llm/prices.ts` as versioned tables (#238). `LLM_PRICES`
+ * is kept for backwards compatibility with existing callers; new code should
+ * import `priceFor` from the versioned module so stored costs carry a
+ * `priceVersion` label.
  */
+import { CURRENT_PRICE_VERSION, PRICE_TABLES, priceFor } from './llm/prices';
+
 export const LLM_PRICES: Record<string, { inputPer1k: number; outputPer1k: number }> = {
-  'claude-sonnet-4-6': { inputPer1k: 3_000, outputPer1k: 15_000 },
-  'gemini-2.0-flash': { inputPer1k: 100, outputPer1k: 400 },
+  ...PRICE_TABLES[CURRENT_PRICE_VERSION],
 };
-const FALLBACK_PRICE = { inputPer1k: 3_000, outputPer1k: 15_000 };
 
 export function estimateCostMicros(usage: Usage | null): number {
   if (!usage) return 0;
-  const price = LLM_PRICES[usage.model] ?? FALLBACK_PRICE;
+  const price = priceFor(usage.model);
   return Math.ceil((usage.inputTokens * price.inputPer1k + usage.outputTokens * price.outputPer1k) / 1000);
 }
 
@@ -118,7 +118,7 @@ function defaultSettings(): GuardSettings {
     tokenBudget: config.LLM_DAILY_TOKEN_BUDGET,
     costBudgetMicros: config.LLM_DAILY_COST_BUDGET_MICROS,
     reservePct: config.LLM_ADMIN_RESERVE_PCT,
-    rpm: { anthropic: config.LLM_ANTHROPIC_RPM, gemini: config.LLM_GEMINI_RPM },
+    rpm: { anthropic: config.LLM_ANTHROPIC_RPM, gemini: config.LLM_GEMINI_RPM, openai: config.LLM_OPENAI_RPM },
     failureThreshold: config.LLM_BREAKER_FAILURE_THRESHOLD,
     openMs: config.LLM_BREAKER_OPEN_MS,
     failMode: config.LLM_REDIS_FAIL_MODE,
@@ -128,12 +128,16 @@ function defaultSettings(): GuardSettings {
   };
 }
 
-let overrides: Partial<GuardSettings> = {};
+/** `rpm` may name only some providers; the rest keep their configured rate. */
+export type GuardSettingsOverride = Partial<Omit<GuardSettings, 'rpm'>> & { rpm?: Partial<Record<Provider, number>> };
+
+let overrides: GuardSettingsOverride = {};
 export function settings(): GuardSettings {
-  return { ...defaultSettings(), ...overrides };
+  const base = defaultSettings();
+  return { ...base, ...overrides, rpm: { ...base.rpm, ...overrides.rpm } };
 }
 /** Test seam. Pass `{}` to restore config-derived settings. */
-export function setLlmGuardSettings(next: Partial<GuardSettings>): void {
+export function setLlmGuardSettings(next: GuardSettingsOverride): void {
   overrides = next;
 }
 

@@ -1,0 +1,466 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://api.oracledesk.io/api/v1/schemas/trace/v2.json",
+  "title": "OracleDesk Reasoning Trace v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "kind",
+    "traceId",
+    "agentType",
+    "decisionType",
+    "action",
+    "market",
+    "probabilityEstimate",
+    "marketProbability",
+    "edge",
+    "confidenceInterval",
+    "sourcesUsed",
+    "betFraction",
+    "betSizeUsdc",
+    "hedgeConditions",
+    "agentWallet",
+    "createdAt",
+    "provenance",
+    "forecast",
+    "sizing",
+    "seedPolicy",
+    "correlation",
+    "corroboration"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 2
+    },
+    "kind": {
+      "const": "oracledesk.trace"
+    },
+    "traceId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "agentType": {
+      "type": "string",
+      "enum": [
+        "MARKET_MAKER",
+        "TRADER"
+      ]
+    },
+    "decisionType": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "action": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "market": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backendId",
+        "onChainId"
+      ],
+      "properties": {
+        "backendId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "onChainId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9]+$"
+        }
+      }
+    },
+    "probabilityEstimate": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "marketProbability": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "edge": {
+      "type": "number",
+      "minimum": -1,
+      "maximum": 1
+    },
+    "confidenceInterval": {
+      "type": "object",
+      "description": "lower must be <= upper",
+      "additionalProperties": false,
+      "required": [
+        "lower",
+        "upper"
+      ],
+      "properties": {
+        "lower": {
+          "type": "number"
+        },
+        "upper": {
+          "type": "number"
+        }
+      }
+    },
+    "sourcesUsed": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source",
+          "weight",
+          "signal",
+          "rawValue",
+          "signalId",
+          "url",
+          "publisher",
+          "publishedAt"
+        ],
+        "properties": {
+          "source": {
+            "type": "string"
+          },
+          "weight": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "signal": {
+            "type": "string"
+          },
+          "rawValue": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "signalId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uri"
+          },
+          "publisher": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "publishedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        }
+      }
+    },
+    "betFraction": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "betSizeUsdc": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "hedgeConditions": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "string",
+        "maxLength": 500
+      }
+    },
+    "agentWallet": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "llm",
+        "generator"
+      ],
+      "properties": {
+        "schema": {
+          "const": "oracledesk.trace.provenance/1"
+        },
+        "llm": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "source",
+                  "provider",
+                  "model",
+                  "promptId",
+                  "promptVersion",
+                  "promptHash",
+                  "params",
+                  "usage",
+                  "latencyMs",
+                  "attempts",
+                  "outputSha256"
+                ],
+                "properties": {
+                  "source": {
+                    "const": "llm"
+                  },
+                  "provider": {
+                    "type": "string",
+                    "enum": [
+                      "anthropic",
+                      "gemini"
+                    ]
+                  },
+                  "model": {
+                    "type": "string"
+                  },
+                  "promptId": {
+                    "type": "string"
+                  },
+                  "promptVersion": {
+                    "type": "integer"
+                  },
+                  "promptHash": {
+                    "type": "string"
+                  },
+                  "params": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "temperature",
+                      "maxTokens"
+                    ],
+                    "properties": {
+                      "temperature": {
+                        "type": "number"
+                      },
+                      "maxTokens": {
+                        "type": "integer"
+                      }
+                    }
+                  },
+                  "usage": {
+                    "type": [
+                      "object",
+                      "null"
+                    ],
+                    "additionalProperties": false,
+                    "required": [
+                      "inputTokens",
+                      "outputTokens"
+                    ],
+                    "properties": {
+                      "inputTokens": {
+                        "type": "integer"
+                      },
+                      "outputTokens": {
+                        "type": "integer"
+                      }
+                    }
+                  },
+                  "latencyMs": {
+                    "type": "number"
+                  },
+                  "attempts": {
+                    "type": "integer"
+                  },
+                  "fallbackFrom": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "provider",
+                      "model",
+                      "errorClass"
+                    ],
+                    "properties": {
+                      "provider": {
+                        "type": "string",
+                        "enum": [
+                          "anthropic",
+                          "gemini"
+                        ]
+                      },
+                      "model": {
+                        "type": "string"
+                      },
+                      "errorClass": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "outputSha256": {
+                    "type": "string"
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "source",
+                  "promptId",
+                  "promptVersion",
+                  "reason"
+                ],
+                "properties": {
+                  "source": {
+                    "const": "default"
+                  },
+                  "promptId": {
+                    "type": "string"
+                  },
+                  "promptVersion": {
+                    "type": "integer"
+                  },
+                  "reason": {
+                    "type": "string",
+                    "enum": [
+                      "LLM_FAILED",
+                      "LLM_BUDGET_EXCEEDED"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "generator": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "service",
+            "version"
+          ],
+          "properties": {
+            "service": {
+              "const": "oracledesk-backend"
+            },
+            "version": {
+              "type": "string"
+            },
+            "commit": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "forecast": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "sizing": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "seedPolicy": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "correlation": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "pairs",
+        "method",
+        "snapshotId"
+      ],
+      "properties": {
+        "pairs": {
+          "type": "array"
+        },
+        "method": {
+          "type": "string",
+          "enum": [
+            "snapshot",
+            "matrix"
+          ]
+        },
+        "snapshotId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "corroboration": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "units",
+        "domains"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "CORROBORATED",
+            "AUTHORITATIVE",
+            "UNCORROBORATED"
+          ]
+        },
+        "units": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "domains": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

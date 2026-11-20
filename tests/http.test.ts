@@ -306,3 +306,112 @@ test('GET /portfolio derives capital from the treasury and serialises raw amount
     (prisma.correlationSnapshot.findFirst as any) = orig.snap;
   }
 });
+
+test('admin outbox console: chain.outbox.* permissions, step-up and one audit row per action (#221)', async () => {
+  const { signToken } = await import('../src/middlewares/auth.middleware');
+  const { prisma } = await import('../src/lib/prisma');
+  const outbox = await import('../src/services/stellar/outbox');
+  const { FakeRedis } = await import('./helpers/fake-redis');
+
+  const reader = Keypair.random().publicKey();
+  const operator = Keypair.random().publicKey();
+  const outsider = Keypair.random().publicKey();
+  const roles: Record<string, { roleName: string; permissions: string[] }> = {
+    [reader]: { roleName: 'auditor', permissions: ['admin.read', 'chain.outbox.read'] },
+    [operator]: { roleName: 'operator', permissions: ['admin.read', 'chain.outbox.read', 'chain.outbox.operate'] },
+    [outsider]: { roleName: 'auditor', permissions: ['admin.read', 'admin.audit.read'] },
+  };
+  const id = crypto.randomUUID();
+  const row: Record<string, unknown> = {
+    id, kind: 'test.console', refId: null, status: 'FAILED', hash: 'ab'.repeat(32), feeBumpHashes: [],
+    landedHash: null, returnValue: null, error: 'boom', handledAt: new Date(1_000), updatedAt: new Date(0),
+  };
+  const audits: Array<{ data: Record<string, any> }> = [];
+  const orig = {
+    role: prisma.adminRoleAssignment.findUnique,
+    audit: prisma.adminAuditLog.create,
+    chainTransaction: (prisma as any).chainTransaction,
+  };
+  (prisma.adminRoleAssignment.findUnique as any) = async ({ where }: { where: { walletAddress: string } }) => {
+    const r = roles[where.walletAddress];
+    return r ? { roleName: r.roleName, role: { permissions: r.permissions.map((permissionKey) => ({ permissionKey })) } } : null;
+  };
+  (prisma.adminAuditLog.create as any) = async (args: { data: Record<string, any> }) => {
+    audits.push(args);
+    return args.data;
+  };
+  (prisma as any).chainTransaction = {
+    findUnique: async ({ where }: { where: { id: string } }) => (where.id === id ? { ...row } : null),
+    updateMany: async ({ where, data }: { where: Record<string, any>; data: Record<string, unknown> }) => {
+      if (where.id !== id) return { count: 0 };
+      if ('handledAt' in where) {
+        const current = row.handledAt as Date | null;
+        const matches = where.handledAt === null ? current === null : current?.getTime() === where.handledAt.getTime();
+        if (!matches) return { count: 0 };
+      }
+      Object.assign(row, data);
+      return { count: 1 };
+    },
+  };
+  outbox.setRowLeaseRedisForTest(new FakeRedis() as never);
+
+  const fresh = (wallet: string) => signToken(`u-${wallet.slice(0, 6)}`, wallet);
+  const stale = (wallet: string) => signToken(`u-${wallet.slice(0, 6)}`, wallet, { authTime: Math.floor(Date.now() / 1000) - 7 * 24 * 3600 });
+  const body = JSON.stringify({ reason: 'handler fixed, re-applying the outcome' });
+  try {
+    await withServer(async (base) => {
+      const api = `${base}/api/v1/admin/chain/transactions`;
+      const post = (path: string, token: string, payload = body) =>
+        fetch(`${api}/${id}/${path}`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: payload });
+
+      // No chain.outbox.* at all: 403 on reads and actions.
+      assert.equal((await fetch(api, { headers: { authorization: `Bearer ${fresh(outsider)}` } })).status, 403);
+      assert.equal((await fetch(`${api}/${id}`, { headers: { authorization: `Bearer ${fresh(outsider)}` } })).status, 403);
+      // Read-only role: every action is 403.
+      for (const path of ['recover', 'rerun-handler', 'abandon']) {
+        const res = await post(path, fresh(reader));
+        assert.equal(res.status, 403, path);
+        assert.equal((await res.json()).error.code, 'FORBIDDEN');
+      }
+      // Operate without a fresh wallet signature: STEP_UP_REQUIRED.
+      for (const path of ['recover', 'rerun-handler', 'abandon']) {
+        const res = await post(path, stale(operator));
+        assert.equal(res.status, 403, path);
+        assert.equal((await res.json()).error.code, 'STEP_UP_REQUIRED');
+      }
+      assert.equal(audits.length, 0);
+
+      // The reason is required.
+      assert.equal((await post('rerun-handler', fresh(operator), '{"reason":"short"}')).status, 400);
+
+      const ok = await post('rerun-handler', fresh(operator));
+      assert.equal(ok.status, 200);
+      const json = await ok.json();
+      assert.equal(json.data.toStatus, 'FAILED');
+      assert.equal(json.data.handled, true);
+      assert.ok(row.handledAt, 'the handler re-ran and re-marked the row');
+
+      // A terminal row cannot be abandoned.
+      const refused = await post('abandon', fresh(operator));
+      assert.equal(refused.status, 409);
+      assert.equal((await refused.json()).error.code, 'OUTBOX_INVALID_STATE');
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(audits.length, 1, 'exactly one audit row: the generic request audit is off for these routes');
+    assert.equal(audits[0].data.action, 'CHAIN_OUTBOX_RERUN_HANDLER');
+    assert.equal(audits[0].data.actor, operator);
+    assert.equal(audits[0].data.target, id);
+    assert.deepEqual(
+      { ...audits[0].data.metadata, outcome: undefined },
+      {
+        outboxId: id, kind: 'test.console', fromStatus: 'FAILED', toStatus: 'FAILED',
+        reason: 'handler fixed, re-applying the outcome', hashes: ['ab'.repeat(32)], outcome: undefined,
+      },
+    );
+  } finally {
+    (prisma.adminRoleAssignment.findUnique as any) = orig.role;
+    (prisma.adminAuditLog.create as any) = orig.audit;
+    (prisma as any).chainTransaction = orig.chainTransaction;
+    outbox.setRowLeaseRedisForTest(null);
+  }
+});

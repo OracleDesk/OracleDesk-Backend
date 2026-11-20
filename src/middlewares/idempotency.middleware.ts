@@ -2,7 +2,7 @@ import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
-import { canonicalJson, sha256Hex } from '../utils/hash.util';
+import { canonicalJsonBounded, sha256Hex } from '../utils/hash.util';
 import { sendError } from '../utils/response.util';
 
 /**
@@ -160,14 +160,14 @@ function routeTemplate(req: Request): string {
 
 export function requestFingerprint(req: Request, route: string): string {
   return sha256Hex(
-    canonicalJson({
+    canonicalJsonBounded({
       method: req.method,
       route,
       params: req.params ?? {},
       // Parsed object, so parameter order doesn't change the fingerprint.
       query: req.query ?? {},
       body: req.body ?? null,
-    }),
+    }, { maxBytes: 1_048_576 }),
   );
 }
 

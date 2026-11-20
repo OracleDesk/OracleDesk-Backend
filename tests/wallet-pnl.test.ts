@@ -11,15 +11,15 @@ import {
   toBig,
   toDec,
   applyWalletEvent,
-} from '../services/wallet-pnl.service';
+} from '../src/services/wallet-pnl.service';
 import {
   calcBuy,
   calcSell,
   settleValue,
   priceYesBps,
   seedReserves,
-} from '../generated/fpmm';
-import { prisma } from '../lib/prisma';
+} from '../src/generated/fpmm';
+import { prisma } from '../src/lib/prisma';
 
 setupTestEnv();
 

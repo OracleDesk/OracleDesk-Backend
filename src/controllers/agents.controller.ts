@@ -9,12 +9,15 @@ import {
   computeAndStoreSnapshots,
   latestSnapshots,
 } from '../services/calibration.service';
+import { listActiveMaps } from '../services/recalibration.service';
 
 const querySchema = z.object({
   window: z.enum(WINDOWS).default('90d'),
   groupBy: z.enum(GROUP_BYS).default('agentType'),
   agentType: z.enum(['MARKET_MAKER', 'TRADER']).optional(),
   category: z.enum(MARKET_CATEGORIES).optional(),
+  // #244: also return the active recalibration maps and what they were fitted from.
+  include: z.enum(['maps']).optional(),
 });
 
 /**
@@ -30,7 +33,7 @@ export async function getCalibration(req: Request, res: Response): Promise<void>
     sendError(res, 400, 'VALIDATION_ERROR', 'Invalid calibration query', parsed.error.flatten().fieldErrors as any);
     return;
   }
-  const { window, groupBy, agentType, category } = parsed.data;
+  const { window, groupBy, agentType, category, include } = parsed.data;
 
   const allowsAgent = groupBy === 'agentType' || groupBy === 'agentType_category';
   const allowsCategory = groupBy === 'category' || groupBy === 'agentType_category';
@@ -62,6 +65,7 @@ export async function getCalibration(req: Request, res: Response): Promise<void>
     minCalibrationMarkets: config.MIN_CALIBRATION_MARKETS,
     weighting: config.CALIBRATION_WEIGHTING,
     slices: slices.map(({ groupKey: key, metrics }) => ({ groupKey: key, ...(metrics as object) })),
+    ...(include === 'maps' ? { recalibrationEnabled: config.CALIBRATION_SHRINKAGE_ENABLED, maps: await listActiveMaps() } : {}),
   });
 }
 

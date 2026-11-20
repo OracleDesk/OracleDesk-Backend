@@ -141,6 +141,11 @@ export const postgresContentStore: ContentStore = {
           WHERE m."metaUri" = ('ipfs://' || ic."cid")
             AND m."status" = 'PENDING'
         )
+        AND NOT EXISTS (
+          SELECT 1 FROM "ipfs_pins" p
+          WHERE p."cid" = ic."cid"
+            AND p."state" <> 'PINNED'
+        )
       ORDER BY (CASE WHEN ic."origin" = 'GATEWAY_VERIFIED' THEN 0 ELSE 1 END),
                ic."lastAccessAt" ASC
       LIMIT ${EVICT_BATCH}

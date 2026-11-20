@@ -1,0 +1,63 @@
+{
+  "name": "fomc-meeting-fred-backed",
+  "now": "2026-10-18T12:00:00.000Z",
+  "description": "Fed funds question at the December FOMC meeting with a FEDFUNDS grounding signal: authoritative, no news coverage needed.",
+  "question": "Will the FOMC lower the federal funds target rate at its December 2026 meeting?",
+  "category": "FED",
+  "resolutionSourceId": "FRED",
+  "meeting": {
+    "body": "FOMC",
+    "date": "2026-12-09"
+  },
+  "grounding": [
+    {
+      "signalId": "sig-fred-fedfunds",
+      "source": "FRED",
+      "url": "https://fred.stlouisfed.org/series/FEDFUNDS",
+      "publisher": "FRED",
+      "title": "FEDFUNDS: 4.33",
+      "content": "FEDFUNDS = 4.33 (+0.000 vs prior). Date: 2026-09-01",
+      "publishedAt": "2026-10-18T10:00:00.000Z",
+      "relevanceScore": 0.8,
+      "category": "GEOPOLITICAL",
+      "sanitizedFlags": [],
+      "clusterSize": 1
+    }
+  ],
+  "candidates": [
+    {
+      "id": "sig-fred-row",
+      "source": "FRED",
+      "clusterId": null,
+      "url": null,
+      "publisher": "FRED",
+      "title": "FEDFUNDS: 4.33",
+      "summary": "FEDFUNDS = 4.33",
+      "publishedAt": "2026-10-18T10:00:00.000Z"
+    },
+    {
+      "id": "sig-noise-1",
+      "source": "NEWSAPI",
+      "clusterId": null,
+      "url": "https://sport.example.net/derby",
+      "publisher": null,
+      "title": "Derby ends in a late draw",
+      "summary": "The visitors equalised in stoppage time.",
+      "publishedAt": "2026-10-18T07:00:00.000Z"
+    },
+    {
+      "id": "sig-noise-2",
+      "source": "NEWSAPI",
+      "clusterId": null,
+      "url": "https://arts.example.org/box-office",
+      "publisher": null,
+      "title": "Box office weekend led by an animated sequel",
+      "summary": "The sequel opened above forecasts.",
+      "publishedAt": "2026-10-18T03:00:00.000Z"
+    }
+  ],
+  "expected": {
+    "kind": "AUTHORITATIVE",
+    "units": 0
+  }
+}

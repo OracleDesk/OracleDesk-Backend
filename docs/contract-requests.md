@@ -149,3 +149,14 @@ Until it exists, `WEB_AUTH_CONTRACT_ID` can point at a community SEP-45
 web-auth contract on testnet. Risk to document: a hostile account contract can
 make `__check_auth` always succeed, but that only proves control of the contract
 being logged in, which is the identity under test.
+
+## Distinct treasury codes for trade deadline and limit failures (#245)
+
+`treasury::core_trade` / `map_market_core_code` maps only market-core
+`SlippageExceeded` to a treasury code and collapses every other market-core
+error, including `DeadlineExpired = 19` and `LimitPriceExceeded = 20`, into a
+generic market-core failure. The backend currently has to infer them from
+simulation diagnostics or local re-checks (`attributeTradeBoundFailure` in
+`src/services/stellar/failures.ts`). Request: dedicated treasury `Error`
+variants `DeadlineExpired` and `LimitPriceExceeded` for `agent_buy_v2` /
+`agent_sell_v2`.

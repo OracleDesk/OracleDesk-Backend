@@ -3,7 +3,7 @@ import { Address, rpc } from '@stellar/stellar-sdk';
 import { prisma as defaultPrisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { CONTRACTS } from '../config/contracts';
-import { toDisplayUsdc } from '../lib/amounts';
+import { priceBpsFromRaw, toDisplayUsdc } from '../lib/amounts';
 import { AppError } from '../middlewares/error.middleware';
 import { withTimeout, TimeoutError } from '../lib/resilience';
 import {
@@ -18,10 +18,8 @@ import { notifyUser } from '../lib/socket-auth';
 export { CopyTradeStatus };
 
 /**
- * COPY_TRADE_CONFIRMED to the owner's sockets (#94). `verified` is true when
- * the buy was matched to an on-chain Trade event, which is how every path that
- * sets EXECUTED works today. Call this after the status update, never inside
- * a transaction.
+ * The guarded transition below is the sole post-write notification point for
+ * COPY_TRADE_CONFIRMED.
  */
 export function notifyCopyTradeConfirmed(
   copyTrade: { id: string; userId?: string | null; txHash?: string | null; status: string },
@@ -51,7 +49,7 @@ export interface VerifiedCopyTrade {
   collateral: bigint;
   shares: bigint;
   fee: bigint;
-  eventId: string;
+  eventId: string | null;
 }
 
 export interface ExpectedCopyTrade {
@@ -62,21 +60,133 @@ export interface ExpectedCopyTrade {
   maxCollateral: bigint;
 }
 
+export interface CopyTradeEventEvidence {
+  id?: string | null;
+  contractId: string;
+  name: string;
+  data: Record<string, unknown>;
+}
+
+export interface CopyTradeEvidence {
+  txHash: string;
+  ledger: number;
+  eventId?: string | null;
+  events: readonly CopyTradeEventEvidence[];
+}
+
 function parseOutcome(o: unknown): 'Yes' | 'No' | null {
   if (o === 'Yes' || o === 'No') return o;
   if (o && typeof o === 'object' && 'tag' in o) {
-    const tag = (o as any).tag;
+    const tag = (o as { tag?: unknown }).tag;
     if (tag === 'Yes' || tag === 'No') return tag;
   }
   return null;
 }
 
-function normalizeAddress(addr: string): string {
+function normalizeAddress(addr: unknown): string | null {
+  if (typeof addr !== 'string') return null;
   try {
     return Address.fromString(addr).toString();
   } catch {
-    return addr.trim().toUpperCase();
+    return null;
   }
+}
+
+function copyTradeError(code: string, message: string): AppError {
+  return new AppError(422, code, message);
+}
+
+/**
+ * Applies the same rules to an indexed event and an event decoded from RPC.
+ */
+export function verifyCopyTradeEvidence(
+  expected: ExpectedCopyTrade,
+  evidence: CopyTradeEvidence,
+): VerifiedCopyTrade {
+  const txHash = expected.txHash.toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(txHash) || evidence.txHash.toLowerCase() !== txHash) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'Invalid copy-trade transaction hash');
+  }
+
+  const tradeEvents = evidence.events.filter(
+    (event) =>
+      (event.name === 'Trade' || event.name === 'trade') &&
+      event.contractId.toLowerCase() === CONTRACTS.marketCore.toLowerCase(),
+  );
+  if (tradeEvents.length === 0) {
+    throw copyTradeError('COPY_TRADE_NO_TRADE_EVENT', 'Transaction did not emit a Trade event');
+  }
+
+  const marketEvents = tradeEvents.filter((event) => {
+    try {
+      return BigInt(String(event.data.market_id)) === expected.onChainMarketId;
+    } catch {
+      return false;
+    }
+  });
+  if (marketEvents.length === 0) {
+    throw copyTradeError('COPY_TRADE_WRONG_MARKET', 'Trade was executed on a different market');
+  }
+
+  const expectedTrader = normalizeAddress(expected.trader);
+  if (!expectedTrader) {
+    throw copyTradeError('COPY_TRADE_WRONG_TRADER', 'Expected wallet address is invalid');
+  }
+  const traderEvents = marketEvents.filter(
+    (event) => normalizeAddress(event.data.trader) === expectedTrader,
+  );
+  if (traderEvents.length === 0) {
+    throw copyTradeError('COPY_TRADE_WRONG_TRADER', 'Trade was executed by a different wallet');
+  }
+
+  const buyEvents = traderEvents.filter((event) => event.data.is_buy === true);
+  if (buyEvents.length === 0) {
+    throw copyTradeError('COPY_TRADE_NOT_A_BUY', 'Trade was a sell, not a buy');
+  }
+
+  const sideEvents = buyEvents.filter((event) => parseOutcome(event.data.outcome) === expected.outcome);
+  if (sideEvents.length === 0) {
+    throw copyTradeError('COPY_TRADE_WRONG_SIDE', 'Trade outcome does not match requested outcome');
+  }
+  if (sideEvents.length > 1) {
+    throw copyTradeError(
+      'COPY_TRADE_AMBIGUOUS_EVENTS',
+      'Transaction contains multiple matching Trade events for user',
+    );
+  }
+
+  const matched = sideEvents[0];
+  let collateral: bigint;
+  let shares: bigint;
+  let fee: bigint;
+  try {
+    collateral = BigInt(String(matched.data.collateral));
+    shares = BigInt(String(matched.data.shares));
+    fee = BigInt(String(matched.data.fee ?? 0));
+  } catch {
+    throw copyTradeError('COPY_TRADE_INVALID_EVENT', 'Trade event contains invalid numeric values');
+  }
+  if (collateral < 0n || shares < 0n || fee < 0n) {
+    throw copyTradeError('COPY_TRADE_INVALID_EVENT', 'Trade event contains negative values');
+  }
+  if (collateral > expected.maxCollateral) {
+    throw copyTradeError(
+      'COPY_TRADE_AMOUNT_EXCEEDED',
+      `Executed collateral (${collateral}) exceeds maximum approved amount (${expected.maxCollateral})`,
+    );
+  }
+
+  return {
+    txHash,
+    ledger: evidence.ledger,
+    trader: expected.trader,
+    onChainMarketId: expected.onChainMarketId,
+    outcome: expected.outcome,
+    collateral,
+    shares,
+    fee,
+    eventId: matched.id ?? evidence.eventId ?? null,
+  };
 }
 
 /**
@@ -120,68 +230,11 @@ export async function verifyCopyTradeTx(
 
   // Primary verification evidence: Contract Events
   const parsedEvents = readContractEvents(response);
-  const tradeEvents = parsedEvents.filter(
-    (ev) =>
-      (ev.name === 'Trade' || ev.name === 'trade') &&
-      ev.contractId.toLowerCase() === CONTRACTS.marketCore.toLowerCase(),
-  );
-
-  if (tradeEvents.length === 0) {
-    throw new AppError(422, 'COPY_TRADE_NO_TRADE_EVENT', 'Transaction did not emit a Trade event');
-  }
-
-  const expectedTraderNorm = normalizeAddress(expected.trader);
-
-  // Check market
-  const marketEvents = tradeEvents.filter((ev) => {
-    try {
-      return BigInt(ev.data.market_id) === expected.onChainMarketId;
-    } catch {
-      return false;
-    }
+  const verified = verifyCopyTradeEvidence(expected, {
+    txHash,
+    ledger: response.ledger,
+    events: parsedEvents,
   });
-  if (marketEvents.length === 0) {
-    throw new AppError(422, 'COPY_TRADE_WRONG_MARKET', 'Trade was executed on a different market');
-  }
-
-  // Check trader
-  const traderEvents = marketEvents.filter(
-    (ev) => normalizeAddress(ev.data.trader) === expectedTraderNorm,
-  );
-  if (traderEvents.length === 0) {
-    throw new AppError(422, 'COPY_TRADE_WRONG_TRADER', 'Trade was executed by a different wallet');
-  }
-
-  // Check buy direction
-  const buyEvents = traderEvents.filter((ev) => Boolean(ev.data.is_buy));
-  if (buyEvents.length === 0) {
-    throw new AppError(422, 'COPY_TRADE_NOT_A_BUY', 'Trade was a sell, not a buy');
-  }
-
-  // Check outcome side
-  const sideEvents = buyEvents.filter((ev) => parseOutcome(ev.data.outcome) === expected.outcome);
-  if (sideEvents.length === 0) {
-    throw new AppError(422, 'COPY_TRADE_WRONG_SIDE', 'Trade outcome does not match requested outcome');
-  }
-
-  // Multi-buy disambiguation: reject if multiple matching events exist for the user
-  if (sideEvents.length > 1) {
-    throw new AppError(
-      422,
-      'COPY_TRADE_AMBIGUOUS_EVENTS',
-      'Transaction contains multiple matching Trade events for user',
-    );
-  }
-
-  const matched = sideEvents[0];
-  const collateral = BigInt(matched.data.collateral);
-  if (collateral > expected.maxCollateral) {
-    throw new AppError(
-      422,
-      'COPY_TRADE_AMOUNT_EXCEEDED',
-      `Executed collateral (${collateral}) exceeds maximum approved amount (${expected.maxCollateral})`,
-    );
-  }
 
   // Defence-in-depth: check transaction envelope if present
   if (response.envelopeXdr) {
@@ -205,7 +258,7 @@ export async function verifyCopyTradeTx(
               const args = call.args();
               if (args.length > 0) {
                 const traderArg = Address.fromScVal(args[0]).toString();
-                if (normalizeAddress(traderArg) !== expectedTraderNorm) {
+                if (normalizeAddress(traderArg) !== normalizeAddress(expected.trader)) {
                   throw new AppError(
                     422,
                     'COPY_TRADE_WRONG_TRADER',
@@ -225,17 +278,63 @@ export async function verifyCopyTradeTx(
     }
   }
 
-  return {
-    txHash,
-    ledger: response.ledger,
-    trader: expected.trader,
-    onChainMarketId: expected.onChainMarketId,
-    outcome: expected.outcome,
-    collateral,
-    shares: BigInt(matched.data.shares),
-    fee: BigInt(matched.data.fee ?? 0),
-    eventId: response.txHash,
-  };
+  return verified;
+}
+
+export async function transitionCopyTrade(
+  prisma: typeof defaultPrisma,
+  copyTrade: { id: string; userId: string | null },
+  txHash: string,
+  data: Prisma.CopyTradeUpdateManyMutationInput,
+  options: {
+    allowedStatuses?: CopyTradeStatus[];
+    audit?: {
+      fromStatus: CopyTradeStatus;
+      chainEventId: string;
+      reason: string;
+    };
+  } = {},
+): Promise<Prisma.CopyTradeGetPayload<{}> | null> {
+  const updated = await prisma.$transaction(async (tx) => {
+    const { count } = await tx.copyTrade.updateMany({
+      where: {
+        id: copyTrade.id,
+        status: { in: options.allowedStatuses ?? [CopyTradeStatus.PENDING, CopyTradeStatus.CONFIRMING] },
+        OR: [{ txHash: null }, { txHash }],
+      },
+      data: { ...data, txHash },
+    });
+    if (count !== 1) return null;
+
+    if (options.audit) {
+      if (data.status !== CopyTradeStatus.EXECUTED) {
+        throw new Error('Copy-trade audit records require an EXECUTED transition');
+      }
+      await tx.copyTradeAudit.create({
+        data: {
+          copyTradeId: copyTrade.id,
+          fromStatus: options.audit.fromStatus,
+          toStatus: CopyTradeStatus.EXECUTED,
+          txHash,
+          chainEventId: options.audit.chainEventId,
+          reason: options.audit.reason,
+        },
+      });
+    }
+
+    return tx.copyTrade.findUnique({ where: { id: copyTrade.id } });
+  });
+  if (!updated) return null;
+
+  if (data.status === CopyTradeStatus.EXECUTED) {
+    notifyCopyTradeConfirmed({
+      id: copyTrade.id,
+      userId: copyTrade.userId,
+      txHash,
+      status: CopyTradeStatus.EXECUTED,
+    }, true);
+  }
+  return updated;
 }
 
 /**
@@ -254,7 +353,7 @@ export async function confirmCopyTrade(
   const copyTrade = await prisma.copyTrade.findFirst({
     where: {
       id: copyTradeId,
-      followerWallet: wallet,
+      userId,
     },
     include: {
       market: { select: { onChainMarketId: true } },
@@ -262,6 +361,11 @@ export async function confirmCopyTrade(
   });
 
   if (!copyTrade) {
+    throw new AppError(404, 'COPY_TRADE_NOT_FOUND', 'Copy trade not found');
+  }
+  const storedWallet = normalizeAddress(copyTrade.followerWallet);
+  const requestWallet = normalizeAddress(wallet);
+  if (!storedWallet || !requestWallet || storedWallet !== requestWallet) {
     throw new AppError(404, 'COPY_TRADE_NOT_FOUND', 'Copy trade not found');
   }
 
@@ -303,51 +407,55 @@ export async function confirmCopyTrade(
     );
   }
 
-  if (!copyTrade.market?.onChainMarketId) {
+  if (copyTrade.market?.onChainMarketId == null) {
     throw new AppError(400, 'MARKET_NOT_ON_CHAIN', 'Market is not active on-chain');
   }
 
-  const expectedOutcome: 'Yes' | 'No' = (copyTrade as any).outcome === 'YES' ? 'Yes' : 'No';
+  const expectedOutcome: 'Yes' | 'No' = copyTrade.direction === 'YES' ? 'Yes' : 'No';
   const maxCollateral = BigInt(copyTrade.amountRaw ?? '0');
 
   try {
     const verified = await verifyCopyTradeTx({
       txHash,
-      trader: wallet,
+      trader: copyTrade.followerWallet,
       onChainMarketId: copyTrade.market.onChainMarketId,
       outcome: expectedOutcome,
       maxCollateral,
     });
 
-    const updated = await prisma.copyTrade.update({
-      where: { id: copyTradeId },
-      data: {
-        txHash,
-        status: CopyTradeStatus.EXECUTED,
-        collateralRaw: verified.collateral.toString(),
-        sharesRaw: verified.shares.toString(),
-        feeRaw: verified.fee.toString(),
-        ledger: verified.ledger,
-        chainEventId: verified.eventId,
-        confirmedAt: new Date(),
-        amount: toDisplayUsdc(verified.collateral),
-        failureCode: null,
-      },
+    const updated = await transitionCopyTrade(prisma, copyTrade, txHash, {
+      status: CopyTradeStatus.EXECUTED,
+      collateralRaw: verified.collateral.toString(),
+      sharesRaw: verified.shares.toString(),
+      feeRaw: verified.fee.toString(),
+      priceBps: priceBpsFromRaw(verified.collateral, verified.shares),
+      ledger: verified.ledger,
+      chainEventId: verified.eventId,
+      confirmedAt: new Date(),
+      amount: toDisplayUsdc(verified.collateral),
+      failureCode: null,
     });
-
-    notifyCopyTradeConfirmed({ ...updated, userId: updated.userId ?? copyTrade.userId }, true);
+    if (!updated) {
+      const current = await prisma.copyTrade.findUnique({ where: { id: copyTradeId } });
+      if (current?.status === CopyTradeStatus.EXECUTED && current.txHash?.toLowerCase() === txHash) {
+        return current;
+      }
+      throw new AppError(409, 'COPY_TRADE_STATE_CHANGED', 'Copy trade changed while it was being verified');
+    }
     return updated;
   } catch (err: any) {
     if (err instanceof CopyTradePendingError) {
       // Mark as CONFIRMING
-      await prisma.copyTrade.update({
-        where: { id: copyTradeId },
-        data: {
-          txHash,
-          status: CopyTradeStatus.CONFIRMING,
-          verificationAttempts: { increment: 1 },
-        },
+      const transitioned = await transitionCopyTrade(prisma, copyTrade, txHash, {
+        status: CopyTradeStatus.CONFIRMING,
+        verificationAttempts: { increment: 1 },
       });
+      if (!transitioned) {
+        const current = await prisma.copyTrade.findUnique({ where: { id: copyTradeId } });
+        if (current?.status === CopyTradeStatus.EXECUTED && current.txHash?.toLowerCase() === txHash) {
+          return current;
+        }
+      }
       throw err;
     }
 
@@ -361,14 +469,16 @@ export async function confirmCopyTrade(
 
     // Definitive validation errors -> mark FAILED
     if (err instanceof AppError && err.statusCode === 422) {
-      await prisma.copyTrade.update({
-        where: { id: copyTradeId },
-        data: {
-          txHash,
-          status: CopyTradeStatus.FAILED,
-          failureCode: err.code,
-        },
+      const failed = await transitionCopyTrade(prisma, copyTrade, txHash, {
+        status: CopyTradeStatus.FAILED,
+        failureCode: err.code,
       });
+      if (!failed) {
+        const current = await prisma.copyTrade.findUnique({ where: { id: copyTradeId } });
+        if (current?.status === CopyTradeStatus.EXECUTED && current.txHash?.toLowerCase() === txHash) {
+          return current;
+        }
+      }
     }
 
     throw err;
@@ -376,64 +486,212 @@ export async function confirmCopyTrade(
 }
 
 /**
- * Reconciles pending copy trades directly from a decoded on-chain Trade event.
+ * Records an ambiguity instead of assigning evidence to an indistinguishable intent.
+ */
+async function reportCopyTradeAmbiguity(
+  event: DecodedEvent,
+  candidateCopyTradeIds: string[],
+  reason: string,
+  prisma: typeof defaultPrisma,
+): Promise<void> {
+  const candidates = [...new Set(candidateCopyTradeIds)].sort();
+  await prisma.copyTradeAmbiguity.upsert({
+    where: { chainEventId: event.id },
+    create: {
+      chainEventId: event.id,
+      txHash: event.txHash.toLowerCase(),
+      candidateCopyTradeIds: candidates as Prisma.InputJsonValue,
+      reason,
+    },
+    update: {
+      candidateCopyTradeIds: candidates as Prisma.InputJsonValue,
+      reason,
+    },
+  });
+  logger.warn(
+    { eventId: event.id, txHash: event.txHash, candidateCopyTradeIds: candidates, reason },
+    'Copy-trade event could not be assigned unambiguously',
+  );
+}
+
+/**
+ * Reconciles an indexed buy against an explicit tx hash or the oldest uniquely
+ * identifiable intent with no submitted hash.
  */
 export async function reconcileFromTradeEvent(
   event: DecodedEvent,
   prisma = defaultPrisma,
-): Promise<'confirmed' | 'ignored'> {
+): Promise<'confirmed' | 'failed' | 'ambiguous' | 'ignored'> {
   const p = event.params;
-  if (!Boolean(p.is_buy)) return 'ignored';
+  if (p.is_buy !== true) return 'ignored';
 
   const txHash = event.txHash.toLowerCase();
-  const onChainMarketId = BigInt(p.market_id);
-  const trader = normalizeAddress(p.trader);
-  const outcome = parseOutcome(p.outcome);
-  if (!outcome) return 'ignored';
-
-  const targetOutcome = outcome === 'Yes' ? 'YES' : 'NO';
-
-  const copyTrade = await prisma.copyTrade.findFirst({
+  let copyTrade = await prisma.copyTrade.findFirst({
     where: {
       txHash,
-      status: { in: [CopyTradeStatus.PENDING, CopyTradeStatus.CONFIRMING] },
-      followerWallet: trader,
-      outcome: targetOutcome,
-      market: { onChainMarketId },
+      status: { in: [CopyTradeStatus.PENDING, CopyTradeStatus.CONFIRMING, CopyTradeStatus.EXPIRED] },
     },
+    include: { market: { select: { onChainMarketId: true } } },
   });
 
-  if (!copyTrade) return 'ignored';
+  if (!copyTrade) {
+    const alreadyConsumed = await prisma.copyTrade.findFirst({ where: { txHash } });
+    if (alreadyConsumed) return 'ignored';
 
-  const collateral = BigInt(p.collateral);
-  const maxCollateral = BigInt(copyTrade.amountRaw ?? '0');
+    const trader = normalizeAddress(p.trader);
+    const outcome = parseOutcome(p.outcome);
+    let onChainMarketId: bigint;
+    let collateral: bigint;
+    try {
+      onChainMarketId = BigInt(p.market_id);
+      collateral = BigInt(p.collateral);
+    } catch {
+      return 'ignored';
+    }
+    if (!trader || !outcome || collateral < 0n) return 'ignored';
 
-  if (maxCollateral > 0n && collateral > maxCollateral) {
-    await prisma.copyTrade.update({
-      where: { id: copyTrade.id },
-      data: {
-        status: CopyTradeStatus.FAILED,
-        failureCode: 'COPY_TRADE_AMOUNT_EXCEEDED',
+    const createdBeforeEvent = new Date(event.ledgerClosedAt);
+    const candidates = await prisma.copyTrade.findMany({
+      where: {
+        followerWallet: trader,
+        direction: outcome === 'Yes' ? 'YES' : 'NO',
+        status: { in: [CopyTradeStatus.PENDING, CopyTradeStatus.EXPIRED] },
+        txHash: null,
+        createdAt: { lte: createdBeforeEvent },
+        market: { onChainMarketId },
       },
+      include: { market: { select: { onChainMarketId: true } } },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
     });
+
+    const eligible = candidates.flatMap((candidate) => {
+      const wallet = normalizeAddress(candidate.followerWallet);
+      const approved = BigInt(candidate.amountRaw ?? '0');
+      if (
+        wallet !== trader ||
+        candidate.market?.onChainMarketId !== onChainMarketId ||
+        approved < collateral
+      ) {
+        return [];
+      }
+      return [{ copyTrade: candidate, slack: approved - collateral }];
+    });
+    if (eligible.length === 0) return 'ignored';
+
+    eligible.sort((a, b) =>
+      (a.slack < b.slack ? -1 : a.slack > b.slack ? 1 : 0) ||
+      a.copyTrade.createdAt.getTime() - b.copyTrade.createdAt.getTime() ||
+      a.copyTrade.id.localeCompare(b.copyTrade.id),
+    );
+    const best = eligible[0];
+    const tied = eligible.filter(
+      (candidate) =>
+        candidate.slack === best.slack &&
+        candidate.copyTrade.createdAt.getTime() === best.copyTrade.createdAt.getTime(),
+    );
+    if (tied.length > 1) {
+      await reportCopyTradeAmbiguity(
+        event,
+        tied.map(({ copyTrade: candidate }) => candidate.id),
+        'COPY_TRADE_INTENT_AMBIGUOUS',
+        prisma,
+      );
+      return 'ambiguous';
+    }
+    copyTrade = best.copyTrade;
+  }
+
+  if (copyTrade.market?.onChainMarketId == null) {
+    return 'ignored';
+  }
+  const outcome: 'Yes' | 'No' = copyTrade.direction === 'YES' ? 'Yes' : 'No';
+  const expected: ExpectedCopyTrade = {
+    txHash,
+    trader: copyTrade.followerWallet,
+    onChainMarketId: copyTrade.market.onChainMarketId,
+    outcome,
+    maxCollateral: BigInt(copyTrade.amountRaw ?? '0'),
+  };
+  let eventVerified: VerifiedCopyTrade | null = null;
+  try {
+    eventVerified = verifyCopyTradeEvidence(
+      expected,
+      {
+        txHash,
+        ledger: event.ledger,
+        eventId: event.id,
+        events: [{
+          id: event.id,
+          contractId: event.contractId,
+          name: event.eventName,
+          data: p,
+        }],
+      },
+    );
+  } catch (err) {
+    if (!(err instanceof AppError) || err.statusCode !== 422) throw err;
+    if (copyTrade.txHash == null) return 'ignored';
+  }
+
+  let verified: VerifiedCopyTrade;
+  try {
+    // The indexed event may be only one of several Trade events in this
+    // transaction; RPC supplies the complete set for ambiguity checks.
+    verified = await verifyCopyTradeTx(expected);
+  } catch (err) {
+    if (!(err instanceof AppError) || err.statusCode !== 422) throw err;
+    if (err.code === 'COPY_TRADE_AMBIGUOUS_EVENTS' && copyTrade.txHash == null) {
+      await reportCopyTradeAmbiguity(event, [copyTrade.id], err.code, prisma);
+      return 'ambiguous';
+    }
+    if (copyTrade.status === CopyTradeStatus.EXPIRED) {
+      logger.warn(
+        { copyTradeId: copyTrade.id, txHash, failureCode: err.code },
+        'Late on-chain event did not verify for expired copy trade',
+      );
+      return 'ignored';
+    }
+    const failed = await transitionCopyTrade(prisma, copyTrade, txHash, {
+      status: CopyTradeStatus.FAILED,
+      failureCode: err.code,
+    }, { allowedStatuses: [copyTrade.status] });
+    if (failed) {
+      logger.warn({ copyTradeId: copyTrade.id, txHash, failureCode: err.code }, 'Indexed transaction failed copy-trade verification');
+      return 'failed';
+    }
     return 'ignored';
   }
 
-  const confirmed = await prisma.copyTrade.update({
-    where: { id: copyTrade.id },
-    data: {
-      status: CopyTradeStatus.EXECUTED,
-      collateralRaw: collateral.toString(),
-      sharesRaw: p.shares ? String(p.shares) : null,
-      feeRaw: p.fee ? String(p.fee) : '0',
-      ledger: event.ledger,
-      chainEventId: event.id,
-      confirmedAt: new Date(event.ledgerClosedAt),
-      amount: toDisplayUsdc(collateral),
-      failureCode: null,
-    },
+  const isLateEvidence =
+    copyTrade.status === CopyTradeStatus.EXPIRED ||
+    (copyTrade.expiresAt !== null &&
+      new Date(event.ledgerClosedAt).getTime() > copyTrade.expiresAt.getTime());
+  const confirmed = await transitionCopyTrade(prisma, copyTrade, txHash, {
+    status: CopyTradeStatus.EXECUTED,
+    collateralRaw: verified.collateral.toString(),
+    sharesRaw: verified.shares.toString(),
+    feeRaw: verified.fee.toString(),
+    priceBps: priceBpsFromRaw(verified.collateral, verified.shares),
+    ledger: verified.ledger,
+    chainEventId: eventVerified?.eventId ?? verified.eventId,
+    confirmedAt: new Date(event.ledgerClosedAt),
+    amount: toDisplayUsdc(verified.collateral),
+    failureCode: null,
+  }, {
+    allowedStatuses: [copyTrade.status],
+    ...(isLateEvidence
+      ? {
+          audit: {
+            fromStatus: copyTrade.status,
+            chainEventId: event.id,
+            reason: copyTrade.status === CopyTradeStatus.EXPIRED
+              ? 'EXPIRED_INTENT_REVERIFIED'
+              : 'LATE_CHAIN_EVIDENCE',
+          },
+        }
+      : {}),
   });
-  notifyCopyTradeConfirmed({ ...confirmed, userId: confirmed?.userId ?? copyTrade.userId }, true);
+  if (!confirmed) return 'ignored';
 
   logger.info({ copyTradeId: copyTrade.id, txHash }, 'Reconciled copy trade from on-chain event');
   return 'confirmed';

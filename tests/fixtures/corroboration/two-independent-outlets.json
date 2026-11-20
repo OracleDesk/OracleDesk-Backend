@@ -1,0 +1,80 @@
+{
+  "name": "two-independent-outlets",
+  "now": "2026-10-18T12:00:00.000Z",
+  "description": "Independent outlets on different domains report the claim: corroborated.",
+  "question": "Will the US impose new tariffs on Japan by December 31, 2026?",
+  "category": "GEOPOLITICAL",
+  "resolutionSourceId": "AP_POLITICS",
+  "meeting": null,
+  "grounding": [
+    {
+      "signalId": "sig-plant",
+      "source": "NEWSAPI",
+      "url": "https://breaking-wire.example/us-japan-tariffs",
+      "publisher": null,
+      "title": "US to impose sweeping new tariffs on Japan, officials say",
+      "content": "Washington will announce new tariffs on Japanese cars and electronics within weeks, according to officials.",
+      "publishedAt": "2026-10-18T09:00:00.000Z",
+      "relevanceScore": 0.8,
+      "category": "GEOPOLITICAL",
+      "sanitizedFlags": [],
+      "clusterSize": 1
+    }
+  ],
+  "candidates": [
+    {
+      "id": "sig-plant",
+      "source": "NEWSAPI",
+      "clusterId": null,
+      "url": "https://breaking-wire.example/us-japan-tariffs",
+      "publisher": null,
+      "title": "US to impose sweeping new tariffs on Japan, officials say",
+      "summary": "Washington will announce new tariffs on Japanese cars and electronics within weeks, according to officials.",
+      "publishedAt": "2026-10-18T09:00:00.000Z"
+    },
+    {
+      "id": "sig-ind-2",
+      "source": "NEWSAPI",
+      "clusterId": "cluster-ind-2",
+      "url": "https://www.globaltimes-review.example.co.uk/asia/japan-trade-response",
+      "publisher": "Global Review",
+      "title": "Japan prepares response as US weighs tariffs",
+      "summary": "Tokyo ministers met on Friday to draft countermeasures should Washington go ahead with tariffs on Japanese exports.",
+      "publishedAt": "2026-10-18T02:00:00.000Z"
+    },
+    {
+      "id": "sig-ind-3",
+      "source": "NEWSAPI",
+      "clusterId": null,
+      "url": null,
+      "publisher": "Market Letter",
+      "title": "Tariffs on Japan: what the US plan means for carmakers",
+      "summary": "Analysts expect US tariffs on Japan to hit carmakers first.",
+      "publishedAt": "2026-10-17T16:00:00.000Z"
+    },
+    {
+      "id": "sig-noise-1",
+      "source": "NEWSAPI",
+      "clusterId": null,
+      "url": "https://sport.example.net/derby",
+      "publisher": null,
+      "title": "Derby ends in a late draw",
+      "summary": "The visitors equalised in stoppage time.",
+      "publishedAt": "2026-10-18T07:00:00.000Z"
+    },
+    {
+      "id": "sig-noise-2",
+      "source": "NEWSAPI",
+      "clusterId": null,
+      "url": "https://arts.example.org/box-office",
+      "publisher": null,
+      "title": "Box office weekend led by an animated sequel",
+      "summary": "The sequel opened above forecasts.",
+      "publishedAt": "2026-10-18T03:00:00.000Z"
+    }
+  ],
+  "expected": {
+    "kind": "CORROBORATED",
+    "units": 3
+  }
+}
