@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { config } from '../config';
 import { secret } from '../config/secrets';
 import { renderSep7StellarToml } from '../services/sep7.service';
+import { getEntitlementJwks } from '../services/entitlement/token.service';
 
 /**
  * Minimal `/.well-known/stellar.toml` endpoint for SEP-7 URI verification (#270).
@@ -35,6 +36,17 @@ export function createWellKnownRouter(resolveSecret?: () => string): Router {
       .setHeader('Access-Control-Allow-Origin', '*')
       .setHeader('Cache-Control', 'public, max-age=300')
       .send(body);
+  });
+
+  router.get('/oracledesk-entitlement-jwks.json', (_req, res) => {
+    try {
+      res
+        .status(200)
+        .setHeader('Cache-Control', 'public, max-age=300')
+        .json(getEntitlementJwks());
+    } catch (err: any) {
+      res.status(err.statusCode ?? 503).json({ error: err.code ?? 'ENTITLEMENT_KEYS_UNAVAILABLE' });
+    }
   });
 
   return router;

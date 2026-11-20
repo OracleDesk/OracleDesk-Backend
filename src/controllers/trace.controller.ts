@@ -26,6 +26,8 @@ import {
   getPaymentIntent,
   submitPaymentIntent,
 } from '../services/payment-intent.service';
+import { getEntitlementJwks, verifyEntitlementToken, issueEntitlementToken } from '../services/entitlement/token.service';
+import { ENTITLEMENT_HEADER } from '../services/entitlement/token.service';
 
 const preauthorizeSchema = z.object({
   type: z.enum(['PER_TRACE', 'DAILY_PASS']).default('DAILY_PASS'),
@@ -111,8 +113,18 @@ export async function listTraces(req: Request, res: Response): Promise<void> {
 export async function getTrace(req: Request, res: Response): Promise<void> {
   const id = String(req.params.id);
   const userId = req.user?.userId;
-
-  const trace = await getTracWithAccessControl(id, userId);
+  const entitlement = req.get(ENTITLEMENT_HEADER);
+  let entitlementAccess = false;
+  if (entitlement) {
+    const verified = await verifyEntitlementToken({
+      token: entitlement,
+      jwks: getEntitlementJwks(),
+      audience: config.X402_ENTITLEMENT_AUDIENCE,
+      traceId: id,
+    });
+    entitlementAccess = verified.valid;
+  }
+  const trace = await getTracWithAccessControl(id, userId, entitlementAccess);
   sendSuccess(res, trace);
 }
 
@@ -167,7 +179,15 @@ export async function unlockTrace(req: Request, res: Response): Promise<void> {
   });
 
   const trace = await getTracWithAccessControl(traceId, req.user.userId).catch(() => null);
-  sendSuccess(res, { subscription: toSubscriptionDto(subscription), trace }, 201);
+  const entitlement = trace
+    ? issueEntitlementToken({
+        subject: req.user.userId,
+        traceId,
+        onChainTraceId: trace.onChainTraceId ?? null,
+        expiresAt: subscription.endsAt ?? subscription.expiresAt,
+      })
+    : null;
+  sendSuccess(res, { subscription: toSubscriptionDto(subscription), trace, entitlement }, 201);
 }
 
 type AllowanceAmount = { ok: true; value: bigint; deprecated: boolean } | { ok: false; message: string };
