@@ -56,7 +56,7 @@ export { calculateKellySize } from './kelly';
  */
 export async function applyBuySuccess(
   tradeId: string,
-  fill: { sharesOut: bigint; collateralIn: bigint; feeRaw: bigint; txHash: string | null; innerTxHash: string | null },
+  fill: { sharesOut: bigint; collateralIn: bigint; feeRaw: bigint; txHash: string | null; innerTxHash: string | null; traceId?: string | null },
 ): Promise<void> {
   const trade = await prisma.trade.findUnique({ where: { id: tradeId }, select: { id: true, marketId: true, direction: true, amount: true } });
   if (!trade) return;
@@ -92,10 +92,14 @@ export async function applyBuySuccess(
         entryPriceBps: fillPriceBps,
         costBasisRaw: bigintToDecimalString(fill.collateralIn),
         feesPaidRaw: bigintToDecimalString(fill.feeRaw),
+        entryTraceId: fill.traceId ?? null,
       },
     });
   } catch (err) {
     if (!(err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002')) throw err;
+    if (fill.traceId) {
+      await prisma.position.updateMany({ where: { tradeId, entryTraceId: null }, data: { entryTraceId: fill.traceId } });
+    }
   }
 }
 
@@ -120,13 +124,14 @@ export async function handleTradeBuyOutcome(row: ChainTransactionRow, outcome: C
     return;
   }
 
-  const args = (row.args ?? {}) as { collateral_in?: string; feeRaw?: string };
+  const args = (row.args ?? {}) as { collateral_in?: string; feeRaw?: string; traceId?: string };
   await applyBuySuccess(tradeId, {
     sharesOut: BigInt(String(outcome.value ?? '0')),
     collateralIn: BigInt(args.collateral_in ?? '0'),
     feeRaw: BigInt(args.feeRaw ?? '0'),
     txHash: outcome.txHash ?? null,
     innerTxHash: row.hash,
+    traceId: args.traceId ?? null,
   });
 }
 
@@ -347,7 +352,7 @@ export async function executeTrade(payload: TradePayload): Promise<{
   // tradeId), so this direct call is a no-op when it did and the single
   // writer when it could not run (e.g. injected chain deps).
   const { sharesOut, collateralIn, feeRaw } = fill!;
-  await applyBuySuccess(trade.id, { sharesOut, collateralIn, feeRaw, txHash, innerTxHash: txHash });
+  await applyBuySuccess(trade.id, { sharesOut, collateralIn, feeRaw, txHash, innerTxHash: txHash, traceId: payload.traceId });
   const updatedTrade = await prisma.trade.findUnique({ where: { id: trade.id } });
   const position = await prisma.position.findUnique({ where: { tradeId: trade.id } });
   if (!updatedTrade || updatedTrade.status !== 'EXECUTED' || !position) {
@@ -532,6 +537,7 @@ async function submitTradeTransaction(
     {
       collateral_in: collateralIn.toString(),
       feeRaw: feeRaw.toString(),
+      ...(payload.traceId ? { traceId: payload.traceId } : {}),
       ...(attemptId ? { attemptId } : {}),
       ...(rebuildCount ? { rebuildCount } : {}),
     },

@@ -18,13 +18,12 @@ import {
   withAdvisoryLocksWait,
 } from '../lib/advisory-lock';
 import {
-  DAILY_PASS_PRICE_RAW,
-  floatMirror,
   paymentClaimLockKey,
   preauthorizeSpending,
   settleVerifiedTransfer,
   userPaymentLockKey,
 } from './subscription.service';
+import { currentPrice } from './pricing';
 import { verifyUsdcTransfer, VerifiedTransfer } from './payment-verification.service';
 
 export interface PaymentIntentView {
@@ -48,6 +47,7 @@ export interface PaymentIntentView {
   expiresAt: Date;
   confirmedAt: Date | null;
   createdAt: Date;
+  priceScheduleVersion: number | null;
 }
 
 function view(intent: any): PaymentIntentView {
@@ -83,13 +83,15 @@ export async function createPaymentIntent(userId: string, walletAddress: string)
 
   const nonce = randomBytes(16).toString('hex');
   const memo = `od-${nonce.slice(0, 24)}`;
-  const allowance = await preauthorizeSpending(userId, 'DAILY_PASS', DAILY_PASS_PRICE_RAW, now);
+  const quote = await currentPrice(now);
+  const allowance = await preauthorizeSpending(userId, 'DAILY_PASS', quote.dailyPassPriceRaw, now);
   const intent = await prisma.paymentIntent.create({
     data: {
       userId,
       walletAddress,
       type: SubscriptionType.DAILY_PASS,
-      amountRaw: DAILY_PASS_PRICE_RAW.toString(),
+      amountRaw: quote.dailyPassPriceRaw.toString(),
+      priceScheduleVersion: quote.version,
       currency: SettlementCurrency.USDC,
       recipient: PAYMENTS_RECIPIENT,
       token: CONTRACTS.usdc,
@@ -136,7 +138,7 @@ async function recordUnappliedPayment(
       userId: intent.userId,
       txHash: transfer.txHash.toLowerCase(),
       type: PaymentEventType.DAILY_PASS,
-      ...floatMirror({ amount: toDisplayUsdc(transfer.amount) }),
+      amount: toDisplayUsdc(transfer.amount),
       amountRaw: transfer.amount.toString(),
       fromAddress: transfer.from,
       currency: SettlementCurrency.USDC,
@@ -296,6 +298,7 @@ export async function submitPaymentIntent(params: {
         type: 'DAILY_PASS',
         transfer,
         paymentIntentId: intent.id,
+        priceScheduleVersion: intent.priceScheduleVersion,
       });
       const updated = await tx.paymentIntent.update({
         where: { id },

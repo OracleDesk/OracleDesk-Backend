@@ -9,6 +9,8 @@ export const TRACE_ACTIONS = {
   createMarket: 'create_market',
   buyYes: 'buy_yes',
   buyNo: 'buy_no',
+  sellYes: 'sell_yes',
+  sellNo: 'sell_no',
   attest: 'attest',
 } as const;
 
@@ -16,6 +18,9 @@ export type TraceAction = (typeof TRACE_ACTIONS)[keyof typeof TRACE_ACTIONS];
 
 export const tradeTraceAction = (direction: 'YES' | 'NO'): TraceAction =>
   direction === 'YES' ? TRACE_ACTIONS.buyYes : TRACE_ACTIONS.buyNo;
+
+export const exitTraceAction = (direction: 'YES' | 'NO'): TraceAction =>
+  direction === 'YES' ? TRACE_ACTIONS.sellYes : TRACE_ACTIONS.sellNo;
 
 /**
  * Agent whose control state gates a `publish_trace` call (#79): the market

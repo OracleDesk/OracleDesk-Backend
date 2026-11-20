@@ -18,6 +18,7 @@
  * - Event shapes come from each binding's contract spec (Spec.parseEvent),
  *   never hand-written XDR decoding.
  */
+import { anchorRefs } from './pin-ledger.service';
 import { rpc, xdr } from '@stellar/stellar-sdk';
 import type { Spec } from '@stellar/stellar-sdk/contract';
 import { Prisma } from '@prisma/client';
@@ -32,6 +33,7 @@ import { printable } from './chain.service';
 import { priceYesBps } from '../generated/fpmm';
 import { withTimeout, deadline } from '../lib/resilience';
 import { applyMarketFinality } from './market-finality';
+import { notifyUser } from '../lib/socket-auth';
 
 export type EventSource = Pick<rpc.Server, 'getEvents' | 'getHealth'>;
 
@@ -245,7 +247,7 @@ async function applySideEffects(event: DecodedEvent): Promise<void> {
         traceHash,
         market: { onChainMarketId },
       },
-      select: { id: true, onChainTraceId: true },
+      select: { id: true, marketId: true, onChainTraceId: true },
     });
     if (trace && (trace.onChainTraceId === null || trace.onChainTraceId === onChainTraceId)) {
       // The event's trace_hash equals our stored traceHash, which is exactly
@@ -272,6 +274,22 @@ async function applySideEffects(event: DecodedEvent): Promise<void> {
         where: { traceId: trace.id, status: { in: ['AWAITING_MARKET', 'READY', 'SUBMITTED'] } },
         data: { status: 'CONFIRMED', confirmedAt: new Date(), lastError: null },
       });
+      await anchorRefs('TRACE', trace.id, `trace:${onChainTraceId.toString()}`);
+      const exit = trace.onChainTraceId === null
+        ? await prisma.positionExit.findUnique({ where: { traceId: trace.id }, select: { positionId: true, reason: true, context: true } })
+        : null;
+      const entryTraceId = (exit?.context as { entryTraceId?: string | null } | null)?.entryTraceId;
+      if (exit && entryTraceId) {
+        const followers = await prisma.copyTrade.findMany({ where: { traceId: entryTraceId, status: 'CONFIRMED' }, select: { userId: true } });
+        for (const follower of followers) {
+          notifyUser(follower.userId, 'POSITION_EXITED', {
+            exitTraceId: trace.id,
+            positionId: exit.positionId,
+            marketId: trace.marketId,
+            reason: exit.reason,
+          });
+        }
+      }
     }
   }
 }

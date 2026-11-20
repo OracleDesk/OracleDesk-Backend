@@ -4,8 +4,7 @@
 // Get a free hosted Postgres database in seconds: `npx create-db`
 
 generator client {
-  provider      = "prisma-client-js"
-  binaryTargets = ["native", "debian-openssl-3.0.x"]
+  provider = "prisma-client-js"
 }
 
 datasource db {
@@ -127,23 +126,6 @@ enum GenerationJobStatus {
   FAILED
 }
 
-enum GenerationRunState {
-  STARTED
-  SIGNALS_READY
-  PROPOSED
-  MARKET_PERSISTED
-  QUESTION_PINNED
-  CHAIN_SUBMITTED
-  CHAIN_CONFIRMED
-  TRACE_PERSISTED
-  TRACE_PINNED
-  TRACE_PUBLISHED
-  COMPLETED
-  SKIPPED
-  NEEDS_ATTENTION
-  CANCELLED
-}
-
 enum TraceAuditStatus {
   VERIFIED
   HASH_MISMATCH
@@ -154,52 +136,11 @@ enum TraceAuditStatus {
   NOT_ON_CHAIN
   FOREIGN_AGENT
   ARCHIVED
-  SIGNATURE_INVALID
-  UNSIGNED
 }
 
 enum AgentType {
   MARKET_MAKER
   TRADER
-}
-
-enum AgentDecisionKind {
-  BUY
-  SKIP
-  HEDGE
-  STOP_LOSS
-  DRAWDOWN_PAUSE
-  TREASURY_READ_FAILED
-  MARKET_SKIP
-  MARKET_CREATED
-}
-
-enum AgentDecisionReason {
-  TREASURY_READ_FAILED
-  DRAWDOWN_LIMIT
-  STOP_LOSS_TRIGGERED
-  HEDGE_EXECUTED
-  HEDGE_FAILED
-  POSITION_ALREADY_OPEN
-  MARKET_NOT_ON_CHAIN
-  PRICE_STALE
-  FORECAST_UNAVAILABLE
-  EDGE_BELOW_MIN
-  SIZE_ZERO_WIDE_CI
-  SIZE_BELOW_MIN
-  BUY_ACCEPTED
-  BUY_REJECTED
-  PRICE_SOURCE_DOWN
-  MARKET_ANALYSIS_FAILED
-  AGENT_PAUSED
-  NO_SIGNALS
-  LLM_BUDGET_EXCEEDED
-  MARKET_GENERATION_FAILED
-  PROPOSAL_UNRESOLVABLE
-  DUPLICATE_PROPOSAL
-  SEED_POLICY_SKIP
-  MARKET_CREATED
-  CYCLE_FAILED
 }
 
 enum LogLevel {
@@ -240,10 +181,6 @@ model User {
   refunds       Refund[]
   entitlementTokens EntitlementToken[]
   x402Settlements X402Settlement[]
-  premiumDevices PremiumDevice[]
-  premiumUsageDaily PremiumUsageDaily[]
-  allowanceDays    AllowanceDay[]
-  allowanceCharges AllowanceCharge[]
 
   @@index([walletAddress])
   @@map("users")
@@ -290,20 +227,8 @@ model Market {
   resolutionHash     String?
   /// Revealed preimage of resolutionHash, kept so it can be registered with the resolver.
   resolutionSpec     Json?
-  /// Commitment scheme used to compute resolutionHash: 'legacy' | 'v2' | 'scaled' | 'twap' (ADR 0004).
-  /// CHECK: markets_resolution_scheme_values (resolution_scheme IN ('legacy','v2','scaled','twap'))
-  resolutionScheme   String    @default("legacy") @map("resolution_scheme")
-  /// Random 32-byte salt (hex) for V2 commitments. NULL for legacy/scaled/twap.
-  /// Never served in API responses before reveal.
-  resolutionSalt     String? @map("resolution_salt")
-  /// sha256(STELLAR_NETWORK_PASSPHRASE) hex — binds V2 hashes to a network.
-  resolutionNetworkId String? @map("resolution_network_id")
-  /// Contract address of the market-core this hash was committed against (V2 only).
-  resolutionMarketCore String? @map("resolution_market_core")
   /// Seed policy inputs, bounds, binding constraint and expected LP loss (#82).
   seedPolicy         Json?
-  /// Cross-source corroboration verdict (#228): { kind, corroborators, policy, checkedAt }. Null for markets created before the gate.
-  corroboration      Json?
   /// Highest ledger whose chain state this row reflects; guards writes from the indexer and the reconciler (#83).
   chainSyncedLedger  Int?
   lastReconciledAt   DateTime?          @db.Timestamptz(3)
@@ -326,7 +251,6 @@ model Market {
   hedgePositions Position[]          @relation("MarketHedgePositions")
   reasoningTraces ReasoningTrace[]
   copyTrades     CopyTrade[]
-  agentDecisions AgentDecision[]
   agentLogs      AgentLog[]
   creationAttempt MarketCreationAttempt?
 
@@ -356,27 +280,6 @@ model MarketGenerationJob {
   @@map("market_generation_jobs")
 }
 
-model MarketGenerationRun {
-  id            String            @id @default(uuid())
-  trigger       String
-  state         GenerationRunState @default(STARTED)
-  attempts      Int               @default(0)
-  nextAttemptAt DateTime?
-  lockedBy      String?
-  lockedUntil   DateTime?
-  inputs        Json?
-  outputs       Json              @default("{}")
-  marketId      String?           @unique
-  lastError     Json?
-  createdAt     DateTime          @default(now())
-  updatedAt     DateTime          @updatedAt
-
-  market Market? @relation(fields: [marketId], references: [id], onDelete: SetNull)
-
-  @@index([state, nextAttemptAt])
-  @@map("market_generation_runs")
-}
-
 /// Individual trade executed by the Trader Agent
 model Trade {
   id           String         @id @default(uuid())
@@ -385,16 +288,6 @@ model Trade {
   status       TradeStatus    @default(PENDING)
   /// CHECK: trades_amount_nonneg (amount >= 0)
   amount       Float
-  /// Exact requested collateral in 7-decimal USDC base units.
-  amountRaw    Decimal?       @db.Decimal(39, 0)
-  /// Chain-confirmed collateral, shares, and fee for the executed buy.
-  collateralRaw Decimal?      @db.Decimal(39, 0)
-  sharesRaw    Decimal?       @db.Decimal(39, 0)
-  feeRaw       Decimal?       @db.Decimal(39, 0)
-  /// Decision price and edge in basis points; fill price comes from chain evidence.
-  priceBps     Int?
-  fillPriceBps Int?
-  edgeBps      Int?
   price        Float
   edgeDetected Float
   kellyFraction Float
@@ -404,11 +297,6 @@ model Trade {
   innerTxHash  String?
   builderFee   Float          @default(0)
   errorMessage String?
-  /// Execution bounds (#245). CHECK: trades_limit_price_bps_range (limitPriceBps IS NULL OR between 1 and 10000)
-  limitPriceBps  Int?
-  /// Ledger close time (unix seconds) after which the trade must not execute.
-  deadline       BigInt?
-  decisionLedger Int?
   executedAt   DateTime?
   createdAt    DateTime       @default(now())
   updatedAt    DateTime       @updatedAt
@@ -416,7 +304,6 @@ model Trade {
   market     Market      @relation(fields: [marketId], references: [id], onDelete: Cascade)
   position   Position?
   copyTrades CopyTrade[]
-  agentDecisions AgentDecision[]
 
   @@index([marketId])
   @@index([status])
@@ -439,8 +326,6 @@ model Position {
   pnl          Float          @default(0)
   /// Outcome shares held, from agent_buy's result (i128 base units, #77/#78). Null: legacy row.
   sharesRaw    Decimal?       @db.Decimal(39, 0)
-  /// Entry price of the held outcome in basis points.
-  entryPriceBps Int?
   /// Collateral paid for the shares still held (base units). Reduced pro rata by partial exits.
   costBasisRaw Decimal?       @db.Decimal(39, 0)
   feesPaidRaw  Decimal?       @db.Decimal(39, 0)
@@ -458,6 +343,8 @@ model Position {
   /// The pool could not absorb a sale of all shares, so liquidation value is 0.
   illiquid           Boolean   @default(false)
   hedgeMarketId String?
+  /// Reasoning trace that led to the confirmed buy.
+  entryTraceId  String?
   closedAt     DateTime?
   closeReason  String?
   createdAt    DateTime       @default(now())
@@ -467,7 +354,6 @@ model Position {
   hedgeMarket Market? @relation("MarketHedgePositions", fields: [hedgeMarketId], references: [id], onDelete: SetNull)
   trade       Trade   @relation(fields: [tradeId], references: [id], onDelete: Cascade)
   exits       PositionExit[]
-  agentDecisions AgentDecision[]
 
   @@index([marketId])
   @@index([status])
@@ -485,16 +371,14 @@ model PositionExit {
   maxSharesInRaw   Decimal  @db.Decimal(39, 0)
   /// collateralOut / sharesSold, for display.
   effectivePrice   Float?
-  effectivePriceBps Int?
   txHash           String?
   reason           String
   /// SUBMITTED | CONFIRMED | FAILED | SIMULATED
   status           String
   error            String?
-  /// Execution bounds (#245). CHECK: position_exits_limit_price_bps_range (limitPriceBps IS NULL OR between 1 and 10000)
-  limitPriceBps    Int?
-  deadline         BigInt?
-  decisionLedger   Int?
+  /// Deterministic decision inputs captured before submission.
+  context          Json?
+  traceId          String?  @unique
   createdAt        DateTime @default(now())
 
   position Position @relation(fields: [positionId], references: [id], onDelete: Cascade)
@@ -549,9 +433,6 @@ model ReasoningTrace {
   sourcesUsed         Json              // Array<{ source, weight, signal }>
   /// CHECK: reasoning_traces_prob_est_range (probabilityEstimate >= 0 AND probabilityEstimate <= 1)
   probabilityEstimate Float
-  /// The forecaster's probability before recalibration (#244); calibration fits read this.
-  /// CHECK: reasoning_traces_raw_prob_est_range (rawProbabilityEstimate IS NULL OR between 0 and 1)
-  rawProbabilityEstimate Float?
   /// CHECK: reasoning_traces_market_prob_range (marketProbability >= 0 AND marketProbability <= 1)
   marketProbability   Float
   edge                Float
@@ -564,7 +445,6 @@ model ReasoningTrace {
   provenance          Json?
   agentWallet         String?
   signature           String?
-  signingKey          String?           @db.Char(64)
   ipfsCid             String?
   /// CHECK: reasoning_traces_trace_hash_format (traceHash IS NULL OR 64 hex chars)
   /// sha256 (hex) of the exact bytes pinned to IPFS.
@@ -582,19 +462,15 @@ model ReasoningTrace {
   previewSources      Json?             // First 2 sources (free preview)
   lastAuditStatus     TraceAuditStatus?
   lastAuditedAt       DateTime?
-  /// Source weight set version the evidence was scored with (#223); null = before #223 (v0).
-  sourceWeightSetVersion Int?
   createdAt           DateTime          @default(now())
   updatedAt           DateTime          @updatedAt
 
   market        Market         @relation(fields: [marketId], references: [id], onDelete: Cascade)
   copyTrades    CopyTrade[]
-  agentDecisions AgentDecision[]
   subscriptions Subscription[]
   paymentEvents PaymentEvent[]
   audits        TraceAudit[]
   publication   TracePublication?
-  traceKey      TraceKey?
 
   @@index([marketId])
   @@index([ipfsCid])
@@ -605,24 +481,6 @@ model ReasoningTrace {
   /// Retention (#73) keeps signals cited by a trace: `sourcesUsed @> [{"signalId": …}]`.
   @@index([sourcesUsed(ops: JsonbPathOps)], type: Gin)
   @@map("reasoning_traces")
-}
-
-enum TraceContentMode {
-  PLAINTEXT_LEGACY
-  ENCRYPTED
-}
-
-/// Wrapped per-trace content key for ENCRYPTED traces (#154).
-model TraceKey {
-  traceId       String   @id
-  kid           String
-  wrappedKey    Bytes
-  plaintextHash String   @db.VarChar(64)
-  createdAt     DateTime @default(now())
-
-  trace ReasoningTrace @relation(fields: [traceId], references: [id], onDelete: Cascade)
-
-  @@map("trace_keys")
 }
 
 /// Daily calibration metrics per slice (#68). Append-only; the API serves the latest computedAt.
@@ -645,7 +503,6 @@ model CalibrationSnapshot {
 model CopyTrade {
   id                   String          @id @default(uuid())
   userId               String
-  followerWallet       String
   traceId              String
   marketId             String
   tradeId              String?
@@ -654,7 +511,6 @@ model CopyTrade {
   amount               Float
   /// CHECK: copy_trades_amount_raw_digits (amountRaw IS NULL OR digits only)
   amountRaw            String?
-  priceBps             Int?
   /// CHECK: copy_trades_tx_hash_format (txHash IS NULL OR 64 hex chars)
   txHash               String?         @unique
   builderFee           Float           @default(0)
@@ -676,75 +532,12 @@ model CopyTrade {
   trace  ReasoningTrace @relation(fields: [traceId], references: [id], onDelete: Restrict)
   market Market         @relation(fields: [marketId], references: [id], onDelete: Restrict)
   trade  Trade?         @relation(fields: [tradeId], references: [id])
-  audits CopyTradeAudit[]
 
   @@index([userId])
-  @@index([followerWallet, status])
   @@index([traceId])
   @@index([status])
   @@index([status, expiresAt])
   @@map("copy_trades")
-}
-
-/// Audit trail for a copy intent fulfilled after its normal expiry window.
-model CopyTradeAudit {
-  id           String          @id @default(uuid())
-  copyTradeId  String
-  fromStatus   CopyTradeStatus
-  toStatus     CopyTradeStatus
-  txHash       String
-  chainEventId String
-  reason       String
-  createdAt    DateTime        @default(now())
-
-  copyTrade CopyTrade @relation(fields: [copyTradeId], references: [id], onDelete: Cascade)
-
-  @@index([copyTradeId, createdAt])
-  @@map("copy_trade_audits")
-}
-
-/// Durable report for buy events that fit multiple indistinguishable intents.
-model CopyTradeAmbiguity {
-  id                    String   @id @default(uuid())
-  chainEventId          String   @unique
-  txHash                String
-  candidateCopyTradeIds Json
-  reason                String
-  createdAt             DateTime @default(now())
-
-  @@index([createdAt])
-  @@map("copy_trade_ambiguities")
-}
-
-/// One typed decision record from a trader or market-maker cycle.
-model AgentDecision {
-  id            String              @id @default(uuid())
-  decisionKey   String              @unique
-  cycleId       String
-  agentType     AgentType
-  kind          AgentDecisionKind
-  reasonCode    AgentDecisionReason
-  marketId      String?
-  traceId       String?
-  tradeId       String?
-  positionId    String?
-  forecastRef   String?
-  inputsDigest  String
-  inputs        Json
-  sizingRecord  Json?
-  outcome       Json?
-  createdAt     DateTime            @default(now())
-
-  market   Market?         @relation(fields: [marketId], references: [id], onDelete: SetNull)
-  trace    ReasoningTrace? @relation(fields: [traceId], references: [id], onDelete: SetNull)
-  trade    Trade?          @relation(fields: [tradeId], references: [id], onDelete: SetNull)
-  position Position?       @relation(fields: [positionId], references: [id], onDelete: SetNull)
-
-  @@index([cycleId, agentType, createdAt])
-  @@index([cycleId, marketId])
-  @@index([marketId, createdAt])
-  @@index([reasonCode, createdAt])
-  @@map("agent_decisions")
 }
 
 /// Nanopayment subscription for trace access
@@ -755,13 +548,7 @@ model Subscription {
   type       SubscriptionType
   status     SubscriptionStatus @default(ACTIVE)
   /// CHECK: subscriptions_amount_paid_nonneg (amountPaid >= 0)
-  /// Display mirror only; DEFAULT 0 once PAYMENT_FLOAT_WRITES=false (#224).
-  /// Dropped by the pending contract migration (prisma/migrations-pending).
-  amountPaid Float              @default(0)
-  /// Exact amount paid in USDC base units (#224). NULL only on legacy rows
-  /// until scripts/backfill-payment-raw.ts fills them.
-  /// CHECK: subscriptions_amount_paid_raw_nonneg (NOT VALID until contract)
-  amountPaidRaw Decimal?        @db.Decimal(39, 0)
+  amountPaid Float
   currency   SettlementCurrency @default(USDC)
   /// CHECK: subscriptions_tx_hash_format (txHash IS NULL OR 64 hex chars)
   txHash     String?            @unique
@@ -1021,8 +808,7 @@ model PaymentEvent {
   /// CHECK: payment_events_tx_hash_format (64 hex chars)
   txHash        String             @unique
   type          PaymentEventType
-  /// Display mirror only; DEFAULT 0 once PAYMENT_FLOAT_WRITES=false (#224).
-  amount        Float              @default(0)
+  amount        Float
   /// CHECK: payment_events_amount_raw_digits (amountRaw IS NULL OR digits only)
   amountRaw     String?
   fromAddress   String?
@@ -1037,6 +823,7 @@ model PaymentEvent {
   allowanceOverageRaw Decimal?     @db.Decimal(39, 0)
   /// Server-issued intent that settled this payment (#52).
   paymentIntentId String?          @unique
+  priceScheduleVersion Int?
   metadata      Json?
   createdAt     DateTime           @default(now())
   confirmedAt   DateTime?
@@ -1047,8 +834,7 @@ model PaymentEvent {
   refund Refund?
 
   @@index([userId])
-  @@index([txHash])
-  @@map("payment_events")
+
 }
 
 // User-defined spending approvals for nanopayment trace access
@@ -1056,24 +842,19 @@ model SpendingAllowance {
   id            String             @id @default(uuid())
   userId        String             @unique
   /// CHECK: spending_allowances_daily_limit_nonneg (dailyLimit >= 0)
-  /// Float mirrors below default to 0 once PAYMENT_FLOAT_WRITES=false (#224).
-  dailyLimit    Float              @default(0)
+  dailyLimit    Float
   /// CHECK: spending_allowances_per_trace_limit_nonneg (perTraceLimit >= 0)
-  perTraceLimit Float              @default(0)
+  perTraceLimit Float
   /// CHECK: spending_allowances_spent_today_nonneg (spentToday >= 0)
-  /// Deprecated (#219): display mirror of spentTodayRaw; see below.
   spentToday    Float              @default(0)
   /// Exact base-unit accounting (#53). The Float columns above are display
   /// mirrors; limits and spend are never enforced from them.
   dailyLimitRaw    Decimal          @default(0) @db.Decimal(39, 0)
   perTraceLimitRaw Decimal          @default(0) @db.Decimal(39, 0)
-  /// Deprecated (#219): per-day spend lives in allowance_days. Still written,
-  /// but only for charges whose ledger day is the current UTC day.
   spentTodayRaw    Decimal          @default(0) @db.Decimal(39, 0)
-  /// Lifetime amount accepted while already at the limit; never silently
-  /// discarded. allowance_days.overageRaw holds the per-day split (#219).
+  /// Amount accepted while already at the limit; never silently discarded.
   overageRaw       Decimal          @default(0) @db.Decimal(39, 0)
-  /// Deprecated (#219): UTC day spentTodayRaw belongs to.
+  /// UTC day the raw counters belong to.
   windowStartedAt  DateTime         @default(now())
   currency      SettlementCurrency @default(USDC)
   lastResetAt   DateTime           @default(now())
@@ -1088,69 +869,6 @@ model SpendingAllowance {
   @@map("spending_allowances")
 }
 
-/// Per-user, per-UTC-day allowance bucket (#219). A charge lands on the UTC
-/// day of its transfer's ledger close time, not the day it was claimed, so a
-/// late claim never touches the following day. The row lock on a bucket
-/// serialises every writer for that user and day (pass claims, payment
-/// intents, x402 reserve/commit/release and the expiry sweep). Lock order:
-/// allowance_charges row, then buckets by ascending day, then
-/// spending_allowances.
-model AllowanceDay {
-  userId      String
-  day         DateTime @db.Date
-  /// CHECK: allowance_days_amounts_nonneg (spentRaw, reservedRaw, overageRaw >= 0)
-  /// Booked within the daily limit (never above it while a limit is active).
-  spentRaw    Decimal  @default(0) @db.Decimal(39, 0)
-  /// Held by open x402 reservations made on this day.
-  reservedRaw Decimal  @default(0) @db.Decimal(39, 0)
-  /// Accepted beyond the daily limit on this day (#53 semantics).
-  overageRaw  Decimal  @default(0) @db.Decimal(39, 0)
-  updatedAt   DateTime @updatedAt
-
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@id([userId, day])
-  @@map("allowance_days")
-}
-
-/// One durable row per allowance charge or x402 reservation (#219).
-/// RESERVED rows hold budget in allowance_days.reservedRaw until committed,
-/// released or expired by the sweep. `reservationKey` is the reserve
-/// idempotency key (`<payer identityKey>|<nonce>`), unique so a retried
-/// reserve returns the same reservation.
-model AllowanceCharge {
-  id               String    @id @default(uuid())
-  userId           String
-  /// Ledger-close UTC day once COMMITTED; the reservation day while RESERVED.
-  day              DateTime  @db.Date
-  /// CHECK: allowance_charges_source_values (source IN ('PASS_CLAIM','PAYMENT_INTENT','X402'))
-  /// PASS_CLAIM | PAYMENT_INTENT | X402
-  source           String
-  /// CHECK: allowance_charges_status_values (status IN ('RESERVED','COMMITTED','RELEASED','EXPIRED'))
-  /// CHECK: allowance_charges_reserved_expiry (status <> 'RESERVED' OR expiresAt IS NOT NULL)
-  /// RESERVED | COMMITTED | RELEASED | EXPIRED
-  status           String
-  /// CHECK: allowance_charges_tx_hash_format (txHash IS NULL OR 64 hex chars)
-  txHash           String?   @unique
-  reservationKey   String?   @unique
-  traceId          String?
-  /// CHECK: allowance_charges_amounts_nonneg (amountRaw >= 0 AND overageRaw >= 0)
-  amountRaw        Decimal   @db.Decimal(39, 0)
-  overageRaw       Decimal   @default(0) @db.Decimal(39, 0)
-  perTraceExceeded Boolean   @default(false)
-  /// The day came from the wall clock because the close time was unknown.
-  dayInferred      Boolean   @default(false)
-  expiresAt        DateTime?
-  createdAt        DateTime  @default(now())
-  updatedAt        DateTime  @default(now()) @updatedAt
-
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([userId, day])
-  @@index([status, expiresAt])
-  @@map("allowance_charges")
-}
-
 // ─────────────────────────── PRICING SCHEDULE ───────────────────────────
 model PriceSchedule {
   id                String   @id @default(cuid())
@@ -1161,6 +879,7 @@ model PriceSchedule {
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
   @@map("price_schedules")
+  @@unique([effectiveAt])
 }
 
 /// Exact bytes of IPFS documents the backend pinned or verified (#100).
@@ -1602,6 +1321,7 @@ model PaymentIntent {
   status          PaymentIntentStatus @default(OPEN)
   type            SubscriptionType    @default(DAILY_PASS)
   amountRaw       Decimal             @db.Decimal(39, 0)
+  priceScheduleVersion Int?
   currency        SettlementCurrency  @default(USDC)
   recipient       String
   token           String
@@ -1675,40 +1395,22 @@ model DisputeReview {
   acknowledgedAt     DateTime?
   /// FINALIZED | CANCELLED | null
   resolvedAs         String?
-  /// Market category at review time, for calibration slicing (#247).
-  category           MarketCategory?
-  /// LlmProvenance JSON returned by callLLMStructured (#247).
-  evaluatorProvenance Json? @map("evaluator_provenance")
-  /// 'primary' | 'news' | 'none' — derived from evidence.items (#247).
-  evidenceClass      String? @map("evidence_class")
-  /// 'YES' | 'NO' | 'VOID' — set by labelReviews once the market is final (#247).
-  finalOutcome       String? @map("final_outcome")
-  /// True when proposedOutcome === finalOutcome for FINALIZED reviews (#247).
-  proposalCorrect    Boolean? @map("proposal_correct")
-  /// Set when this review has been labelled against chain-final ground truth (#247).
-  labelledAt         DateTime? @map("labelled_at") @db.Timestamptz(6)
   createdAt          DateTime  @default(now())
   updatedAt          DateTime  @updatedAt
 
   @@index([verdict])
   @@index([onChainMarketId])
-  @@index([labelledAt], map: "dispute_reviews_labelled_at_idx")
   @@map("dispute_reviews")
 }
 
 /// One alert sent (or attempted) for a review, deduplicated by `dedupeKey`.
 model AlertDelivery {
   id        String    @id @default(uuid())
-  /// Dispute review (#92). Null for operational alerts (#226).
-  reviewId  String?
-  /// Operational incident (#226). Null for dispute alerts.
-  incidentId String?
-  /// open | escalate | resolve. Dispute rows are all `open`.
-  kind      String    @default("open")
+  reviewId  String
   /// INFO | WARN | CRITICAL
   level     String
   sink      String
-  /// Dispute: reviewId:level:sink. Incident: inc:<incidentId>:<episode>:<kind>:<severity>:<sink>.
+  /// reviewId:level:sink
   dedupeKey String    @unique
   /// SENT | FAILED
   status    String
@@ -1720,367 +1422,46 @@ model AlertDelivery {
   @@map("alert_deliveries")
 }
 
-/// Operational alert incident (#226): one row per (subjectType, subjectKey),
-/// re-opened as a new episode after it resolves. Hysteresis streaks live here
-/// so any instance can take over evaluation.
-model AlertIncident {
-  id             String    @id @default(uuid())
-  /// agent_pause | outbox_stuck | outbox_unhandled | cron_failing | reconcile_drift
-  subjectType    String
-  /// e.g. TRADER:failure_breaker, outbox:trade.buy, cron:trader, drift:status
-  subjectKey     String
-  /// INFO | WARN | CRITICAL
-  severity       String
-  /// PENDING (bad, below ALERT_OPEN_AFTER) | OPEN | RESOLVED
-  state          String    @default("PENDING")
-  /// Incremented on every open; part of the delivery dedupe key. 0 = never opened.
-  episode        Int       @default(0)
-  summary        String
-  detail         Json?
-  badStreak      Int       @default(0)
-  goodStreak     Int       @default(0)
-  openedAt       DateTime? @db.Timestamptz(3)
-  resolvedAt     DateTime? @db.Timestamptz(3)
-  ackedAt        DateTime? @db.Timestamptz(3)
-  ackedBy        String?
-  silencedUntil  DateTime? @db.Timestamptz(3)
-  lastNotifiedAt DateTime? @db.Timestamptz(3)
-  /// Escalations sent in the current episode.
-  escalations    Int       @default(0)
-  createdAt      DateTime  @default(now()) @db.Timestamptz(3)
-  updatedAt      DateTime  @updatedAt @db.Timestamptz(3)
-
-  @@unique([subjectType, subjectKey])
-  @@index([state, severity])
-  @@map("alert_incidents")
-}
-
-/// Cluster-wide cron run record (#226), next to the per-instance in-memory
-/// registry, so failure streaks are visible to the alert evaluator.
-model CronRunStatus {
-  job           String    @id
-  lastSuccessAt DateTime? @db.Timestamptz(3)
-  lastFailureAt DateTime? @db.Timestamptz(3)
-  /// Consecutive failures since the last success, across instances.
-  failureStreak Int       @default(0)
-  lastError     String?
-  updatedAt     DateTime  @updatedAt @db.Timestamptz(3)
-
-  @@map("cron_runs")
-}
-
-/// Per-wallet open position for a prediction market outcome (#155).
-/// PK matches wallet_positions_pkey from 20261017100002_wallet_pnl.
-model WalletPosition {
-  wallet          String
-  onChainMarketId BigInt
-  outcome         String
-  shares          Decimal  @default(0) @db.Decimal(39, 0)
-  costBasis       Decimal  @default(0) @db.Decimal(39, 0)
-  realizedPnl     Decimal  @default(0) @db.Decimal(39, 0)
-  boughtCollateral Decimal @default(0) @db.Decimal(39, 0)
-  soldCollateral  Decimal  @default(0) @db.Decimal(39, 0)
-  feesPaid        Decimal  @default(0) @db.Decimal(39, 0)
-  redeemed        Decimal  @default(0) @db.Decimal(39, 0)
-  tradeCount      Int      @default(0)
-  lastEventId     String   @default("")
-  settled         Boolean  @default(false)
-  incomplete      Boolean  @default(false)
-  /// Plain column default — NOT @updatedAt; the service writes this explicitly.
-  updatedAt       DateTime @default(now()) @db.Timestamp(3)
-
-  @@id([wallet, onChainMarketId, outcome], map: "wallet_positions_pkey")
-  @@index([onChainMarketId], map: "wallet_positions_onChainMarketId_idx")
-  @@map("wallet_positions")
-}
-
-/// Daily aggregate stats per wallet and category (#155).
-model WalletStatsDaily {
-  wallet      String
-  day         DateTime @db.Date
-  category    String
-  volume      Decimal  @default(0) @db.Decimal(39, 0)
-  realizedPnl Decimal  @default(0) @db.Decimal(39, 0)
-  fees        Decimal  @default(0) @db.Decimal(39, 0)
-  trades      Int      @default(0)
-  wins        Int      @default(0)
-  losses      Int      @default(0)
-
-  @@id([wallet, day, category], map: "wallet_stats_daily_pkey")
-  @@index([day], map: "wallet_stats_daily_day_idx")
-  @@map("wallet_stats_daily")
-}
-
-/// Deduplication log — one row per trade event already applied (#155).
-model WalletEventApplied {
-  eventId   String   @id(map: "wallet_events_applied_pkey")
-  appliedAt DateTime @default(now()) @db.Timestamp(3)
-
-  @@map("wallet_events_applied")
-}
-
-/// Markets flagged for PnL recalculation (#155).
-model WalletPnlDirtyMarket {
-  onChainMarketId BigInt   @id(map: "wallet_pnl_dirty_markets_pkey")
-  dirtiedAt       DateTime @default(now()) @db.Timestamp(3)
-  reason          String?
-
-  @@map("wallet_pnl_dirty_markets")
-}
-
-/// Short-lived exclusive hold on a question that prevents concurrent cycles
-/// from creating duplicate markets. Rows are HELD until the market is inserted
-/// (then COMMITTED), or released on skip/abort/failure.
-model MarketReservation {
-  id              String    @id @default(uuid())
-  cycleId         String
-  question        String
-  /// sha256(exactKey(question, expiryDay)) — partial unique index enforced in SQL
-  questionKey     String
-  category        MarketCategory
-  expiryTimestamp DateTime  @db.Timestamptz(3)
-  embeddingModel  String?
-  /// JSON array of numbers; compared in-process, never indexed
-  embeddingVector Json?
-  /// HELD | COMMITTED | RELEASED
-  status          String
-  marketId        String?   @unique
-  leaseUntil      DateTime  @db.Timestamptz(3)
-  createdAt       DateTime  @default(now())
-
-  @@index([status, leaseUntil])
-  @@map("market_reservations")
-}
-
-model PortfolioRiskSnapshot {
-  id                     String   @id @default(uuid())
-  computedAt             DateTime @default(now()) @db.Timestamptz(3)
-  correlationSnapshotId  String?
-  inputsHash             String
-  paths                  Int
-  metrics                Json
-  flags                  Json
-  durationMs             Int
-
-  @@index([computedAt])
-  @@map("portfolio_risk_snapshots")
-}
-
-/// Tracks premium session devices per user to enforce the concurrent-device cap (#288).
-model PremiumDevice {
-  id            String    @id @default(uuid())
-  userId        String
-  /// sha-256(deviceKey) so the raw secret never touches the DB
-  deviceKeyHash String
-  label         String    @default("Device")
-  /// Session ids (JWT `sid`) that first registered and last used the device.
-  firstSid      String
-  lastSid       String
-  /// Salted hash of the client IP prefix (hashClientIp); never the raw IP.
-  ipPrefixHash  String?
-  lastSeenAt    DateTime  @default(now()) @db.Timestamptz(3)
-  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
-  /// Set when the device is evicted (LRU) or revoked; a fresher login re-admits it.
-  revokedAt     DateTime? @db.Timestamptz(3)
-  /// EVICTED_LRU | USER_REVOKED | ADMIN @db.Timestamptz(3)
-  revokeReason  String?
-
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@unique([userId, deviceKeyHash])
-  @@index([userId, lastSeenAt])
-  @@map("premium_devices")
-}
-
-/// Per-user, per-day premium usage budget (#288).
-model PremiumUsageDaily {
-  id                 String   @id @default(uuid())
-  userId             String
-  day                DateTime @db.Date
-  premiumReads       Int      @default(0)
-  keyReleases        Int      @default(0)
-  devicesEvicted     Int      @default(0)
-  distinctIpPrefixes Int      @default(0)
-  updatedAt          DateTime @updatedAt @db.Timestamptz(3)
-
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@unique([userId, day])
-  @@index([distinctIpPrefixes])
-  @@map("premium_usage_daily")
-}
-
-/// Market generation saga state (#152, #242). TRACE_PINNED / TRACE_PUBLISHED
-/// are legacy: the saga maps them to TRACE_ENQUEUED on resume.
-enum GenerationRunState {
-  STARTED
-  SIGNALS_READY
-  PROPOSED
-  MARKET_PERSISTED
-  QUESTION_PINNED
-  CHAIN_SUBMITTED
-  CHAIN_CONFIRMED
-  TRACE_PERSISTED
-  TRACE_PINNED
-  TRACE_PUBLISHED
-  COMPLETED
-  SKIPPED
-  NEEDS_ATTENTION
-  CANCELLED
-  GATED
-  VALIDATED
-  SEED_PLANNED
-  TRACE_ENQUEUED
-}
-
-/// One market-generation saga run (#242). Every step persists its outputs
-/// before the next side effect; `fence` increments on every claim so a worker
-/// whose lease expired can no longer write step results.
-model MarketGenerationRun {
-  id            String             @id @default(uuid())
-  trigger       String
-  state         GenerationRunState @default(STARTED)
-  attempts      Int                @default(0)
-  nextAttemptAt DateTime?
-  lockedBy      String?
-  lockedUntil   DateTime?
-  fence         Int                @default(0)
-  cycleId       String?
-  inputs        Json?
-  outputs       Json               @default("{}")
-  marketId      String?            @unique
-  market        Market?            @relation(fields: [marketId], references: [id], onDelete: SetNull)
-  lastError     Json?
-  createdAt     DateTime           @default(now())
-  updatedAt     DateTime           @default(now()) @updatedAt
-
-  @@index([state, nextAttemptAt])
-  @@map("market_generation_runs")
-}
-
-/// Fitted per-category recalibration maps (#244). One active row per
-/// (agentType, category); superseded versions stay for audit. `id` is the
-/// map's content hash, so a refit from the same inputs reproduces it.
-model RecalibrationMapRow {
-  id         String   @id
-  agentType  String
-  category   String
-  version    Int
-  params     Json
-  fittedFrom Json
-  active     Boolean  @default(true)
-  createdAt  DateTime @default(now()) @db.Timestamptz(3)
-
-  @@unique([agentType, category, version])
-  @@index([agentType, category, active])
-  @@map("recalibration_maps")
-}
-
-/// Per-signer single-use SEP-7 signing request (#270). Raw callback tokens are
-/// never persisted — only their SHA-256 hex digest (`tokenHash`).
-model Sep7Request {
-  id          String    @id @default(uuid())
-  operationId String
-  signer      String
-  tokenHash   String    @unique
-  status      String    @default("ISSUED")
-  uri         String
-  expiresAt   DateTime
-  usedAt      DateTime?
-  rejectCode  String?
-  createdAt   DateTime  @default(now())
-
-  @@unique([operationId, signer])
-  @@map("sep7_requests")
-}
-
-enum IpfsPinState {
-  PENDING
-  PINNING
-  PINNED
-  MISSING
-  FAILED
-}
-
-/// Per-CID, per-provider replication state for anchored IPFS documents (#271).
+/// Remote IPFS pin ledger (#328): one row per CID pinned at the provider.
+/// A pin is only unpinned by the GC job when it has no live owner reference.
 model IpfsPin {
-  cid           String
-  provider      String
-  state         IpfsPinState @default(PENDING)
-  attempts      Int          @default(0)
-  lastError     String?
-  lastCheckedAt DateTime?
-  pinnedAt      DateTime?
+  cid            String    @id
+  sha256         String
+  size           Int
+  /// pinata | local
+  provider       String
+  /// PINNING | PINNED | UNPIN_PENDING | UNPINNED | FAILED
+  status         String
+  /// Set when a new pin of the CID arrives while an unpin is in flight.
+  repinRequested Boolean   @default(false)
+  pinnedAt       DateTime?
+  unpinnedAt     DateTime?
+  lastError      String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  refs           IpfsPinRef[]
 
-  @@id([cid, provider])
+  @@index([status])
   @@map("ipfs_pins")
 }
 
-/// Learned signal source/publisher weights (#223). DRAFT → APPROVED → ACTIVE →
-/// RETIRED; at most one ACTIVE row (raw-SQL partial unique index
-/// source_weight_sets_active_key). Written by `npm run weights:estimate -- --save`.
-model SourceWeightSet {
-  id          String    @id @default(uuid())
-  version     Int       @unique
-  /// DRAFT | APPROVED | ACTIVE | RETIRED
-  status      String    @default("DRAFT")
-  /// { "source:NEWSAPI": 0.64, "publisher:reuters.com": 0.81 }
-  weights     Json
-  /// { key: { lower, upper, nEff, nMarkets, insufficient, ... } }
-  intervals   Json
-  /// { priorSd, window, cutoff, inputDigest, heldOutDeltaLogLoss, regression, ... }
-  method      Json
-  parentId    String?
-  createdBy   String
-  approvedBy  String?
-  activatedAt DateTime? @db.Timestamptz(3)
-  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+/// One use of a pinned CID by a market question or a reasoning trace (#328).
+model IpfsPinRef {
+  id         String    @id @default(uuid())
+  cid        String
+  /// MARKET_QUESTION | TRACE
+  ownerKind  String
+  ownerId    String
+  /// CANDIDATE | ANCHORED | RELEASED
+  state      String    @default("CANDIDATE")
+  anchoredAt DateTime?
+  /// e.g. "market:42", "trace:17".
+  anchor     String?
+  createdAt  DateTime  @default(now())
+  pin        IpfsPin   @relation(fields: [cid], references: [cid])
 
-  @@map("source_weight_sets")
-}
-
-/// One money-audit run (#222): invariants over trades, positions, exits and
-/// outbox rows, read from one REPEATABLE READ snapshot taken at snapshotAt.
-model MoneyAuditRun {
-  id             String    @id @default(uuid())
-  startedAt      DateTime  @default(now()) @db.Timestamptz(3)
-  finishedAt     DateTime? @db.Timestamptz(3)
-  snapshotAt     DateTime  @db.Timestamptz(3)
-  /// Highest ledger a chain read of this run observed.
-  observedLedger Int?
-  checked        Int       @default(0)
-  findings       Int       @default(0)
-  repaired       Int       @default(0)
-  rpcCalls       Int       @default(0)
-  error          String?
-
-  @@map("money_audit_runs")
-}
-
-/// One invariant violation seen by a money-audit run (#222).
-model MoneyAuditFinding {
-  id              String    @id @default(uuid())
-  runId           String
-  /// e.g. TRADE_EXECUTED_WITHOUT_OUTBOX
-  invariant       String
-  /// CRITICAL | HIGH | MEDIUM | INFO
-  severity        String
-  /// trade | position | exit | outbox | market_side | trace
-  subjectType     String
-  subjectId       String
-  evidence        Json
-  suggestedRepair String?
-  /// REPORTED | REPAIRED | SKIPPED_IN_FLIGHT | DEFERRED | ACKED
-  action          String
-  /// sha256(invariant|subjectId|evidence-core): carries a finding across runs.
-  fingerprint     String
-  firstSeenRunId  String
-  ackedBy         String?
-  ackedAt         DateTime? @db.Timestamptz(3)
-  createdAt       DateTime  @default(now()) @db.Timestamptz(3)
-
-  @@index([runId])
-  @@index([invariant, createdAt])
-  @@index([fingerprint])
-  @@map("money_audit_findings")
+  @@unique([cid, ownerKind, ownerId])
+  @@index([ownerKind, ownerId])
+  @@index([state])
+  @@map("ipfs_pin_refs")
 }

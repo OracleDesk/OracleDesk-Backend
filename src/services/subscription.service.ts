@@ -10,6 +10,7 @@ import type { VerifiedTransfer } from './payment-verification.service';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { config } from '../config';
+import { currentPrice, formatPrice as formatScheduledPrice, priceAt, upcomingChange } from './pricing';
 import { CONTRACTS, PAYMENTS_RECIPIENT } from '../config/contracts';
 import { decimalToBigint, formatUsdc, toDisplayUsdc } from '../lib/amounts';
 import { verifyUsdcTransfer } from './payment-verification.service';
@@ -575,10 +576,11 @@ export async function settleVerifiedTransfer(
     type: 'PER_TRACE' | 'DAILY_PASS';
     transfer: VerifiedTransfer;
     paymentIntentId?: string | null;
+    priceScheduleVersion?: number | null;
     now?: Date;
   },
 ): Promise<SettlementResult> {
-  const { userId, traceId, type, transfer, paymentIntentId } = params;
+  const { userId, traceId, type, transfer, paymentIntentId, priceScheduleVersion } = params;
   const txHash = transfer.txHash.toLowerCase();
   const now = params.now ?? new Date();
   const ledgerCloseAt = ledgerCloseDate(transfer.createdAt) ?? now;
@@ -634,6 +636,7 @@ export async function settleVerifiedTransfer(
       endsAt,
       expiresAt: endsAt,
       paymentIntentId: paymentIntentId ?? null,
+      priceScheduleVersion: priceScheduleVersion ?? null,
     },
   });
 
@@ -719,16 +722,24 @@ export async function recordPayment(params: {
           token:     CONTRACTS.usdc,
           from:      walletAddress,
           to:        PAYMENTS_RECIPIENT,
-          minAmount: DAILY_PASS_PRICE_RAW,
+          minAmount: 0n,
           subId,
           subIdKind,
         });
 
+        const quote = await priceAt(ledgerCloseDate(transfer.createdAt) ?? new Date());
+        if (transfer.amount < quote.dailyPassPriceRaw) {
+          throw new AppError(402, 'PAYMENT_INSUFFICIENT', 'Payment amount is below the daily-pass price', {
+            requiredRaw: quote.dailyPassPriceRaw.toString(),
+            priceScheduleVersion: quote.version,
+          });
+        }
         const settlement = await settleVerifiedTransfer(tx, {
           userId,
           traceId: traceId ?? null,
           type,
           transfer,
+          priceScheduleVersion: quote.version,
         });
 
         return { subscription: settlement.subscription, transfer, replay: false };
@@ -810,6 +821,8 @@ export async function getTracWithAccessControl(
     return { ...trace, audit, accessLevel: access.accessType };
   }
 
+  const dailyPass = await currentPrice();
+  const nextPrice = await upcomingChange();
   // Discover live x402 trace price (#63)
   const discovered = await discoverTracePrice(trace.onChainTraceId ?? trace.id);
   const isDiscovered = discovered.status === 'discovered';
@@ -842,8 +855,10 @@ export async function getTracWithAccessControl(
     unlockPrice:         isDiscovered ? discovered.amountUsdc : null,
     unlockPriceStatus:   discovered.status,
     paymentRequirements: isDiscovered ? discovered.requirements : null,
-    dailyPassPriceRaw:   DAILY_PASS_PRICE_RAW.toString(),
-    dailyPassPrice:      formatUsdc(DAILY_PASS_PRICE_RAW),
+    dailyPassPriceRaw:   dailyPass.dailyPassPriceRaw.toString(),
+    dailyPassPrice:      formatScheduledPrice(dailyPass.dailyPassPriceRaw),
+    priceScheduleVersion: dailyPass.version,
+    nextPriceChange: nextPrice?.effectiveAt ?? null,
   };
 }
 
