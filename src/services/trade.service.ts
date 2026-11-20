@@ -160,6 +160,19 @@ export async function executeTrade(payload: TradePayload): Promise<{
     throw new AppError(404, 'MARKET_NOT_FOUND', 'Market not found');
   }
 
+  if (market.status !== 'ACTIVE' || market.expiryTimestamp <= new Date()) {
+    throw new AppError(409, 'MARKET_NOT_TRADABLE', 'This market is closed or no longer active');
+  }
+  if (market.onChainMarketId !== null) {
+    const pendingResolution = await prisma.disputeReview.findFirst({
+      where: { onChainMarketId: market.onChainMarketId, resolvedAs: null },
+      select: { id: true },
+    });
+    if (pendingResolution) {
+      throw new AppError(409, 'MARKET_RESOLUTION_PENDING', 'Trading is paused while this market resolution is proposed or disputed');
+    }
+  }
+
   // Check existing exposure for this market
   const existingPosition = await prisma.position.findFirst({
     where: { marketId: payload.marketId, status: 'OPEN' },

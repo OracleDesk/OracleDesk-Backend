@@ -201,7 +201,13 @@ export function prodTraderEnv(): TraderEnv {
       });
       // The forecast cap (#75) goes to markets without a recent forecast, soonest close first.
       // onChainMarketId is included so the trader can gate on fresh ledger prices (#266).
-      return rankForForecast(markets.map(m => ({
+      const disputed = new Set(
+        (await prisma.disputeReview.findMany({
+          where: { onChainMarketId: { in: markets.flatMap(m => m.onChainMarketId === null ? [] : [m.onChainMarketId]) }, resolvedAs: null },
+          select: { onChainMarketId: true },
+        })).map(r => r.onChainMarketId.toString()),
+      );
+      return rankForForecast(markets.filter(m => m.onChainMarketId === null || !disputed.has(m.onChainMarketId.toString())).map(m => ({
         ...m,
         onChainMarketId: m.onChainMarketId !== null ? BigInt(m.onChainMarketId) : undefined,
       })));
