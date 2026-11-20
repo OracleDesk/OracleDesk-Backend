@@ -21,15 +21,34 @@ import { CONTRACTS } from '../config/contracts';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { resolutionHash, validateResolutionSpec, type ResolutionSpecJson } from '../lib/resolution-spec';
-import { sha256Hex } from '../utils/hash.util';
+import { canonicalBytes, sha256Hex } from '../utils/hash.util';
 import { AppError } from '../middlewares/error.middleware';
 import { baseOptions, ResolverClient, rpcServer } from './stellar/clients';
 import { contractErrorName } from './stellar/errors';
 import { getOnChainMarket, Outcomes, resolverState } from './chain.service';
 import { fetchIpfsBytes } from './ipfs.service';
+import { pinJson } from './ipfs.service';
+import { fetchEvidenceSource } from '../lib/safe-fetch';
+import { ReasoningRegistryClient } from './stellar/clients';
 
 export type SignerSpec = Extract<ResolutionSpecJson, { kind: 'signers' }>;
 export type AttestOutcome = 'YES' | 'NO';
+export type EvidenceOutcome = AttestOutcome | 'INVALID';
+
+export interface EvidenceBundleV1 {
+  version: 1;
+  kind: 'oracledesk.attestation-evidence';
+  network: string;
+  resolver: string;
+  onChainMarketId: string;
+  signer: string;
+  outcome: EvidenceOutcome;
+  question: { cid: string; sha256: string };
+  resolutionHash: string;
+  sources: Array<{ url: string; fetchedAt: string; sha256: string; contentType: string; bytes: number; cid?: string }>;
+  notes?: string;
+  createdAt: string;
+}
 
 export interface SignerContext {
   market: Market;
@@ -40,7 +59,7 @@ export interface SignerContext {
 /** What the service needs from the outside world; tests replace these. */
 export interface SignerPortalDeps {
   /** The structural subset of the resolver binding used to build an attest. */
-  clientFor(wallet: string): { attest: ResolverClient['attest'] };
+  clientFor(wallet: string): { attest: ResolverClient['attest']; attest_with_evidence?: ResolverClient['attest_with_evidence'] };
   onChainResolutionHash(onChainMarketId: bigint): Promise<string>;
   resolverState(onChainMarketId: bigint): Promise<string>;
   fetchQuestion(cid: string): Promise<Buffer>;
@@ -273,6 +292,61 @@ export async function getEvidence(marketId: string, wallet: string) {
   };
 }
 
+export async function createEvidenceBundle(
+  marketId: string,
+  wallet: string,
+  input: { outcome: EvidenceOutcome; sources: string[]; notes?: string },
+) {
+  const { market, onChainMarketId } = await assertMarketSigner(marketId, wallet);
+  if (!market.metaUri || !market.questionHash || !market.resolutionHash) throw new AppError(409, 'EVIDENCE_CONTEXT_MISSING', 'The market is missing committed evidence context');
+  const questionCid = market.metaUri.replace(/^ipfs:\/\//, '');
+  const sources = [] as EvidenceBundleV1['sources'];
+  for (const url of input.sources) {
+    const fetched = await fetchEvidenceSource(url);
+    sources.push({ url, fetchedAt: new Date().toISOString(), sha256: sha256Hex(fetched.bytes), contentType: fetched.contentType, bytes: fetched.bytes.length });
+  }
+  const bundle: EvidenceBundleV1 = {
+    version: 1, kind: 'oracledesk.attestation-evidence', network: config.STELLAR_NETWORK_PASSPHRASE,
+    resolver: CONTRACTS.resolver, onChainMarketId: onChainMarketId.toString(), signer: wallet, outcome: input.outcome,
+    question: { cid: questionCid, sha256: market.questionHash }, resolutionHash: market.resolutionHash,
+    sources, ...(input.notes ? { notes: input.notes } : {}), createdAt: new Date().toISOString(),
+  };
+  const pinned = await pinJson(bundle, `attestation-${market.id}-${wallet}-${input.outcome}`);
+  const hash = sha256Hex(canonicalBytes(bundle));
+  return prisma.attestationEvidence.upsert({
+    where: { onChainMarketId_signer_outcome_bundleHash: { onChainMarketId, signer: wallet, outcome: input.outcome, bundleHash: hash } },
+    create: { marketId: market.id, onChainMarketId, signer: wallet, outcome: input.outcome, bundleCid: pinned.cid, bundleHash: hash, bundle, status: 'BUNDLED' },
+    update: {},
+  });
+}
+
+export async function prepareEvidenceTrace(marketId: string, wallet: string, evidenceId: string) {
+  const { market, onChainMarketId } = await assertMarketSigner(marketId, wallet);
+  const evidence = await prisma.attestationEvidence.findFirst({ where: { id: evidenceId, marketId: market.id, signer: wallet } });
+  if (!evidence) throw new AppError(404, 'EVIDENCE_NOT_FOUND', 'Evidence bundle not found');
+  const client = new ReasoningRegistryClient({ ...baseOptions(CONTRACTS.reasoningRegistry), publicKey: wallet });
+  const tx = await client.publish_trace({ agent: wallet, market_id: onChainMarketId, action: 'Resolve', trace_hash: Buffer.from(evidence.bundleHash, 'hex'), ipfs_cid: evidence.bundleCid }, { timeoutInSeconds: PREPARE_TTL_SECONDS });
+  if (!tx.built) throw new AppError(502, 'PREPARE_FAILED', 'Simulation did not produce a trace transaction');
+  await prisma.attestationEvidence.update({ where: { id: evidence.id }, data: { traceTxXdr: tx.toXDR(), status: 'TRACE_PREPARED' } });
+  return { evidenceId: evidence.id, xdr: tx.toXDR(), networkPassphrase: config.STELLAR_NETWORK_PASSPHRASE };
+}
+
+export async function submitEvidenceTrace(marketId: string, wallet: string, evidenceId: string, signedXdr: string, traceId?: bigint) {
+  const { market } = await assertMarketSigner(marketId, wallet);
+  const evidence = await prisma.attestationEvidence.findFirst({ where: { id: evidenceId, marketId: market.id, signer: wallet } });
+  if (!evidence?.traceTxXdr) throw new AppError(409, 'TRACE_NOT_PREPARED', 'Prepare the evidence trace first');
+  let parsed: ReturnType<typeof TransactionBuilder.fromXDR>;
+  try { parsed = TransactionBuilder.fromXDR(signedXdr, config.STELLAR_NETWORK_PASSPHRASE); } catch { throw new AppError(400, 'INVALID_SIGNED_XDR', 'xdr is not a valid transaction envelope for this network'); }
+  const prepared = TransactionBuilder.fromXDR(evidence.traceTxXdr, config.STELLAR_NETWORK_PASSPHRASE);
+  if (parsed.hash().toString('hex') !== prepared.hash().toString('hex')) throw new AppError(409, 'PREPARED_TX_MISMATCH', 'This is not the prepared evidence trace transaction');
+  const keypair = Keypair.fromPublicKey(wallet);
+  if (!parsed.signatures.some((s) => { try { return s.hint().equals(keypair.signatureHint()) && keypair.verify(parsed.hash(), s.signature()); } catch { return false; } })) throw new AppError(400, 'SIGNATURE_INVALID', 'The transaction is not signed by the signer wallet');
+  const sent = await deps.rpc.sendTransaction(parsed).catch(() => null);
+  if (!sent || sent.status === 'ERROR') throw new AppError(502, 'BROADCAST_FAILED', 'The evidence trace could not be sent to the network');
+  await prisma.attestationEvidence.update({ where: { id: evidence.id }, data: { traceTxHash: parsed.hash().toString('hex'), ...(traceId === undefined ? {} : { onChainTraceId: traceId }), status: traceId === undefined ? 'TRACE_SUBMITTED' : 'TRACE_CONFIRMED' } });
+  return { evidenceId, status: traceId === undefined ? 'SUBMITTED' : 'CONFIRMED', txHash: parsed.hash().toString('hex'), traceId: traceId?.toString() ?? null };
+}
+
 // ─── Prepare ─────────────────────────────────────────────────────────────
 
 export interface PreparedAttestation {
@@ -331,9 +405,15 @@ export async function prepareAttestation(
   marketId: string,
   wallet: string,
   outcome: AttestOutcome,
-  opts: { allowConflict?: boolean } = {},
+  opts: { allowConflict?: boolean; evidenceId?: string } = {},
 ): Promise<PreparedAttestation> {
   const { market, onChainMarketId } = await assertMarketSigner(marketId, wallet);
+  const evidence = opts.evidenceId
+    ? await prisma.attestationEvidence.findFirst({ where: { id: opts.evidenceId, marketId: market.id, signer: wallet, outcome } })
+    : null;
+  if (opts.evidenceId && (!evidence || evidence.status !== 'TRACE_CONFIRMED' || evidence.onChainTraceId === null)) {
+    throw new AppError(409, 'EVIDENCE_TRACE_REQUIRED', 'Publish and confirm the evidence trace before preparing the attestation');
+  }
 
   const state = await deps.resolverState(onChainMarketId);
   if (state === 'Unconfigured') {
@@ -368,10 +448,19 @@ export async function prepareAttestation(
 
   let tx: any;
   try {
-    tx = await deps.clientFor(wallet).attest(
-      { market_id: onChainMarketId, signer: wallet, outcome: toEnum(outcome) },
-      { timeoutInSeconds: PREPARE_TTL_SECONDS } as never,
-    );
+    const client = deps.clientFor(wallet);
+    if (evidence) {
+      if (!client.attest_with_evidence) throw new AppError(503, 'CONTRACT_BINDING_OUTDATED', 'Resolver binding lacks attest_with_evidence');
+      tx = await client.attest_with_evidence(
+        { market_id: onChainMarketId, signer: wallet, outcome: toEnum(outcome) as never, trace_id: evidence.onChainTraceId! },
+        { timeoutInSeconds: PREPARE_TTL_SECONDS } as never,
+      );
+    } else {
+      tx = await client.attest(
+        { market_id: onChainMarketId, signer: wallet, outcome: toEnum(outcome) },
+        { timeoutInSeconds: PREPARE_TTL_SECONDS } as never,
+      );
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (/account not found|not found.*account|404/i.test(message)) {
@@ -415,6 +504,8 @@ export async function prepareAttestation(
     txHash: null,
     ledger: null,
     error: null,
+    evidenceId: evidence?.id ?? null,
+    evidenceTraceId: evidence?.onChainTraceId ?? null,
   };
   const row = await prisma.signerAttestation.upsert({
     where: { onChainMarketId_signer_outcome: { onChainMarketId, signer: wallet, outcome } },
@@ -586,6 +677,7 @@ export async function getProgress(marketId: string, wallet: string) {
   }
 
   const reached = (counts.YES >= spec.threshold ? 1 : 0) + (counts.NO >= spec.threshold ? 1 : 0) > 0;
+  const evidence = await prisma.attestationEvidence.findMany({ where: { onChainMarketId }, select: { id: true, signer: true, outcome: true, bundleCid: true, bundleHash: true, onChainTraceId: true, status: true } });
   return {
     marketId: market.id,
     onChainMarketId: onChainMarketId.toString(),
@@ -602,5 +694,6 @@ export async function getProgress(marketId: string, wallet: string) {
     // A proposal that the API-observed counts cannot explain means attestations happened outside the API.
     attestationsOutsideApi: proposal !== null && counts[proposal.outcome] < spec.threshold,
     resolverState: state,
+    evidence: evidence.map((item) => ({ ...item, onChainTraceId: item.onChainTraceId?.toString() ?? null, verification: item.status === 'TRACE_CONFIRMED' ? 'UNVERIFIED_ON_READ' : item.status })),
   };
 }

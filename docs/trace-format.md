@@ -247,3 +247,12 @@ block is canonical-safe:
 `sizing.binding` may now also be `IMPACT`: the curve's optimum, below every
 cap, set the size. `sizing.kellyRaw` is that optimum within the caps, before
 correlation. Traces written before #225 have no `impact` block.
+## Signer attestation evidence bundles (#323)
+
+The signer portal pins a canonical JSON bundle before preparing an attestation. Its
+`version` is `1`, `kind` is `oracledesk.attestation-evidence`, and the bundle
+contains the market, signer, outcome, committed question and resolution hashes,
+plus fetched source URL/hash/size metadata. The SHA-256 of the canonical bytes is
+the trace hash published to the reasoning registry; the subsequent resolver call
+uses `attest_with_evidence` with the returned trace id. Source URLs are HTTPS-only,
+size-capped and never followed across redirects.
