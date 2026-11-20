@@ -2,7 +2,7 @@ import type { Request, Response } from 'express';
 import { Account, MuxedAccount } from '@stellar/stellar-sdk';
 import { CopyTradeStatus } from '@prisma/client';
 import { prisma } from '../lib/prisma';
-import { sendSuccess, sendError } from '../utils/response.util';
+import { sendSuccess, sendError, parsePagination, buildPaginationMeta } from '../utils/response.util';
 import { checkAccess } from '../services/subscription.service';
 import { CONTRACTS } from '../config/contracts';
 import { config } from '../config';
@@ -163,4 +163,55 @@ export async function confirmCopyTrade(req: Request, res: Response): Promise<voi
     }
     sendError(res, 500, 'INTERNAL_SERVER_ERROR', err.message || 'Confirmation failed');
   }
+}
+
+const copyTradeSelect = {
+  id: true, traceId: true, marketId: true, direction: true, amountRaw: true,
+  status: true, pnl: true, collateralRaw: true, sharesRaw: true, feeRaw: true,
+  txHash: true, ledger: true, chainEventId: true, confirmedAt: true,
+  failureCode: true, verificationAttempts: true, expiresAt: true, createdAt: true,
+  trace: { select: { id: true, decisionType: true, edge: true, ipfsCid: true } },
+  market: { select: { id: true, question: true, onChainMarketId: true } },
+} as const;
+
+function copyTradeWhere(req: Request) {
+  const status = typeof req.query.status === 'string' ? req.query.status : undefined;
+  const traceId = typeof req.query.traceId === 'string' ? req.query.traceId : undefined;
+  return {
+    userId: req.user!.userId,
+    ...(status && Object.values(CopyTradeStatus).includes(status as CopyTradeStatus)
+      ? { status: status as CopyTradeStatus } : {}),
+    ...(traceId ? { traceId } : {}),
+  };
+}
+
+export async function getCopyTradeHistory(req: Request, res: Response): Promise<void> {
+  const { page, limit, skip } = parsePagination(req.query as any);
+  const where = copyTradeWhere(req);
+  const [items, total] = await Promise.all([
+    prisma.copyTrade.findMany({ where, select: copyTradeSelect, orderBy: { createdAt: 'desc' }, skip, take: limit }),
+    prisma.copyTrade.count({ where }),
+  ]);
+  sendSuccess(res, items, 200, buildPaginationMeta(page, limit, total) as any);
+}
+
+export async function getCopyTrade(req: Request, res: Response): Promise<void> {
+  const item = await prisma.copyTrade.findFirst({
+    where: { id: String(req.params.id), userId: req.user!.userId },
+    select: copyTradeSelect,
+  });
+  if (!item) {
+    sendError(res, 404, 'COPY_TRADE_NOT_FOUND', 'Copy trade not found');
+    return;
+  }
+  sendSuccess(res, item);
+}
+
+export async function getCopyTradeSummary(req: Request, res: Response): Promise<void> {
+  const where = copyTradeWhere(req);
+  const [groups, totals] = await Promise.all([
+    prisma.copyTrade.groupBy({ by: ['traceId', 'status'], where, _count: { _all: true }, _sum: { pnl: true } }),
+    prisma.copyTrade.aggregate({ where, _count: { _all: true }, _sum: { pnl: true } }),
+  ]);
+  sendSuccess(res, { total: totals._count._all, pnl: totals._sum.pnl ?? 0, byTrace: groups });
 }

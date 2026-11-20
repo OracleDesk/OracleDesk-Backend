@@ -33,6 +33,7 @@ import type { Market as OnChainMarket } from '../generated/market-core';
 import {
   Outcomes,
   agentSell,
+  closeTrade,
   getOnChainMarket,
   getPosition,
   quoteSell,
@@ -478,6 +479,9 @@ export async function exitPosition(
         txHash: result.txHash,
         reason: opts.reason,
       });
+      if (closed && result.mode === 'live') {
+        await closeTrade(onChainMarketId, undefined, { kind: 'trade.close', refId: row.id });
+      }
       await writeAgentLog({
         agentType: 'TRADER',
         level: 'INFO',
