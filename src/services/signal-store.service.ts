@@ -47,7 +47,7 @@ export interface UpsertResult {
   inserted: boolean;
 }
 
-export type FetchStatus = 'ok' | 'error' | 'timeout' | 'skipped_no_key';
+export type FetchStatus = 'ok' | 'error' | 'timeout' | 'skipped_no_key' | 'partial' | 'skipped_breaker_open';
 
 export interface FetchRecord {
   source: string;
@@ -56,6 +56,7 @@ export interface FetchRecord {
   durationMs: number;
   status: FetchStatus;
   itemCount: number;
+  newCount?: number | null;
   rejectedCount: number;
   error: string | null;
   /** Provider JSON with credentials already stripped; stored in signal_raw_payloads. */
@@ -173,6 +174,7 @@ export const prismaSignalStore: SignalStore = {
         durationMs: f.durationMs,
         status: f.status,
         itemCount: f.itemCount,
+        newCount: f.newCount ?? null,
         rejectedCount: f.rejectedCount,
         error: f.error,
         rawPayloadId,

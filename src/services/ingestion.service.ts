@@ -29,6 +29,14 @@ import {
   type NormalizedSignal,
   type SignalRow,
 } from './signal-store.service';
+import {
+  getCachedSourceHealth,
+  healthFactor,
+  quietPeriod,
+  sourceHealthMap,
+  type SourceHealthState,
+} from './source-health.service';
+import { sourceBreakerDecide, sourceBreakerRecord, type SourceFetchOutcome } from '../lib/source-breaker';
 
 // ─── HTTP seam (#72) ──────────────────────────────────────────────────────────
 

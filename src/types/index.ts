@@ -49,12 +49,18 @@ export interface AggregatedSignal extends SanitizedSignal {
   clusterSize: number;
 }
 
+export type SourceHealthState = 'HEALTHY' | 'DEGRADED' | 'UNHEALTHY' | 'UNKNOWN';
+
 export interface AggregatedSignals {
   news: AggregatedSignal[];
   fed: AggregatedSignal[];
   macro: AggregatedSignal[];
   aggregatedAt: Date;
   signalCount: number;
+  /** Per-source health at aggregation time (#277). */
+  sourceHealth: Record<string, SourceHealthState>;
+  /** True when every source is healthy or only quietly empty (#277). */
+  quiet?: boolean;
   /** The source weight set the relevance scores were computed with (#223); version 0 = compiled table. */
   weightSet?: SourceWeightSetRef;
 }
@@ -227,6 +233,8 @@ export interface TraceInput {
   sizing?: Record<string, unknown>;
   /** Weight set behind the evidence's relevance scores (#223). */
   sourceWeightSet?: SourceWeightSetRef;
+  /** Source health map stamped on the decision (#277). */
+  sourceHealth?: Record<string, SourceHealthState>;
 }
 
 export interface TraceVerification {

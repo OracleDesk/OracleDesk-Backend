@@ -259,7 +259,9 @@ export function relevanceScore(
   now: Date,
   table?: SourceWeightTable,
   publisher?: string | null,
+  weightOverride?: number,
 ): number {
-  const score = sourceWeight(source, publisher, table) * recencyDecay(ageFrom, now) * Math.log2(1 + Math.max(1, clusterSize));
+  const base = weightOverride ?? sourceWeight(source, publisher, table);
+  const score = base * recencyDecay(ageFrom, now) * Math.log2(1 + Math.max(1, clusterSize));
   return Math.round(score * 10_000) / 10_000;
 }
