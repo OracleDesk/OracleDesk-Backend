@@ -2,15 +2,10 @@ import { prisma } from '../lib/prisma';
 import { callLLMStructured } from '../lib/llm';
 import { LlmBudgetExceeded, type CallContext } from '../lib/llm-budget';
 import { traceReasoningSchema, traceReasoningSpec } from '../lib/llm-schema';
-import { hedgeConditionsV2 } from '../lib/prompts';
-import {
-  validateAndGroundPredicates,
-  type HedgePredicate,
-} from '../schemas/hedge-predicate';
+import { hedgeConditionsV1 } from '../lib/prompts';
 import { buildTraceProvenance, type ProvenanceEntry } from '../lib/llm/provenance';
 import { renderUntrustedBlock, sanitizeSignal } from './llm-guard.service';
 import { logger } from '../lib/logger';
-import crypto from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import type {
   AggregatedSignal,
@@ -19,6 +14,9 @@ import type {
   ConfidenceInterval,
 } from '../types';
 import { now as clockNow } from '../lib/clock';
+import { AppError } from '../middlewares/error.middleware';
+import { buildTraceDoc, type TraceDocV1 } from '../schemas/trace';
+import { newId } from '../lib/context';
 
 // The hedge-condition schema lives in src/lib/llm-schema.ts; re-exported here.
 export { traceReasoningSchema };
@@ -30,64 +28,49 @@ export { traceReasoningSchema };
  * 1. Compute edge  (agent prob − market prob)
  * 2. 90% confidence interval: the forecaster's own interval when the input
  *    carries a forecast (#75), otherwise jackknife over the sources
- * 3. Call Claude/Gemini to generate hedge conditions and validate citations (#304)
- * 4. Record provenance (#66): who produced the market proposal/forecast (when the
+ * 3. Call Claude/Gemini to generate hedge conditions and reasoning narrative
+ * 4. Record provenance (#66): who produced the market proposal (when the
  *    caller passes it) and the hedge conditions, as `tracePayload.provenance`.
  *    It is part of the pinned bytes, so it is committed with the trace.
- * 5. Build the TraceDocV2 document (#227) and persist the row under the same
- *    pre-allocated id. The document is final: callers enqueue it unchanged and
- *    the hash is computed later, over the exact bytes pinned to IPFS
- *    (services/trace-publish.service.ts).
- *
- * `market.onChainId` records what was known when the decision was made (null
- * for most market-creation traces) and is never updated. The registry entry's
- * market_id, read by the publication worker at publish time, is the
- * authoritative link (docs/trace-format.md §3b).
+ * 5. Persist to DB. The hash is computed later, over the exact bytes pinned
+ *    to IPFS (services/trace-publish.service.ts), never over this object.
  */
 export async function generateReasoningTrace(
   input: TraceInput,
-  ctxOrOpts: CallContext | { upstreamProvenance?: ProvenanceEntry[] } = { purpose: 'trace_hedge', priority: 'cron' },
+  ctx: CallContext = { purpose: 'trace_hedge', priority: 'cron' },
   opts: { upstreamProvenance?: ProvenanceEntry[] } = {},
-): Promise<{ trace: ReasoningTrace; tracePayload: TraceDocV2 }> {
+) {
   const edge = calculateEdge(input.probabilityEstimate, input.marketProbability);
   // A forecast-driven decision (#75) already has a calibrated interval; the
   // jackknife over sourcesUsed would only echo the signals' rawValues.
-  const ci = input.forecast
+  const ci   = input.forecast
     ? input.confidenceInterval
     : calculateConfidenceInterval(input.sourcesUsed, input.probabilityEstimate);
 
   const hedgeConditions = await generateHedgeConditions(input, edge, ci, ctx);
 
-  // Upstream first (the proposal/forecast precedes the hedge call). Throws on
-  // anything canonicalJson would encode differently from the contracts repo.
-  const provenance = buildTraceProvenance([
-    ...(resolvedOpts.upstreamProvenance ?? []),
-    hedgeConditions.provenance,
-  ]);
+  // Upstream first (the proposal precedes the hedge call). Throws on anything
+  // canonicalJson would encode differently from the contracts repo.
+  const provenance = buildTraceProvenance([...(opts.upstreamProvenance ?? []), hedgeConditions.provenance]);
 
-  const tracePayload: Record<string, unknown> = {
-    agentType:           input.agentType,
-    decisionType:        input.decisionType,
-    marketId:            input.marketId,
-    sourcesUsed:         input.sourcesUsed,
+  const traceId = newId('req');
+  const traceDoc: TraceDocV1 = buildTraceDoc({
+    traceId,
+    agentType: input.agentType,
+    decisionType: input.decisionType,
+    action: input.decisionType.toLowerCase(),
+    backendMarketId: input.marketId,
+    onChainMarketId: null,
     probabilityEstimate: input.probabilityEstimate,
-    marketProbability:   input.marketProbability,
+    marketProbability: input.marketProbability,
     edge,
     confidenceInterval:  ci,
+    sourcesUsed: input.sourcesUsed,
     betFraction:         input.betFraction,
     betSizeUsdc:         input.betSizeUsdc,
-    correlation:         input.correlation,
-    seedPolicy:          input.seedPolicy,
-    forecast:            input.forecast,
-    sizing:              input.sizing,
-    // #223: which source weight set scored the evidence; absent on older traces.
-    sourceWeightSet:     input.sourceWeightSet,
     hedgeConditions:     hedgeConditions.conditions,
-    hedgePredicates:     hedgeConditions.predicates,
-    provenance,
-    agentWallet:         input.agentWallet ?? null,
-    timestamp:           clockNow().toISOString(),
-  };
+    agentWallet:         input.agentWallet,
+  });
 
   // The free preview names the source and headline only; links and ids are
   // part of the paid trace (#73).
@@ -97,32 +80,33 @@ export async function generateReasoningTrace(
     signal: s.signal,
   }));
 
-  const trace = await prisma.reasoningTrace.create({
-    data: {
+  const trace = await prisma.reasoningTrace.upsert({
+    where: { id: traceId },
+    create: {
+      id: traceId,
       marketId:            input.marketId,
       agentType:           input.agentType,
       decisionType:        input.decisionType,
-      sourcesUsed:         input.sourcesUsed as Prisma.InputJsonValue,
+      sourcesUsed:         input.sourcesUsed as any,
       probabilityEstimate: input.probabilityEstimate,
       rawProbabilityEstimate: input.rawProbabilityEstimate ?? input.probabilityEstimate,
-      marketProbability:      input.marketProbability,
+      marketProbability:   input.marketProbability,
       edge,
       confidenceInterval:  ci as Prisma.InputJsonValue,
       betFraction:         input.betFraction ?? null,
       betSizeUsdc:         input.betSizeUsdc ?? null,
-      hedgeConditions:     hedgeConditions.conditions as Prisma.InputJsonValue,
-      hedgePredicates:     hedgeConditions.predicates as unknown as Prisma.InputJsonValue,
+      hedgeConditions:     hedgeConditions.conditions as any,
       provenance:          provenance as unknown as Prisma.InputJsonValue,
       agentWallet:         input.agentWallet,
-      sourceWeightSetVersion: input.sourceWeightSet?.version ?? null,
       previewSources:      previewSources as any,
       verified:            false,
       isPublic:            false,
     },
+    update: {},
   });
 
   logger.info({ traceId: trace.id, edge, marketId: input.marketId }, 'Reasoning trace generated');
-  return { trace, tracePayload: { ...tracePayload, traceId: trace.id } };
+  return { trace, tracePayload: traceDoc };
 }
 
 /**
@@ -204,9 +188,9 @@ export function calculateConfidenceInterval(
 /**
  * Uses Claude/Gemini to generate specific, measurable hedge conditions.
  *
- * This is a secondary LLM call after market creation / forecast. It is
- * intentionally non-blocking: if the LLM call fails or its output fails
- * citation validation (#304), we return safe defaults so the cycle completes.
+ * This is a secondary LLM call after market creation. It is intentionally
+ * non-blocking: if the LLM call fails for any reason (quota, timeout, etc.)
+ * we return safe defaults so the market creation cycle always completes.
  */
 async function generateHedgeConditions(
   input: TraceInput,
@@ -215,42 +199,19 @@ async function generateHedgeConditions(
   ctx:   CallContext,
 ): Promise<{
   conditions: string[];
-  predicates: HedgePredicate[];
-  droppedPredicates: number;
   reasoning: string;
   provenance: ProvenanceEntry;
 }> {
   // Signal text comes from headlines: sanitise it and send it as delimited data.
-  const rawTop = input.sourcesUsed.slice(0, 3);
-  const sanitizedTop = rawTop.map((s, i) => ({
+  const topSignals = input.sourcesUsed.slice(0, 3).map((s, i) => ({
     ...sanitizeSignal({
-      source: String(s.source),
-      title: String(s.signal),
-      content: '',
-      publishedAt: s.publishedAt ?? '',
-      relevanceScore: Number(s.weight) || 0,
-      category: '',
-      url: typeof s.url === 'string' ? s.url : undefined,
+      source: String(s.source), title: String(s.signal), content: '',
+      publishedAt: '', relevanceScore: Number(s.weight) || 0, category: '',
     }),
     id: `s${i + 1}`,
   }));
-  const { clean: topSignals, quarantined } = partitionSignals(sanitizedTop);
-  const sent: CitationSource[] = topSignals.map((s) => {
-    const orig = rawTop[Number(s.id.slice(1)) - 1];
-    const numeric = parseFredNumeric(s.source, s.title);
-    return {
-      promptId: s.id,
-      signalId: typeof orig?.signalId === 'string' ? orig.signalId : null,
-      source: s.source,
-      title: s.title,
-      url: canonicalUrl(typeof orig?.url === 'string' ? orig.url : s.url ?? null),
-      ...(numeric ? { numeric } : {}),
-    };
-  });
-  const quarantinedIds = quarantined.map((s) => s.id);
-  const signalHashes = sent.map((s) => sha256Hex(`${s.promptId}:${s.signalId ?? ''}:${s.source}`).slice(0, 16));
 
-  const { system, user } = hedgeConditionsV2.render({
+  const { system, user } = hedgeConditionsV1.render({
     marketId: input.marketId,
     agentType: input.agentType,
     decisionType: input.decisionType,
@@ -262,25 +223,19 @@ async function generateHedgeConditions(
     signalsBlock: renderUntrustedBlock(topSignals, 'untrusted_signals'),
   });
 
-  const fallback = (
-    reason: 'LLM_FAILED' | 'LLM_BUDGET_EXCEEDED' | 'CITATION_REJECTED',
-    citationCheck?: CitationCheckProvenance,
-  ) => ({
+  const fallback = (reason: 'LLM_FAILED' | 'LLM_BUDGET_EXCEEDED') => ({
     conditions: [
       `Close if market probability rises above ${(input.probabilityEstimate + 0.10).toFixed(2)}`,
       `Close if primary signal source reverses direction`,
       `Hard stop-loss at 15% adverse market move`,
     ],
-    predicates: [] as HedgePredicate[],
-    droppedPredicates: 0,
     reasoning: 'Default hedge conditions applied — LLM call failed',
     // No model produced these: marked as such, with no model fields (#66).
     provenance: {
       source: 'default' as const,
-      promptId: hedgeConditionsV2.id,
-      promptVersion: hedgeConditionsV2.version,
+      promptId: hedgeConditionsV1.id,
+      promptVersion: hedgeConditionsV1.version,
       reason,
-      ...(citationCheck ? { citationCheck } : {}),
     },
   });
 
@@ -292,23 +247,14 @@ async function generateHedgeConditions(
         maxTokens: 1024,
         ctx,
         task: 'hedge_conditions',
-        prompt: { id: hedgeConditionsV2.id, version: hedgeConditionsV2.version, hash: hedgeConditionsV2.contentHash },
+        prompt: { id: hedgeConditionsV1.id, version: hedgeConditionsV1.version, hash: hedgeConditionsV1.contentHash },
       },
     );
     const validated = result.value;
-    const grounded = validateAndGroundPredicates(validated.hedge_predicates);
-    if (grounded.droppedCount > 0) {
-      logger.warn(
-        { marketId: input.marketId, droppedCount: grounded.droppedCount, droppedReasons: grounded.droppedReasons },
-        'Dropped ungrounded hedge predicates from LLM output',
-      );
-    }
     return {
       conditions: validated.hedge_conditions,
-      predicates: grounded.valid,
-      droppedPredicates: grounded.droppedCount,
       reasoning: validated.reasoning_summary,
-      provenance,
+      provenance: result.provenance,
     };
   } catch (err) {
     // Non-fatal: log a warning but never fail the whole market creation cycle

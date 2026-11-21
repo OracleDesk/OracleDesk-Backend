@@ -1,5 +1,5 @@
-import type { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
+import { seedReserves } from '../generated/fpmm';
 import { logger } from '../lib/logger';
 import { writeAgentLog } from '../lib/agent-log';
 import { CONTRACTS } from '../config/contracts';
@@ -228,61 +228,58 @@ export async function linkLandedMarket(
   marketId: string,
   onChainMarketId: bigint,
   txHash?: string | null,
-  externalTx?: Prisma.TransactionClient,
 ): Promise<boolean> {
-  const apply = async (tx: Prisma.TransactionClient): Promise<boolean> => {
-    const conflict = await tx.market.findFirst({
-      where: { onChainMarketId, id: { not: marketId } },
-      select: { id: true },
-    });
-    if (conflict) {
-      logger.error({ marketId, onChainMarketId: onChainMarketId.toString(), conflictId: conflict.id }, 'CREATION_ID_CONFLICT: on-chain market id already linked');
-      await writeAgentLog(
-        {
-          agentType: 'MARKET_MAKER',
-          level: 'ERROR',
-          action: 'CREATION_ID_CONFLICT',
-          marketId,
-          data: { onChainMarketId: onChainMarketId.toString(), conflictId: conflict.id },
+  try {
+    await prisma.$transaction(async (tx) => {
+      const market = await tx.market.findUnique({ where: { id: marketId } });
+      if (!market) throw new Error(`Market ${marketId} not found`);
+      await tx.market.update({
+        where: { id: marketId },
+        data: {
+          onChainMarketId,
+          creationTxHash: txHash ?? undefined,
+          status: 'ACTIVE',
         },
-        tx,
-      ).catch(() => undefined);
-      return false;
-    }
+      });
 
-    await tx.market.update({
-      where: { id: marketId },
-      data: {
-        onChainMarketId,
-        creationTxHash: txHash ?? undefined,
-        status: 'ACTIVE',
-      },
-    });
+      await tx.marketCreationAttempt.upsert({
+        where: { marketId },
+        create: {
+          marketId,
+          onChainMarketId,
+          txHash: txHash ?? null,
+          status: 'LANDED',
+        },
+        update: {
+          onChainMarketId,
+          txHash: txHash ?? undefined,
+          status: 'LANDED',
+          claimLeaseExpiresAt: new Date(),
+        },
+      });
 
-    await tx.marketCreationAttempt.upsert({
-      where: { marketId },
-      create: {
-        marketId,
-        onChainMarketId,
-        txHash: txHash ?? null,
-        status: 'LANDED',
-      },
-      update: {
-        onChainMarketId,
-        txHash: txHash ?? undefined,
-        status: 'LANDED',
-        claimLeaseExpiresAt: new Date(),
-      },
+      // Record the treasury-owned seed immediately; fee-ledger enrichment is
+      // intentionally deferred until the deployed market-core exposes it.
+      if (market.seedAmountRaw) {
+        const policy = (market.seedPolicy ?? {}) as Record<string, unknown>;
+        const openBps = Number(policy.initialYesBps ?? Math.round(market.initialYesProb * 10_000));
+        const reserves = seedReserves(BigInt(market.seedAmountRaw), BigInt(openBps));
+        await tx.lpPosition.upsert({
+          where: { marketId },
+          create: {
+            marketId,
+            onChainMarketId,
+            seedRaw: market.seedAmountRaw,
+            openBps,
+            creatorYesRaw: reserves.creatorYes.toString(),
+            creatorNoRaw: reserves.creatorNo.toString(),
+            expectedLpLossRaw: typeof policy.expectedLpLossRaw === 'string' ? policy.expectedLpLossRaw : null,
+          },
+          update: { onChainMarketId },
+        });
+      }
     });
     return true;
-  };
-
-  if (externalTx) {
-    return apply(externalTx);
-  }
-
-  try {
-    return await prisma.$transaction(apply);
   } catch (err: any) {
     // Unique violation on onChainMarketId (P2002)
     if (err?.code === 'P2002' || err?.message?.includes('Unique constraint')) {
