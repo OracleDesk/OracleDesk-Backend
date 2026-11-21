@@ -161,11 +161,17 @@ import {
   getSourceWeightSet,
   listSourceWeightSets,
   rollbackSourceWeightSet,
+  getLlmCanaryStatus,
+  overrideLlmDemotion,
 } from '../controllers/admin.controller';
 router.get('/source-weights', requirePermission('admin.read'), listSourceWeightSets);
 router.post('/source-weights/rollback', requirePermission('agents.weights.approve', { audit: false }), requireStepUp, rollbackSourceWeightSet);
 router.get('/source-weights/:id', requirePermission('admin.read'), getSourceWeightSet);
 router.post('/source-weights/:id/approve', requirePermission('agents.weights.approve', { audit: false }), requireStepUp, approveSourceWeightSet);
 router.post('/source-weights/:id/activate', requirePermission('agents.weights.approve', { audit: false }), requireStepUp, activateSourceWeightSet);
+
+// LLM drift canary & model demotions (#296)
+router.get('/llm/canary', requirePermission('admin.read'), getLlmCanaryStatus);
+router.post('/llm/demotions', requirePermission('agents.manage'), requireStepUp, overrideLlmDemotion);
 
 export default router;

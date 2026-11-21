@@ -185,6 +185,9 @@ export interface CompletionOutcome {
   txHash?: string | null;
   ledger?: number | null;
   error?: string | null;
+  /** Full GetTransactionResponse when available, so handlers can read events without re-fetching. */
+  confirmedTx?: unknown;
+  ledger?: number | null;
 }
 
 export interface CompletionContext {
@@ -203,7 +206,17 @@ export type CompletionHandler = (
 const handlers = new Map<string, CompletionHandler>();
 
 /** Kinds that must have a handler; resolving one without is an error, never a skip. */
-export const DOMAIN_KINDS: ReadonlySet<string> = new Set(['market.create', 'trade.buy', 'trade.sell', 'trace.publish']);
+export const DOMAIN_KINDS: ReadonlySet<string> = new Set([
+  'market.create',
+  'trade.buy',
+  'trade.sell',
+  'trace.publish',
+  'resolver.price_spec',
+  'resolver.resolve_price',
+  'resolver.signer_spec',
+  'resolver.attest',
+  'resolver.finalize_signers',
+]);
 
 /** Registers the idempotent completion handler for one kind (at module load). */
 export function registerHandler(kind: string, handler: CompletionHandler): void {

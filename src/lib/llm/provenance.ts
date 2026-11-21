@@ -48,6 +48,8 @@ export interface LlmProvenance {
   source: 'llm';
   provider: ProvenanceProvider;
   model: string;
+  /** Provider-reported model version/snapshot served for this call (#296). */
+  servedModel?: string;
   promptId: string;
   promptVersion: number;
   promptHash: string;

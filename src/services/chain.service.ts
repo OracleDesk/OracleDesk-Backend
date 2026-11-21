@@ -1647,33 +1647,57 @@ const publishTraceImpl = (args: {
 // source account. Reveal commits the price spec; resolve reads the feed at
 // close_time and finalises market-core.
 
-export const registerPriceSpec = (marketId: bigint, spec: PriceConfig, signal?: AbortSignal) =>
+export const registerPriceSpec = (
+  marketId: bigint,
+  spec: PriceConfig,
+  signal?: AbortSignal,
+  ref: WriteRef = { kind: 'resolver.price_spec' },
+) =>
   write<void>('MARKET_MAKER', 'maintenance', 'resolver', 'register_price_spec', { market_id: marketId, spec }, async (opts) =>
-    agentClients.resolver().register_price_spec({ market_id: marketId, spec }, opts as any), signal,
+    agentClients.resolver().register_price_spec({ market_id: marketId, spec }, opts as any), signal, ref,
   );
 
-export const resolvePrice = (marketId: bigint, signal?: AbortSignal) =>
+export const resolvePrice = (
+  marketId: bigint,
+  signal?: AbortSignal,
+  ref: WriteRef = { kind: 'resolver.resolve_price' },
+) =>
   write<Outcome>('MARKET_MAKER', 'maintenance', 'resolver', 'resolve_price', { market_id: marketId }, async (opts) =>
-    agentClients.resolver().resolve_price({ market_id: marketId }, opts as any), signal,
+    agentClients.resolver().resolve_price({ market_id: marketId }, opts as any), signal, ref,
   );
 
-const registerSignerSpecImpl = (marketId: bigint, spec: SignerConfig, signal?: AbortSignal) =>
+const registerSignerSpecImpl = (
+  marketId: bigint,
+  spec: SignerConfig,
+  signal?: AbortSignal,
+  ref: WriteRef = { kind: 'resolver.signer_spec' },
+) =>
   write<void>('MARKET_MAKER', 'maintenance', 'resolver', 'register_signer_spec', { market_id: marketId, spec }, async (opts) =>
-    agentClients.resolver().register_signer_spec({ market_id: marketId, spec }, opts as any), signal,
+    agentClients.resolver().register_signer_spec({ market_id: marketId, spec }, opts as any), signal, ref,
   );
 
-const attestImpl = (marketId: bigint, signerPublicKey: string, outcome: 'YES' | 'NO', signal?: AbortSignal) =>
+const attestImpl = (
+  marketId: bigint,
+  signerPublicKey: string,
+  outcome: 'YES' | 'NO',
+  signal?: AbortSignal,
+  ref: WriteRef = { kind: 'resolver.attest' },
+) =>
   write<void>('MARKET_MAKER', 'maintenance', 'resolver', 'attest', { market_id: marketId, signer: signerPublicKey, outcome }, async (opts, signer) =>
     agentClients.resolver(signer).attest({
       market_id: marketId,
       signer: signerPublicKey,
       outcome: outcome === 'YES' ? { tag: 'Yes', values: undefined } : { tag: 'No', values: undefined },
-    }, opts as any), signal,
+    }, opts as any), signal, ref,
   );
 
-const finalizeSignersImpl = (marketId: bigint, signal?: AbortSignal) =>
+const finalizeSignersImpl = (
+  marketId: bigint,
+  signal?: AbortSignal,
+  ref: WriteRef = { kind: 'resolver.finalize_signers' },
+) =>
   write<Outcome>('MARKET_MAKER', 'maintenance', 'resolver', 'finalize_signers', { market_id: marketId }, async (opts, signer) =>
-    agentClients.resolver(signer).finalize_signers({ market_id: marketId }, opts as any), signal,
+    agentClients.resolver(signer).finalize_signers({ market_id: marketId }, opts as any), signal, ref,
   );
 
 // ─── Test seam (#72) ─────────────────────────────────────────────────────────

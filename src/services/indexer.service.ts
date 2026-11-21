@@ -231,6 +231,17 @@ async function applySideEffects(event: DecodedEvent): Promise<void> {
     logger.warn({ err, eventId: event.id }, 'Indexer: chain cache invalidation failed');
   }
 
+  if (event.contractName === 'marketCore') {
+    if (['MarketCreated', 'Trade', 'Redeemed', 'MarketResolved'].includes(event.eventName)) {
+      try {
+        const { applyWalletEvent } = await import('./wallet-pnl.service');
+        await applyWalletEvent(event);
+      } catch (err) {
+        logger.error({ err, eventId: event.id }, 'Indexer: wallet PnL projection failed');
+      }
+    }
+  }
+
   if (event.contractName === 'marketCore' && event.eventName === 'Trade') {
     const onChainMarketId = BigInt(p.market_id);
     const yesBps = Number(priceYesBps(BigInt(p.reserve_yes), BigInt(p.reserve_no)));
@@ -416,6 +427,17 @@ export interface PublicEvent {
  */
 export async function publicEventFor(event: DecodedEvent): Promise<PublicEvent | null> {
   const p = event.params;
+
+  if (event.contractName === 'marketCore') {
+    if (['MarketCreated', 'Trade', 'Redeemed', 'MarketResolved'].includes(event.eventName)) {
+      try {
+        const { applyWalletEvent } = await import('./wallet-pnl.service');
+        await applyWalletEvent(event);
+      } catch (err) {
+        logger.error({ err, eventId: event.id }, 'Indexer: wallet PnL projection failed');
+      }
+    }
+  }
 
   if (event.contractName === 'marketCore' && event.eventName === 'Trade') {
     const onChainMarketId = BigInt(p.market_id);
@@ -641,6 +663,12 @@ export async function backfillEvents(
     }
 
     await writeCursor(latestLedger);
+    // Repair any markets marked dirty by out-of-order wallet PnL events (#298)
+    await import('./wallet-pnl.service')
+      .then((m) => m.processDirtyMarkets())
+      .catch((err) =>
+        logger.warn({ err: err instanceof Error ? err.message : err }, 'Indexer: dirty wallet PnL repair failed'),
+      );
     // Also covers rows left unpublished by an earlier outage, not just this run's.
     await publishPending(deps.emit).catch((err) =>
       logger.warn({ err: err instanceof Error ? err.message : err }, 'Indexer: publish pass failed'),

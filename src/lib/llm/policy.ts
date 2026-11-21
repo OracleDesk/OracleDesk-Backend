@@ -24,11 +24,30 @@ const modelSpecSchema = z.object({
   baseUrl: z.string().url().optional(),
   jsonMode: z.enum(['native', 'prompt']).optional(),
   retries: z.number().int().min(0).max(5).optional(),
+  pinned: z.boolean().optional(),
 });
 
 const policySchema = z.partialRecord(
   z.enum(TASKS),
-  z.array(modelSpecSchema).min(1),
+  z.array(modelSpecSchema).min(1).superRefine((specs, ctx) => {
+    const hasPinned = specs.some((s) => s.pinned);
+    if (hasPinned && specs.length < 2) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'pinned model specs require at least one explicit fallback entry in the task chain',
+      });
+    }
+    if (hasPinned && specs.length >= 2) {
+      const primary = specs[0];
+      const hasDistinctFallback = specs.slice(1).some((s) => s.provider !== primary.provider || s.model !== primary.model);
+      if (!hasDistinctFallback) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'pinned model fallback must differ from the primary (provider, model)',
+        });
+      }
+    }
+  }),
 );
 
 const anthropic = (model = 'claude-sonnet-4-6', temperature = 0.2, maxTokens = 4096): ModelSpec => ({
@@ -88,3 +107,42 @@ export function loadPolicies(raw = sourceJson()): LlmPolicies {
 }
 
 export const policies: LlmPolicies = loadPolicies();
+
+// ─── Runtime demotion overlay (#296) ─────────────────────────────────────────
+
+const activeDemotions = new Map<string, Set<string>>();
+
+function demotionKey(provider: string, model: string): string {
+  return `${provider}:${model}`;
+}
+
+/** Replaces the in-memory demotion set for a task (or all tasks). */
+export function setDemotedModels(demotions: Array<{ task: string; provider: string; model: string }>): void {
+  activeDemotions.clear();
+  for (const d of demotions) {
+    let set = activeDemotions.get(d.task);
+    if (!set) {
+      set = new Set();
+      activeDemotions.set(d.task, set);
+    }
+    set.add(demotionKey(d.provider, d.model));
+  }
+}
+
+/**
+ * Returns the policy chain for `task` with any actively demoted models moved
+ * behind non-demoted fallbacks (never removed completely, so availability is
+ * preserved if all models are demoted).
+ */
+export function getEffectiveChain(task: LlmTask, basePolicies: LlmPolicies = policies): ModelSpec[] {
+  const chain = basePolicies[task] ?? [];
+  const demoted = activeDemotions.get(task);
+  if (!demoted || demoted.size === 0 || chain.length <= 1) return chain;
+  const healthy: ModelSpec[] = [];
+  const lowered: ModelSpec[] = [];
+  for (const spec of chain) {
+    if (demoted.has(demotionKey(spec.provider, spec.model))) lowered.push(spec);
+    else healthy.push(spec);
+  }
+  return [...healthy, ...lowered];
+}

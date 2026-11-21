@@ -447,7 +447,7 @@ export async function createMarketOnChain(
     // simply stays Unconfigured until then.
     if (spec.kind === 'price') {
       try {
-        await revealPriceSpec(result.value, spec);
+        await revealPriceSpec(result.value, spec, { marketId: market.id });
         logger.info({ marketId: market.id, onChainMarketId: result.value.toString() }, 'Price spec revealed');
       } catch (err) {
         await writeAgentLog({

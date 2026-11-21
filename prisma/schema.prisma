@@ -341,6 +341,7 @@ model Market {
   agentDecisions AgentDecision[]
   agentLogs      AgentLog[]
   creationAttempt MarketCreationAttempt?
+  resolutionSteps MarketResolutionStep[]
 
   @@index([status])
   @@index([category])
@@ -350,6 +351,34 @@ model Market {
   @@index([lastReconciledAt])
   @@index([resolutionSpec], type: Gin)
   @@map("markets")
+}
+
+/// Persisted per-market resolver step state for outbox-tracked writes (#297).
+model MarketResolutionStep {
+  id            String    @id @default(uuid())
+  marketId      String
+  /// PRICE_SPEC | RESOLVE_PRICE | SIGNER_SPEC | ATTEST | FINALIZE_SIGNERS
+  step          String
+  /// PENDING | IN_FLIGHT | LANDED | LANDED_EXTERNALLY | FAILED | ESCALATED
+  status        String    @default("PENDING")
+  attempts      Int       @default(0)
+  nextAttemptAt DateTime?
+  escalatedAt   DateTime?
+  txHash        String?
+  ledger        Int?
+  outcome       String?
+  failureCode   String?
+  /// AGENT | EXTERNAL
+  landedBy      String?
+  lastOutboxId  String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  market Market @relation(fields: [marketId], references: [id], onDelete: Cascade)
+
+  @@unique([marketId, step])
+  @@index([step, status, nextAttemptAt])
+  @@map("market_resolution_steps")
 }
 
 // Background job for market generation process, tracking status and errors
@@ -404,6 +433,10 @@ model Trade {
   collateralRaw Decimal?      @db.Decimal(39, 0)
   sharesRaw    Decimal?       @db.Decimal(39, 0)
   feeRaw       Decimal?       @db.Decimal(39, 0)
+  reserveYesRaw Decimal?      @db.Decimal(39, 0)
+  reserveNoRaw  Decimal?      @db.Decimal(39, 0)
+  fillLedger   Int?
+  fillMismatch Json?
   /// Decision price and edge in basis points; fill price comes from chain evidence.
   priceBps     Int?
   fillPriceBps Int?
@@ -525,6 +558,11 @@ model PositionExit {
   sharesSoldRaw    Decimal  @default(0) @db.Decimal(39, 0)
   collateralOutRaw Decimal  @db.Decimal(39, 0)
   maxSharesInRaw   Decimal  @db.Decimal(39, 0)
+  feeRaw           Decimal? @db.Decimal(39, 0)
+  reserveYesRaw    Decimal? @db.Decimal(39, 0)
+  reserveNoRaw     Decimal? @db.Decimal(39, 0)
+  fillLedger       Int?
+  fillMismatch     Json?
   /// collateralOut / sharesSold, for display.
   effectivePrice   Float?
   effectivePriceBps Int?
@@ -2248,4 +2286,65 @@ model MoneyAuditFinding {
   @@index([invariant, createdAt])
   @@index([fingerprint])
   @@map("money_audit_findings")
+}
+
+/// Statistical baseline per (task, provider, model, promptVersion) for canary drift detection (#296).
+model LlmCanaryBaseline {
+  id            String   @id @default(uuid())
+  task          String
+  provider      String
+  model         String
+  promptVersion Int
+  sampleCount   Int
+  passCount     Int
+  passRate      Float
+  meanScore     Float
+  scoreStdDev   Float    @default(0)
+  metricsJson   Json     @default("{}")
+  createdAt     DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime @updatedAt @db.Timestamptz(3)
+
+  @@unique([task, provider, model, promptVersion])
+  @@map("llm_canary_baselines")
+}
+
+/// One daily canary evaluation run for a (task, provider, model) chain entry (#296).
+model LlmCanaryRun {
+  id             String   @id @default(uuid())
+  task           String
+  provider       String
+  model          String
+  servedModel    String?
+  promptVersion  Int
+  sampleCount    Int
+  passCount      Int
+  passRate       Float
+  meanScore      Float
+  pValue         Float?
+  drifted        Boolean  @default(false)
+  driftReason    String?
+  budgetSpentUsd Float    @default(0)
+  details        Json     @default("{}")
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([task, model, createdAt])
+  @@map("llm_canary_runs")
+}
+
+/// Time-limited model demotion (by canary auto-demotion or admin override) (#296).
+model LlmModelDemotion {
+  id        String   @id @default(uuid())
+  task      String
+  provider  String
+  model     String
+  reason    String
+  /// canary | admin
+  demotedBy String   @default("canary")
+  expiresAt DateTime @db.Timestamptz(3)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  @@index([task, active, expiresAt])
+  @@map("llm_model_demotions")
 }
