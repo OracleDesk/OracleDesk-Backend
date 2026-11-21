@@ -27,6 +27,7 @@ import {
 } from '../services/treasury-budget.service';
 import { toDisplayUsdc, usdcFromNumber } from '../lib/amounts';
 import { config } from '../config';
+import { runMarketAnalyses } from './trader-scheduler';
 import { logger } from '../lib/logger';
 import type { MarketView, TraderEnv, DecisionPrice, PoolView } from './trader-env';
 import { StalePriceError } from '../services/market-price.service';
@@ -289,9 +290,22 @@ export async function runTraderPolicy(
 
   // Circuit breaker: abort the scan if too many consecutive stale-price markets (#266).
   let consecutiveStale = 0;
-  for (const market of activeMarkets) {
+  const scheduled = await runMarketAnalyses(
+    activeMarkets.map((market) => ({ marketId: market.id, deadlineAt: Date.now() + config.TRADER_MARKET_DEADLINE_MS })),
+    async (task, marketSignal) => {
+      const market = activeMarkets.find((candidate) => candidate.id === task.marketId);
+      if (!market) throw new Error(`market ${task.marketId} disappeared from candidate set`);
+      return analyzeAndTradeMarket(env, params, cycle, market, signals, recordDecision, marketSignal);
+    },
+    { concurrency: config.TRADER_MARKET_CONCURRENCY, signal },
+  );
+  for (const result of scheduled) {
     signal?.throwIfAborted();
-    const stale = await analyzeAndTradeMarket(env, params, cycle, market, signals, recordDecision, signal);
+    if (result.status !== 'DONE') {
+      await recordDecision({ kind: 'SKIP', reasonCode: 'PRICE_SOURCE_DOWN', data: { marketId: result.marketId, status: result.status, error: result.error } });
+      continue;
+    }
+    const stale = result.value;
     if (stale) {
       consecutiveStale++;
       if (consecutiveStale >= config.TRADER_STALE_ABORT_COUNT) {

@@ -734,6 +734,10 @@ export const envObjectSchema = z
     TRADER_MAX_PRICE_DRIFT_BPS: z.string().default('150').transform(Number).pipe(z.number().int().min(0)),
     /** Consecutive stale-price markets that abort the scan cycle with PRICE_SOURCE_DOWN. */
     TRADER_STALE_ABORT_COUNT: z.string().default('3').transform(Number).pipe(z.number().int().min(1)),
+    /** Maximum concurrent market analyses; keep at one unless the environment is concurrency-safe. */
+    TRADER_MARKET_CONCURRENCY: z.string().default('1').transform(Number).pipe(z.number().int().min(1).max(16)),
+    /** Per-market analysis deadline in milliseconds. */
+    TRADER_MARKET_DEADLINE_MS: z.string().default('30000').transform(Number).pipe(z.number().int().positive()),
     // ── Market-core TWAP and breakers (#292) ──────────────────────────────
     /** Window for the manipulation-resistant YES-price TWAP used by risk decisions. */
     TWAP_WINDOW_SECS: z.string().default('300').transform(Number).pipe(z.number().int().min(30).max(3600)),
