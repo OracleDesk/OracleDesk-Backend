@@ -961,9 +961,11 @@ model SignalFetch {
   requestFingerprint String
   startedAt          DateTime @default(now()) @db.Timestamptz(3)
   durationMs         Int
-  /// ok | error | timeout | skipped_no_key
+  /// ok | error | timeout | skipped_no_key | partial | skipped_breaker_open
   status             String
   itemCount          Int      @default(0)
+  /// Rows newly inserted (not re-sightings) on this fetch (#277).
+  newCount           Int?
   /// Provider items dropped before storage (no URL, unparseable date, missing value).
   rejectedCount      Int      @default(0)
   error              String?
