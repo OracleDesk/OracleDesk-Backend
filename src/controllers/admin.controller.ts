@@ -44,14 +44,19 @@ import { AppError } from '../middlewares/error.middleware';
 import * as sourceWeights from '../services/source-weights.service';
 import {
   ADMIN_ROLES,
+  approveAdminRoleGrant,
   grantAdminRole,
   isAdminAddress,
   isAdminRole,
   listAdminAudit,
+  listAdminGrantProposals,
   listAdmins,
   listRoles,
+  proposeAdminRoleGrant,
+  renewAdminAssignment,
   revokeAdminRole,
 } from '../services/admin-rbac.service';
+import { evictAdminsFromRoom } from '../lib/admin-socket';
 import {
   acknowledge,
   buildGuardianTx,
@@ -663,7 +668,47 @@ export async function postRevokeAdmin(req: Request, res: Response): Promise<void
     throw new AppError(400, 'VALIDATION_ERROR', 'walletAddress must be a Stellar G… address');
   }
   await revokeAdminRole({ walletAddress, actor: actor(req) });
+  const io = req.app.get('io') as import('socket.io').Server | undefined;
+  if (io) evictAdminsFromRoom(io, [walletAddress]);
   sendSuccess(res, { revoked: true });
+}
+
+/** GET /admin/admins/grant/proposals — pending privileged grant proposals. */
+export async function getAdminGrantProposals(_req: Request, res: Response): Promise<void> {
+  sendSuccess(res, await listAdminGrantProposals('PENDING'));
+}
+
+/** POST /admin/admins/grant/propose — start two-person grant for a privileged role. */
+export async function postProposeAdminGrant(req: Request, res: Response): Promise<void> {
+  const { walletAddress, roleName } = (req.body ?? {}) as { walletAddress?: unknown; roleName?: unknown };
+  if (!isAdminAddress(walletAddress)) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'walletAddress must be a Stellar G… address');
+  }
+  if (!isAdminRole(roleName)) {
+    throw new AppError(400, 'VALIDATION_ERROR', `roleName must be one of: ${ADMIN_ROLES.join(', ')}`);
+  }
+  const proposal = await proposeAdminRoleGrant({ walletAddress, roleName, actor: actor(req) });
+  sendSuccess(res, proposal, 201);
+}
+
+/** POST /admin/admins/grant/approve — complete a privileged grant (different admin, step-up). */
+export async function postApproveAdminGrant(req: Request, res: Response): Promise<void> {
+  const { proposalId } = (req.body ?? {}) as { proposalId?: unknown };
+  if (typeof proposalId !== 'string' || proposalId.length === 0) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'proposalId is required');
+  }
+  await approveAdminRoleGrant({ proposalId, actor: actor(req) });
+  sendSuccess(res, { approved: true });
+}
+
+/** POST /admin/admins/renew — extend an active assignment before it expires. */
+export async function postRenewAdmin(req: Request, res: Response): Promise<void> {
+  const { walletAddress } = (req.body ?? {}) as { walletAddress?: unknown };
+  if (!isAdminAddress(walletAddress)) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'walletAddress must be a Stellar G… address');
+  }
+  const result = await renewAdminAssignment({ walletAddress, actor: actor(req) });
+  sendSuccess(res, result);
 }
 
 /** GET /admin/audit — append-only admin action trail. */

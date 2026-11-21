@@ -23,8 +23,12 @@ import {
   getChainFeesReport,
   getExecutionQuality,
   pauseAgentControl,
+  postApproveAdminGrant,
   postGrantAdmin,
+  postProposeAdminGrant,
+  postRenewAdmin,
   postRevokeAdmin,
+  getAdminGrantProposals,
   resumeAgentControl,
   getTraceAuditSummary,
   getTreasury,
@@ -57,7 +61,11 @@ router.use(requireAuth);
 // generic request audit.
 router.get('/admins', requirePermission('admin.read'), requireStepUp, getAdmins);
 router.get('/roles', requirePermission('admin.read'), getAdminRoles);
+router.get('/admins/grant/proposals', requirePermission('admin.read'), requireStepUp, getAdminGrantProposals);
+router.post('/admins/grant/propose', requirePermission('admin.manage', { audit: false }), requireStepUp, postProposeAdminGrant);
+router.post('/admins/grant/approve', requirePermission('admin.manage', { audit: false }), requireStepUp, postApproveAdminGrant);
 router.post('/admins/grant', requirePermission('admin.manage', { audit: false }), requireStepUp, postGrantAdmin);
+router.post('/admins/renew', requirePermission('admin.manage', { audit: false }), requireStepUp, postRenewAdmin);
 router.post('/admins/revoke', requirePermission('admin.manage', { audit: false }), requireStepUp, postRevokeAdmin);
 router.get('/audit', requirePermission('admin.audit.read'), requireStepUp, getAdminAudit);
 

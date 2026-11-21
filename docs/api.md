@@ -1185,7 +1185,11 @@ Admin-management endpoints:
 
 - `GET /admin/admins` (`admin.read`, step-up)
 - `GET /admin/roles` (`admin.read`)
-- `POST /admin/admins/grant` `{ walletAddress: "G…", roleName }` (`admin.manage`, step-up)
+- `GET /admin/admins/grant/proposals` (`admin.read`, step-up) — pending two-person grants
+- `POST /admin/admins/grant/propose` `{ walletAddress, roleName }` (`admin.manage`, step-up)
+- `POST /admin/admins/grant/approve` `{ proposalId }` (`admin.manage`, step-up; different admin than proposer)
+- `POST /admin/admins/grant` `{ walletAddress: "G…", roleName }` (`admin.manage`, step-up; non-privileged roles only, otherwise `409 PRIVILEGED_GRANT_REQUIRES_APPROVAL`)
+- `POST /admin/admins/renew` `{ walletAddress: "G…" }` (`admin.manage`, step-up; extends active assignment)
 - `POST /admin/admins/revoke` `{ walletAddress: "G…" }` (`admin.manage`, step-up; refuses `409 LAST_SUPER_ADMIN`)
 - `GET /admin/audit?page&limit` (`admin.audit.read`, step-up)
 

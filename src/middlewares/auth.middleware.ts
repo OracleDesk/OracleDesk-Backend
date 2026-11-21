@@ -10,6 +10,7 @@ import {
   AdminPermission,
   adminAccessFor,
   ensureAdminRbacSeeded,
+  syncAdminRbacCatalogue,
 } from '../services/admin-rbac.service';
 
 export interface JwtPayload {
@@ -226,6 +227,7 @@ export async function isAdminToken(token: unknown): Promise<boolean> {
 /** First-boot RBAC catalogue/seed hook, called after the DB connection is up. */
 export async function bootstrapAdminRbac(): Promise<void> {
   await ensureAdminRbacSeeded();
+  await syncAdminRbacCatalogue();
 }
 
 /**
