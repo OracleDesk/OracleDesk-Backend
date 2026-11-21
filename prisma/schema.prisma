@@ -142,6 +142,10 @@ enum GenerationRunState {
   SKIPPED
   NEEDS_ATTENTION
   CANCELLED
+  GATED
+  VALIDATED
+  SEED_PLANNED
+  TRACE_ENQUEUED
 }
 
 enum TraceAuditStatus {
@@ -357,19 +361,21 @@ model MarketGenerationJob {
 }
 
 model MarketGenerationRun {
-  id            String            @id @default(uuid())
+  id            String             @id @default(uuid())
   trigger       String
   state         GenerationRunState @default(STARTED)
-  attempts      Int               @default(0)
+  attempts      Int                @default(0)
   nextAttemptAt DateTime?
   lockedBy      String?
   lockedUntil   DateTime?
+  fence         Int                @default(0)
+  cycleId       String?
   inputs        Json?
-  outputs       Json              @default("{}")
-  marketId      String?           @unique
+  outputs       Json               @default("{}")
+  marketId      String?            @unique
   lastError     Json?
-  createdAt     DateTime          @default(now())
-  updatedAt     DateTime          @updatedAt
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
 
   market Market? @relation(fields: [marketId], references: [id], onDelete: SetNull)
 
@@ -1566,12 +1572,31 @@ model AdminRoleAssignment {
   walletAddress String   @unique
   roleName      String
   assignedBy    String?
+  expiresAt     DateTime
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
   role          AdminRole @relation(fields: [roleName], references: [name], onDelete: Restrict)
 
   @@index([roleName])
+  @@index([expiresAt])
   @@map("admin_role_assignments")
+}
+
+/// Two-person rule for privileged admin role grants (#276).
+model AdminRoleGrantProposal {
+  id            String   @id @default(uuid())
+  walletAddress String
+  roleName      String
+  proposedBy    String
+  approvedBy    String?
+  status        String   @default("PENDING")
+  expiresAt     DateTime
+  createdAt     DateTime @default(now())
+  decidedAt     DateTime?
+
+  @@index([status, expiresAt])
+  @@index([walletAddress])
+  @@map("admin_role_grant_proposals")
 }
 
 /// Append-only audit trail for admin actions (#49). The migration adds a
@@ -1908,54 +1933,6 @@ model PremiumUsageDaily {
   @@unique([userId, day])
   @@index([distinctIpPrefixes])
   @@map("premium_usage_daily")
-}
-
-/// Market generation saga state (#152, #242). TRACE_PINNED / TRACE_PUBLISHED
-/// are legacy: the saga maps them to TRACE_ENQUEUED on resume.
-enum GenerationRunState {
-  STARTED
-  SIGNALS_READY
-  PROPOSED
-  MARKET_PERSISTED
-  QUESTION_PINNED
-  CHAIN_SUBMITTED
-  CHAIN_CONFIRMED
-  TRACE_PERSISTED
-  TRACE_PINNED
-  TRACE_PUBLISHED
-  COMPLETED
-  SKIPPED
-  NEEDS_ATTENTION
-  CANCELLED
-  GATED
-  VALIDATED
-  SEED_PLANNED
-  TRACE_ENQUEUED
-}
-
-/// One market-generation saga run (#242). Every step persists its outputs
-/// before the next side effect; `fence` increments on every claim so a worker
-/// whose lease expired can no longer write step results.
-model MarketGenerationRun {
-  id            String             @id @default(uuid())
-  trigger       String
-  state         GenerationRunState @default(STARTED)
-  attempts      Int                @default(0)
-  nextAttemptAt DateTime?
-  lockedBy      String?
-  lockedUntil   DateTime?
-  fence         Int                @default(0)
-  cycleId       String?
-  inputs        Json?
-  outputs       Json               @default("{}")
-  marketId      String?            @unique
-  market        Market?            @relation(fields: [marketId], references: [id], onDelete: SetNull)
-  lastError     Json?
-  createdAt     DateTime           @default(now())
-  updatedAt     DateTime           @default(now()) @updatedAt
-
-  @@index([state, nextAttemptAt])
-  @@map("market_generation_runs")
 }
 
 /// Fitted per-category recalibration maps (#244). One active row per

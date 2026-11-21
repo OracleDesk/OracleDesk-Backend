@@ -19,6 +19,7 @@ import { bootstrapAdminRbac, isAdminToken } from './middlewares/auth.middleware'
 import { startTraceAuditCron } from './cron/trace-audit.cron';
 import { startTracePublicationCron } from './cron/trace-publication.cron';
 import { startPaymentIntentCron } from './cron/payment-intent.cron';
+import { startAdminAssignmentCron } from './cron/admin-assignment.cron';
 import { startOpsAlertCron } from './cron/ops-alerts.cron';
 import { startEventListener } from './services/indexer.service';
 import { gateDecision, runSpecCompatGate } from './services/stellar/spec-compat';
@@ -309,6 +310,7 @@ async function bootstrap(): Promise<void> {
     startTraceAuditCron();
     startTracePublicationCron();
     startPaymentIntentCron();
+    startAdminAssignmentCron();
     startDisputeCron();
     // Drift reports reach admins only: sockets join the room with an admin JWT.
     startReconcileCron((event, payload) => {

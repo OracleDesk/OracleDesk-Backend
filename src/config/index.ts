@@ -213,6 +213,18 @@ export const envObjectSchema = z
     // Sensitive admin actions require a wallet proof no older than this (#49).
     STEP_UP_MAX_AGE_SECONDS: z.string().default('300').transform(Number)
       .pipe(z.number().int().min(30).max(3600)),
+    // Admin assignment lifetime by role (#276). Renewals extend to now + TTL.
+    ADMIN_ASSIGNMENT_SUPER_ADMIN_TTL_SECONDS: z.string().default('7776000').transform(Number)
+      .pipe(z.number().int().min(3600).max(31536000)),
+    ADMIN_ASSIGNMENT_OPERATOR_TTL_SECONDS: z.string().default('2592000').transform(Number)
+      .pipe(z.number().int().min(3600).max(31536000)),
+    ADMIN_ASSIGNMENT_AUDITOR_TTL_SECONDS: z.string().default('7776000').transform(Number)
+      .pipe(z.number().int().min(3600).max(31536000)),
+    ADMIN_ASSIGNMENT_EXPIRE_CRON: z.string().default('*/30 * * * * *'),
+    ADMIN_GRANT_PROPOSAL_TTL_SECONDS: z.string().default('86400').transform(Number)
+      .pipe(z.number().int().min(300).max(604800)),
+    // Roles whose permission set intersects this list need propose + approve (#276).
+    ADMIN_PRIVILEGED_GRANT_PERMISSIONS: commaList(z.string(), 'admin.manage,treasury.operate,agents.manage,refund.approve'),
 
     // ── Challenge issuance hardening (#50) ───────────────────────────────
     AUTH_MAX_OUTSTANDING_PER_ADDRESS: z.string().default('5').transform(Number)
