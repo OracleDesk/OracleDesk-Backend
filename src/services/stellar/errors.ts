@@ -22,7 +22,14 @@ const TABLES: Record<string, Record<number, { message: string }>> = {
 export function contractErrorName(contract: keyof typeof TABLES, err: unknown, hostErrorText?: string): string | null {
   const text = [hostErrorText ?? '', err instanceof Error ? err.message : String(err)].join(' ');
   const match = text.match(/Error\(Contract, #(\d+)\)/);
-  if (match) return TABLES[contract][Number(match[1])]?.message ?? `ContractError${match[1]}`;
+  if (match) {
+    const known = TABLES[contract]?.[Number(match[1])]?.message;
+    if (known) return known;
+    import('./spec-monitor')
+      .then((m) => m.requestSpecCheck(`unknown_contract_error:${String(contract)}:${match[1]}`))
+      .catch(() => undefined);
+    return `ContractError${match[1]}`;
+  }
   if (err && typeof err === 'object' && 'error' in err) {
     const inner = (err as { error?: { message?: string } }).error;
     if (inner?.message) return inner.message;

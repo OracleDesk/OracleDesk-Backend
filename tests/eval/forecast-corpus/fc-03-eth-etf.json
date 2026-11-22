@@ -1,0 +1,21 @@
+{
+  "id": "fc-03-eth-etf",
+  "marketId": "mkt-fc-03",
+  "question": "Will Ethereum spot ETF weekly net inflows exceed $500M in mid-November 2026?",
+  "category": "CRYPTO",
+  "closeTime": "2026-11-16T23:59:59.000Z",
+  "resolutionSource": "CHAINLINK",
+  "questionDoc": null,
+  "signals": [
+    {
+      "id": "sig-fc-03-a",
+      "source": "NEWSAPI",
+      "title": "Ethereum institutional funds record $420M inflow in first three days of the week",
+      "publishedAt": "2026-11-13T09:30:00.000Z"
+    }
+  ],
+  "asOf": "2026-11-13T12:00:00.000Z",
+  "marketProbability": 0.58,
+  "resolvedOutcome": 1,
+  "resolvedAt": "2026-11-17T01:00:00.000Z"
+}

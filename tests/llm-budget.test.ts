@@ -272,6 +272,99 @@ const scenarios: Array<[string, (rig: Rig) => Promise<void>]> = [
     assert.equal(await s.setOnce('budget-alert:x', 60), true);
     assert.equal(await rig.process().setOnce('budget-alert:x', 60), false);
   }],
+
+  ['per-class guarantees hold back budget for dispute reviews when routine classes borrow (#327)', async (rig) => {
+    const { DEFAULT_CLASS_POLICY } = await import('../src/lib/llm-budget-store');
+    const s = rig.process();
+    // tokenBudget = 1000:
+    // dispute guarantee=150 cap=400, admin guarantee=100 cap=1000,
+    // generation guarantee=200 cap=500, forecast guarantee=200 cap=500,
+    // hedge guarantee=50 cap=200, other guarantee=0 cap=100
+    const mk = (purposeClass: any, estimate: number) =>
+      base({
+        purposeClass,
+        classPolicy: DEFAULT_CLASS_POLICY,
+        tokenBudget: 1000,
+        costBudgetMicros: 1_000_000,
+        estimate,
+      });
+
+    // generation uses 500 (its 50% CLASS_CAP: 200 guarantee + 300 borrowed)
+    const g1 = mk('generation', 500);
+    const gl1 = await ok(s, g1);
+    await s.record(rec(g1, gl1.day, { purposeClass: 'generation', inputTokens: 500 }));
+
+    // Next generation call hits CLASS_CAP (500 + 10 > 500)
+    const capStop = await denied(s, mk('generation', 10), 'BUDGET_EXCEEDED');
+    assert.equal(capStop.purposeClass, 'generation');
+    assert.equal(capStop.budgetReason, 'CLASS_CAP');
+
+    // forecast uses its 200 guarantee -> total used = 700.
+    // Remaining budget is 300, which equals heldBack for dispute(150) + admin(100) + hedge(50).
+    const f1 = mk('forecast', 200);
+    const fl1 = await ok(s, f1);
+    await s.record(rec(f1, fl1.day, { purposeClass: 'forecast', inputTokens: 200 }));
+
+    // forecast cannot borrow another 50 because 700 + 50 > 1000 - 300 (heldBack)
+    const borrowStop = await denied(s, mk('forecast', 50), 'BUDGET_EXCEEDED');
+    assert.equal(borrowStop.purposeClass, 'forecast');
+    assert.equal(borrowStop.budgetReason, 'RESERVED_FOR_GUARANTEES');
+
+    // dispute CAN use its protected 150 guarantee!
+    const d1 = mk('dispute', 150);
+    const dl1 = await ok(s, d1);
+    await s.record(rec(d1, dl1.day, { purposeClass: 'dispute', inputTokens: 150, costMicros: 42 }));
+
+    const u = await s.usage();
+    assert.equal(u.tokens, 850);
+    assert.equal(u.byClass.generation.tokens, 500);
+    assert.equal(u.byClass.forecast.tokens, 200);
+    assert.equal(u.byClass.dispute.tokens, 150);
+    assert.equal(u.byClass.dispute.costMicros, 42);
+  }],
+
+  ['protected bucket slice reserves tokens for dispute when routine calls drain the bucket (#327)', async (rig) => {
+    const { DEFAULT_CLASS_POLICY } = await import('../src/lib/llm-budget-store');
+    const s = rig.process();
+    const rpm = 10; // maxReserve = 2 (dispute), so generation needs tokens >= 3
+    for (let i = 0; i < 8; i++) {
+      await ok(s, base({ rpm, estimate: 1, purposeClass: 'generation', classPolicy: DEFAULT_CLASS_POLICY }));
+    }
+    // 2 tokens left: routine generation is RATE_LIMITED, but dispute (bucketReserve=2) succeeds twice!
+    await denied(s, base({ rpm, estimate: 1, purposeClass: 'generation', classPolicy: DEFAULT_CLASS_POLICY }), 'RATE_LIMITED');
+    await ok(s, base({ rpm, estimate: 1, purposeClass: 'dispute', classPolicy: DEFAULT_CLASS_POLICY }));
+    await ok(s, base({ rpm, estimate: 1, purposeClass: 'dispute', classPolicy: DEFAULT_CLASS_POLICY }));
+    await denied(s, base({ rpm, estimate: 1, purposeClass: 'dispute', classPolicy: DEFAULT_CLASS_POLICY }), 'RATE_LIMITED');
+  }],
+
+  ['half-open breaker admits a second probe for dispute when primary probe is held by routine work (#327)', async (rig) => {
+    const { DEFAULT_CLASS_POLICY } = await import('../src/lib/llm-budget-store');
+    const s = rig.process();
+    const p0 = base({ purposeClass: 'generation', classPolicy: DEFAULT_CLASS_POLICY });
+    const l0 = await ok(s, p0);
+    await s.record(rec(p0, l0.day, { purposeClass: 'generation', outcome: 'quota', openMs: 250 }));
+    await rig.advance(300);
+
+    // Routine generation takes primary half-open probe slot
+    const routineProbe = base({ purposeClass: 'generation', classPolicy: DEFAULT_CLASS_POLICY });
+    const gProbe = await ok(s, routineProbe);
+    assert.equal(gProbe.probe, true);
+
+    // Another routine call is blocked by CIRCUIT_OPEN
+    await denied(s, base({ purposeClass: 'forecast', classPolicy: DEFAULT_CLASS_POLICY }), 'CIRCUIT_OPEN');
+
+    // A dispute call is admitted in the secondary probe slot (probeHolder2)!
+    const disputeProbe = base({ purposeClass: 'dispute', classPolicy: DEFAULT_CLASS_POLICY });
+    const dProbe = await ok(s, disputeProbe);
+    assert.equal(dProbe.probe, true);
+
+    // A second dispute call while probeHolder2 is active is blocked
+    await denied(s, base({ purposeClass: 'dispute', classPolicy: DEFAULT_CLASS_POLICY }), 'CIRCUIT_OPEN');
+
+    // Dispute probe succeeding closes the breaker for everyone
+    await s.record(rec(disputeProbe, dProbe.day, { purposeClass: 'dispute', probe: true, outcome: 'ok' }));
+    assert.equal(await s.breakerState('anthropic'), 'closed');
+  }],
 ];
 
 for (const [title, run] of scenarios) {
@@ -401,16 +494,20 @@ test('falling back from anthropic to gemini does not double-reserve', async () =
   }
 });
 
-test('cron generation stops at the budget while admin generation still runs', async () => {
+test('cron generation stops at its class cap while admin and dispute still run (#327)', async () => {
   const h = await highLevel();
   try {
     h.llm.setAnthropicClient({ messages: { create: async () => toolUse(goodInput) } });
-    h.budget.setLlmGuardSettings({ rpm: { anthropic: 6000, gemini: 6000 }, tokenBudget: 3000, reservePct: 25 }); // cron cap 2250, admin cap 3000
-    const call = (priority: 'cron' | 'admin') =>
-      h.llm.callLLMStructured(h.schema.marketProposalSpec, P, { maxTokens: 1200, ctx: { purpose: 'x', priority } });
-    await call('cron'); // reserves ~1200, then bills the actual 1200
-    await assert.rejects(call('cron'), (e: any) => e.code === 'LLM_BUDGET_EXCEEDED' && e.statusCode === 429);
-    const admin = await call('admin');
+    // tokenBudget = 3000: generation cap = 50% (1500), admin cap = 100% (3000), dispute guarantee = 15% (450)
+    h.budget.setLlmGuardSettings({ rpm: { anthropic: 6000, gemini: 6000 }, tokenBudget: 3000, reservePct: 25 });
+    const call = (purpose: string, priority: 'cron' | 'admin') =>
+      h.llm.callLLMStructured(h.schema.marketProposalSpec, P, { maxTokens: 1200, ctx: { purpose, priority } });
+    await call('market_generation', 'cron'); // reserves ~1200, then bills the actual 1200
+    await assert.rejects(
+      call('market_generation', 'cron'),
+      (e: any) => e.code === 'LLM_BUDGET_EXCEEDED' && e.statusCode === 429 && e.details.class === 'generation' && e.details.reason === 'CLASS_CAP',
+    );
+    const admin = await call('admin_generation', 'admin');
     assert.equal(admin.provider, 'anthropic');
   } finally {
     h.cleanup();
@@ -453,12 +550,13 @@ test('redis unavailable, fail-closed: acquire throws LLM_CIRCUIT_OPEN with GUARD
 test('redis unavailable, fail-open: a per-process limiter takes over', async () => {
   const h = await highLevel();
   h.budget.setLlmGuardStore(downStore());
-  h.budget.setLlmGuardSettings({ failMode: 'open', rpm: { anthropic: 2, gemini: 2 }, maxWaitMs: 50 });
+  h.budget.setLlmGuardSettings({ failMode: 'open', rpm: { anthropic: 4, gemini: 4 }, maxWaitMs: 50 });
   try {
-    const ctx = { purpose: 'x', priority: 'cron' as const };
+    const ctx = { purpose: 'market_generation', priority: 'cron' as const };
     const first = await h.budget.acquire('anthropic', ctx, 10);
     assert.equal(first.local, true);
     await h.budget.acquire('anthropic', ctx, 10);
+    // 2 tokens left in bucket (protected for dispute): 3rd routine call hits LLM_RATE_LIMITED
     await assert.rejects(h.budget.acquire('anthropic', ctx, 10), (e: any) => e.code === 'LLM_RATE_LIMITED');
     await h.budget.record(first, null, 'ok'); // a dead store never fails the caller
 
@@ -471,22 +569,62 @@ test('redis unavailable, fail-open: a per-process limiter takes over', async () 
   }
 });
 
-test('RATE_LIMITED waits for a token instead of failing', async () => {
+test('RATE_LIMITED waits for a token instead of failing, and dispute waits up to its window deadline (#327)', async () => {
   const h = await highLevel();
   let now = Date.UTC(2026, 9, 18, 10, 0, 0);
   const { MemoryGuardStore } = h.budget;
   const store = new MemoryGuardStore(() => now);
   h.budget.setLlmGuardStore(store);
-  h.budget.setLlmGuardSettings({ rpm: { anthropic: 60, gemini: 60 } });
+  h.budget.setLlmGuardSettings({ rpm: { anthropic: 60, gemini: 60 }, maxWaitMs: 2_000, disputeMaxWaitMs: 120_000 });
   const waits: number[] = [];
   h.budget.setLlmWait(async (ms) => { waits.push(ms); now += ms; });
   try {
-    const ctx = { purpose: 'x', priority: 'cron' as const };
-    for (let i = 0; i < 60; i++) await h.budget.acquire('anthropic', ctx, 1);
-    await h.budget.acquire('anthropic', ctx, 1); // 61st: waits ~1 s for a refill
+    const ctx = { purpose: 'market_generation', priority: 'cron' as const };
+    // Routine class leaves 2 reserved tokens in the 60-token bucket, so 58 calls drain its slice
+    for (let i = 0; i < 58; i++) await h.budget.acquire('anthropic', ctx, 1);
+    await h.budget.acquire('anthropic', ctx, 1); // 59th: waits ~1 s for a refill
     assert.equal(waits.length, 1);
     assert.ok(waits[0] >= 1000 && waits[0] <= 1300, `waited ${waits[0]}`);
+
+    // Drain remaining 2 tokens with dispute calls
+    const disputeCtx = { purpose: 'dispute_review', priority: 'cron' as const, deadlineMs: now + 90_000 };
+    await h.budget.acquire('anthropic', disputeCtx, 1);
+    await h.budget.acquire('anthropic', disputeCtx, 1);
+    // Bucket is now at 0; next dispute call waits with deadline-aware limit
+    await h.budget.acquire('anthropic', disputeCtx, 1);
+    assert.equal(waits.length, 2);
   } finally {
+    h.cleanup();
+  }
+});
+
+test('OpenAI calls go through withLease, and getLlmUsage reports per-class consumption (#327)', async () => {
+  const h = await highLevel();
+  const { openaiProvider, setOpenAIClient } = await import('../src/lib/llm/providers/openai');
+  try {
+    setOpenAIClient({
+      chat: {
+        completions: {
+          create: async () => ({
+            choices: [{ message: { content: '{"ok":true}' } }],
+            usage: { prompt_tokens: 120, completion_tokens: 30 },
+          }),
+        },
+      },
+    });
+    const res = await openaiProvider.complete(
+      { provider: 'openai', model: 'gpt-4o-mini', temperature: 0.2, maxTokens: 200, timeoutMs: 5000, retries: 0 },
+      { task: 'generic_json', system: 'sys', user: 'user', mode: 'json', ctx: { purpose: 'dispute_review', priority: 'cron' } },
+    );
+    assert.equal(res.text, '{"ok":true}');
+
+    const usage = await h.budget.getLlmUsage();
+    assert.equal(usage.total.tokens, 150);
+    assert.equal(usage.byClass.dispute.tokens, 150);
+    assert.equal(usage.byClass.dispute.guarantee, Math.floor((usage.tokenBudget * 15) / 100));
+    assert.equal(usage.byClass.dispute.cap, Math.floor((usage.tokenBudget * 40) / 100));
+  } finally {
+    setOpenAIClient(null);
     h.cleanup();
   }
 });

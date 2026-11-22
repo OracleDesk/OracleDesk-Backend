@@ -56,7 +56,8 @@ app.use((req, res, next) => {
   const inbound = acceptInboundId(raw);
   const requestId = newId('req');
   res.setHeader('X-Request-Id', inbound ?? requestId);
-  runWithContext({ requestId, kind: 'http', clientRequestId: inbound }, () => {
+  const callerClass = req.user || req.headers.authorization ? 'interactive' : 'public';
+  runWithContext({ requestId, kind: 'http', clientRequestId: inbound, callerClass }, () => {
     res.locals.requestContext = currentContext();
     next();
   });

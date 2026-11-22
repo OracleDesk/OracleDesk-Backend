@@ -82,12 +82,14 @@ test('wire schemas convert to JSON Schema without unrepresentable types', async 
   for (const spec of [schema.marketProposalSpec, schema.traceReasoningSpec]) {
     assert.equal(spec.jsonSchema.type, 'object');
     assert.equal(spec.jsonSchema.$schema, undefined);
-    // The #90 price fields are the only optional ones; nothing else may have
-    // become optional through a .default/.catch.
+    // The #90 price fields and #302 hedge_predicates are the only optional ones;
+    // nothing else may have become optional through a .default/.catch.
     assert.deepEqual(
       [...spec.jsonSchema.required].sort(),
-      Object.keys(spec.jsonSchema.properties).filter((k) => !k.startsWith('price_')).sort(),
-      'every wire field but the optional price fields is required',
+      Object.keys(spec.jsonSchema.properties)
+        .filter((k) => !k.startsWith('price_') && k !== 'hedge_predicates')
+        .sort(),
+      'every wire field but the optional price and hedge_predicates fields is required',
     );
   }
   assert.equal(schema.marketProposalSpec.jsonSchema.properties.settlement_currency.const, 'USDC');

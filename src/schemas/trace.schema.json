@@ -89,7 +89,6 @@
     },
     "confidenceInterval": {
       "type": "object",
-      "description": "lower must be <= upper",
       "additionalProperties": false,
       "required": [
         "lower",
@@ -137,6 +136,13 @@
         }
       }
     },
+    "citedSourceIds": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "string"
+      }
+    },
     "betFraction": {
       "type": [
         "number",
@@ -151,7 +157,6 @@
     },
     "hedgeConditions": {
       "type": "array",
-      "maxItems": 20,
       "items": {
         "type": "string",
         "maxLength": 500

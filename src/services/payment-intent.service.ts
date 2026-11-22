@@ -18,6 +18,7 @@ import {
   withAdvisoryLocksWait,
 } from '../lib/advisory-lock';
 import {
+  CLAIM_LOCKED_TIMEOUT_MS,
   DAILY_PASS_PRICE_RAW,
   floatMirror,
   paymentClaimLockKey,
@@ -25,7 +26,12 @@ import {
   settleVerifiedTransfer,
   userPaymentLockKey,
 } from './subscription.service';
-import { verifyUsdcTransfer, VerifiedTransfer } from './payment-verification.service';
+import {
+  evaluateTransfer,
+  getTxFacts,
+  type TxFacts,
+  type VerifiedTransfer,
+} from './payment-verification.service';
 
 export interface PaymentIntentView {
   id: string;
@@ -179,63 +185,93 @@ export async function submitPaymentIntent(params: {
     throw new AppError(400, 'VALIDATION_ERROR', 'txHash must be a 64-character lowercase hex Stellar transaction hash');
   }
 
-  const initial = await prisma.paymentIntent.findUnique({ where: { id } });
-  if (!initial || initial.userId !== userId) {
-    throw new AppError(404, 'PAYMENT_INTENT_NOT_FOUND', 'Payment intent not found');
-  }
-  if (initial.status === PaymentIntentStatus.CONFIRMED) {
-    return { status: 'CONFIRMED', intent: view(initial) };
-  }
-  if (initial.status === PaymentIntentStatus.REFUND_REQUIRED) {
-    return { status: 'REFUND_REQUIRED', intent: view(initial) };
-  }
-  if (initial.status === PaymentIntentStatus.FAILED || initial.status === PaymentIntentStatus.EXPIRED) {
-    throw new AppError(409, 'PAYMENT_INTENT_CLOSED', 'This payment intent is no longer open');
-  }
-  if (initial.txHash && initial.txHash !== txHash) {
-    throw new AppError(409, 'PAYMENT_INTENT_TX_MISMATCH', 'A different transaction is already attached to this intent');
-  }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    // Phase A (unlocked, #305): read the intent to learn expected terms and
+    // fetch immutable chain facts before acquiring advisory locks.
+    const initial = await prisma.paymentIntent.findUnique({ where: { id } });
+    if (!initial || initial.userId !== userId) {
+      throw new AppError(404, 'PAYMENT_INTENT_NOT_FOUND', 'Payment intent not found');
+    }
+    if (initial.status === PaymentIntentStatus.CONFIRMED) {
+      return { status: 'CONFIRMED', intent: view(initial) };
+    }
+    if (initial.status === PaymentIntentStatus.REFUND_REQUIRED) {
+      return { status: 'REFUND_REQUIRED', intent: view(initial) };
+    }
+    if (initial.status === PaymentIntentStatus.FAILED || initial.status === PaymentIntentStatus.EXPIRED) {
+      throw new AppError(409, 'PAYMENT_INTENT_CLOSED', 'This payment intent is no longer open');
+    }
+    if (initial.txHash && initial.txHash !== txHash) {
+      throw new AppError(409, 'PAYMENT_INTENT_TX_MISMATCH', 'A different transaction is already attached to this intent');
+    }
 
-  const claim = await withAdvisoryLocksWait(
-    [paymentClaimLockKey(txHash), userPaymentLockKey(userId)],
-    async (tx) => {
-      const intent = await tx.paymentIntent.findUnique({ where: { id } });
-      if (!intent || intent.userId !== userId) {
-        throw new AppError(404, 'PAYMENT_INTENT_NOT_FOUND', 'Payment intent not found');
-      }
-      if (intent.status === PaymentIntentStatus.CONFIRMED) {
-        return { status: 'CONFIRMED' as const, intent: view(intent) };
-      }
-      if (intent.status === PaymentIntentStatus.REFUND_REQUIRED) {
-        return { status: 'REFUND_REQUIRED' as const, intent: view(intent) };
-      }
-      if (intent.status === PaymentIntentStatus.FAILED || intent.status === PaymentIntentStatus.EXPIRED) {
-        throw new AppError(409, 'PAYMENT_INTENT_CLOSED', 'This payment intent is no longer open');
-      }
-      if (intent.txHash && intent.txHash !== txHash) {
-        throw new AppError(409, 'PAYMENT_INTENT_TX_MISMATCH', 'A different transaction is already attached to this intent');
-      }
-      if (await existingHashReplay(tx, txHash, intent)) {
-        const settled = await tx.paymentIntent.findUnique({ where: { id } });
-        return { status: 'CONFIRMED' as const, intent: view(settled) };
-      }
+    const expectedSnapshot = {
+      token: initial.token,
+      recipient: initial.recipient,
+      memo: initial.memo,
+      amountRaw: initial.amountRaw.toString(),
+    };
 
-      const now = new Date();
-      const requiredRaw = decimalToBigint(intent.amountRaw);
-      let transfer: VerifiedTransfer;
-      try {
-        transfer = await verifyUsdcTransfer({
-          txHash,
-          token: intent.token,
-          from: walletAddress,
-          to: intent.recipient,
-          // Read the actual amount so underpayments can be recorded and routed
-          // to manual review instead of vanishing behind a 402.
-          minAmount: 0n,
-          memo: { type: 'text', value: intent.memo },
-        });
-      } catch (err) {
-        if (err instanceof AppError && err.code === 'PAYMENT_NOT_FOUND') {
+    type PhaseAOutcome =
+      | { kind: 'NOT_FOUND' }
+      | { kind: 'FAILED'; facts: TxFacts }
+      | { kind: 'SUCCESS'; facts: TxFacts };
+
+    let phaseA: PhaseAOutcome;
+    try {
+      const facts = await getTxFacts(txHash);
+      phaseA = facts.status === 'FAILED' ? { kind: 'FAILED', facts } : { kind: 'SUCCESS', facts };
+    } catch (err) {
+      if (err instanceof AppError && err.code === 'PAYMENT_NOT_FOUND') {
+        phaseA = { kind: 'NOT_FOUND' };
+      } else {
+        throw err;
+      }
+    }
+
+    type LockedOutcome =
+      | { kind: 'RESULT'; result: SubmitIntentResult }
+      | { kind: 'RESTART' }
+      | { kind: 'THROW_FAILED' };
+
+    // Phase B (locked, DB-only): re-check every intent invariant and settle
+    // against the already-fetched immutable facts.
+    const claim = await withAdvisoryLocksWait<LockedOutcome>(
+      [paymentClaimLockKey(txHash), userPaymentLockKey(userId)],
+      async (tx) => {
+        const intent = await tx.paymentIntent.findUnique({ where: { id } });
+        if (!intent || intent.userId !== userId) {
+          throw new AppError(404, 'PAYMENT_INTENT_NOT_FOUND', 'Payment intent not found');
+        }
+        if (intent.status === PaymentIntentStatus.CONFIRMED) {
+          return { kind: 'RESULT' as const, result: { status: 'CONFIRMED' as const, intent: view(intent) } };
+        }
+        if (intent.status === PaymentIntentStatus.REFUND_REQUIRED) {
+          return { kind: 'RESULT' as const, result: { status: 'REFUND_REQUIRED' as const, intent: view(intent) } };
+        }
+        if (intent.status === PaymentIntentStatus.FAILED || intent.status === PaymentIntentStatus.EXPIRED) {
+          throw new AppError(409, 'PAYMENT_INTENT_CLOSED', 'This payment intent is no longer open');
+        }
+        if (intent.txHash && intent.txHash !== txHash) {
+          throw new AppError(409, 'PAYMENT_INTENT_TX_MISMATCH', 'A different transaction is already attached to this intent');
+        }
+        if (await existingHashReplay(tx, txHash, intent)) {
+          const settled = await tx.paymentIntent.findUnique({ where: { id } });
+          return { kind: 'RESULT' as const, result: { status: 'CONFIRMED' as const, intent: view(settled) } };
+        }
+
+        if (
+          intent.token !== expectedSnapshot.token ||
+          intent.recipient !== expectedSnapshot.recipient ||
+          intent.memo !== expectedSnapshot.memo ||
+          intent.amountRaw.toString() !== expectedSnapshot.amountRaw
+        ) {
+          return { kind: 'RESTART' as const };
+        }
+
+        const now = new Date();
+
+        if (phaseA.kind === 'NOT_FOUND') {
           const attempts = intent.attempts + 1;
           const pending = await tx.paymentIntent.update({
             where: { id },
@@ -248,81 +284,103 @@ export async function submitPaymentIntent(params: {
               failureCode: 'PAYMENT_NOT_FOUND',
             },
           });
-          return { status: 'PENDING_PAYMENT' as const, intent: view(pending) };
+          return { kind: 'RESULT' as const, result: { status: 'PENDING_PAYMENT' as const, intent: view(pending) } };
         }
-        if (err instanceof AppError && err.code === 'PAYMENT_FAILED') {
+
+        if (phaseA.kind === 'FAILED') {
           await tx.paymentIntent.update({
             where: { id },
-            data: { status: PaymentIntentStatus.FAILED, txHash, failureCode: err.code, nextAttemptAt: null },
+            data: { status: PaymentIntentStatus.FAILED, txHash, failureCode: 'PAYMENT_FAILED', nextAttemptAt: null },
           });
+          return { kind: 'THROW_FAILED' as const };
         }
-        throw err;
-      }
 
-      const closeAt = ledgerCloseDate(transfer.createdAt) ?? now;
-      const late = closeAt.getTime() > intent.expiresAt.getTime();
-      const underpaymentRaw = transfer.amount < requiredRaw ? requiredRaw - transfer.amount : 0n;
-      const overpaymentRaw = transfer.amount > requiredRaw ? transfer.amount - requiredRaw : 0n;
+        const requiredRaw = decimalToBigint(intent.amountRaw);
+        // Pure evaluation against immutable facts (no RPC I/O inside the lock).
+        const transfer: VerifiedTransfer = evaluateTransfer(phaseA.facts, {
+          txHash,
+          token: intent.token,
+          from: walletAddress,
+          to: intent.recipient,
+          // Read the actual amount so underpayments can be recorded and routed
+          // to manual review instead of vanishing behind a 402.
+          minAmount: 0n,
+          memo: { type: 'text', value: intent.memo },
+        });
 
-      if (late || underpaymentRaw > 0n) {
-        const eventId = await recordUnappliedPayment(tx, {
-          intent,
+        const closeAt = ledgerCloseDate(transfer.createdAt) ?? now;
+        const late = closeAt.getTime() > intent.expiresAt.getTime();
+        const underpaymentRaw = transfer.amount < requiredRaw ? requiredRaw - transfer.amount : 0n;
+        const overpaymentRaw = transfer.amount > requiredRaw ? transfer.amount - requiredRaw : 0n;
+
+        if (late || underpaymentRaw > 0n) {
+          const eventId = await recordUnappliedPayment(tx, {
+            intent,
+            transfer,
+            reason: late ? 'LATE_PAYMENT' : 'UNDERPAYMENT',
+            underpaymentRaw,
+            latePayment: late,
+          });
+          const updated = await tx.paymentIntent.update({
+            where: { id },
+            data: {
+              status: PaymentIntentStatus.REFUND_REQUIRED,
+              txHash,
+              paymentEventId: eventId,
+              underpaymentRaw: underpaymentRaw > 0n ? underpaymentRaw.toString() : null,
+              overpaymentRaw: overpaymentRaw > 0n ? overpaymentRaw.toString() : null,
+              latePayment: late,
+              refundRequired: true,
+              expiredAt: late ? intent.expiresAt : null,
+              confirmedAt: null,
+              nextAttemptAt: null,
+              failureCode: late ? 'LATE_PAYMENT' : 'UNDERPAYMENT',
+            },
+          });
+          return { kind: 'RESULT' as const, result: { status: 'REFUND_REQUIRED' as const, intent: view(updated) } };
+        }
+
+        const settlement = await settleVerifiedTransfer(tx, {
+          userId,
+          type: 'DAILY_PASS',
           transfer,
-          reason: late ? 'LATE_PAYMENT' : 'UNDERPAYMENT',
-          underpaymentRaw,
-          latePayment: late,
+          paymentIntentId: intent.id,
         });
         const updated = await tx.paymentIntent.update({
           where: { id },
           data: {
-            status: PaymentIntentStatus.REFUND_REQUIRED,
+            status: PaymentIntentStatus.CONFIRMED,
             txHash,
-            paymentEventId: eventId,
-            underpaymentRaw: underpaymentRaw > 0n ? underpaymentRaw.toString() : null,
+            subscriptionId: settlement.subscription.id,
+            paymentEventId: settlement.paymentEventId,
             overpaymentRaw: overpaymentRaw > 0n ? overpaymentRaw.toString() : null,
-            latePayment: late,
-            refundRequired: true,
-            expiredAt: late ? intent.expiresAt : null,
-            confirmedAt: null,
+            underpaymentRaw: null,
+            latePayment: false,
+            refundRequired: false,
+            confirmedAt: new Date(),
             nextAttemptAt: null,
-            failureCode: late ? 'LATE_PAYMENT' : 'UNDERPAYMENT',
+            failureCode: null,
           },
         });
-        return { status: 'REFUND_REQUIRED' as const, intent: view(updated) };
-      }
+        return { kind: 'RESULT' as const, result: { status: 'CONFIRMED' as const, intent: view(updated) } };
+      },
+      { waitMs: 30_000, timeoutMs: CLAIM_LOCKED_TIMEOUT_MS },
+    );
 
-      const settlement = await settleVerifiedTransfer(tx, {
-        userId,
-        type: 'DAILY_PASS',
-        transfer,
-        paymentIntentId: intent.id,
-      });
-      const updated = await tx.paymentIntent.update({
-        where: { id },
-        data: {
-          status: PaymentIntentStatus.CONFIRMED,
-          txHash,
-          subscriptionId: settlement.subscription.id,
-          paymentEventId: settlement.paymentEventId,
-          overpaymentRaw: overpaymentRaw > 0n ? overpaymentRaw.toString() : null,
-          underpaymentRaw: null,
-          latePayment: false,
-          refundRequired: false,
-          confirmedAt: new Date(),
-          nextAttemptAt: null,
-          failureCode: null,
-        },
-      });
-      return { status: 'CONFIRMED' as const, intent: view(updated) };
-    },
-    { waitMs: 30_000, timeoutMs: 60_000 },
-  );
-
-  if (!claim.acquired) {
-    throw new AppError(409, 'PAYMENT_CLAIM_IN_PROGRESS', 'This payment is being processed; retry shortly');
+    if (!claim.acquired) {
+      throw new AppError(409, 'PAYMENT_CLAIM_IN_PROGRESS', 'This payment is being processed; retry shortly');
+    }
+    if (claim.value.kind === 'RESTART') {
+      continue;
+    }
+    if (claim.value.kind === 'THROW_FAILED') {
+      throw new AppError(402, 'PAYMENT_FAILED', 'The payment transaction failed on-chain');
+    }
+    logger.info({ intentId: id, status: claim.value.result.status, txHash }, 'Payment intent submission processed');
+    return claim.value.result;
   }
-  logger.info({ intentId: id, status: claim.value.status, txHash }, 'Payment intent submission processed');
-  return claim.value;
+
+  throw new AppError(409, 'PAYMENT_CLAIM_IN_PROGRESS', 'Payment intent changed during verification; retry shortly');
 }
 
 /**

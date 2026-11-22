@@ -2,6 +2,28 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { v7 as uuidv7 } from 'uuid';
 import { config } from '../config';
 
+export type CallerClass = 'critical' | 'agent' | 'interactive' | 'public' | 'background';
+
+export const CALLER_CLASSES: readonly CallerClass[] = [
+  'critical',
+  'agent',
+  'interactive',
+  'public',
+  'background',
+] as const;
+
+export const CALLER_CLASS_RANK: Record<CallerClass, number> = {
+  critical: 4,
+  agent: 3,
+  interactive: 2,
+  public: 1,
+  background: 0,
+};
+
+export function isHigherCallerClass(a: CallerClass, b: CallerClass): boolean {
+  return CALLER_CLASS_RANK[a] > CALLER_CLASS_RANK[b];
+}
+
 export interface RequestContext {
   requestId: string;
   kind: 'http' | 'cron' | 'job' | 'indexer';
@@ -9,6 +31,8 @@ export interface RequestContext {
   jobId?: string;
   userId?: string;
   job?: string;
+  /** RPC traffic priority class carried through AsyncLocalStorage (#300). */
+  callerClass?: CallerClass;
   /**
    * Inbound `X-Request-Id` from the client, retained for log search only.
    * The durable `requestId` above is always server-generated (#236), so an
@@ -90,6 +114,49 @@ export function runWithContext<T>(ctx: Omit<RequestContext, 'startedAt'>, fn: ()
   return als.run({ ...ctx, startedAt: Date.now() }, fn);
 }
 
+/**
+ * Run `fn` inside a nested context with the given RPC caller class (#300).
+ * Never lowers an enclosing `critical` class so write-path simulations and
+ * confirmations remain protected even when calling shared helpers.
+ */
+export function withCallerClass<T>(cls: CallerClass, fn: () => T): T {
+  const parent = als.getStore();
+  const effective: CallerClass = parent?.callerClass === 'critical' ? 'critical' : cls;
+  if (parent) {
+    return als.run({ ...parent, callerClass: effective }, fn);
+  }
+  return als.run(
+    {
+      requestId: newId('job'),
+      kind: 'job',
+      callerClass: effective,
+      startedAt: Date.now(),
+    },
+    fn,
+  );
+}
+
+/**
+ * Effective RPC caller class for the current async context (#300).
+ * Defaults by context kind when no explicit class is set:
+ *   http -> interactive (when authenticated) | public
+ *   cron | job | indexer -> background
+ */
+export function currentCallerClass(): CallerClass {
+  const ctx = als.getStore();
+  if (!ctx) return 'background';
+  if (ctx.callerClass) {
+    if (ctx.kind === 'http' && ctx.userId && ctx.callerClass === 'public') {
+      return 'interactive';
+    }
+    return ctx.callerClass;
+  }
+  if (ctx.kind === 'http') {
+    return ctx.userId ? 'interactive' : 'public';
+  }
+  return 'background';
+}
+
 /** Time-sortable id (uuid v7), e.g. `req_018f...`. */
 export function newId(prefix: 'req' | 'cyc' | 'job'): string {
   return `${prefix}_${uuidv7()}`;
@@ -142,4 +209,27 @@ const INBOUND_ID = /^[A-Za-z0-9._:-]{8,64}$/;
 export function acceptInboundId(value: string | undefined): string | undefined {
   if (!config.TRUST_INBOUND_REQUEST_ID || !value) return undefined;
   return INBOUND_ID.test(value) ? value : undefined;
+}
+
+// ─── Active Advisory Lock Tracking (#305) ───────────────────────────────────
+
+const activeLockAls = new AsyncLocalStorage<readonly string[]>();
+
+/** Runs `fn` with the currently held advisory-lock keys recorded in ALS. */
+export function withActiveLockContext<T>(keys: readonly string[], fn: () => T): T {
+  const existing = activeLockAls.getStore();
+  const merged = existing ? [...existing, ...keys] : [...keys];
+  return activeLockAls.run(merged, fn);
+}
+
+/** Advisory-lock keys held by the current async execution, if any. */
+export function activeLockKeys(): readonly string[] | undefined {
+  return activeLockAls.getStore();
+}
+
+/** True when the current async execution holds a payment advisory lock (`payment:*`). */
+export function isInPaymentLock(): boolean {
+  const keys = activeLockAls.getStore();
+  if (!keys) return false;
+  return keys.some((k) => k.startsWith('payment:'));
 }

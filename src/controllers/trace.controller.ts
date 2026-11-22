@@ -7,6 +7,7 @@ import { logger } from '../lib/logger';
 import { sendSuccess, sendError, parsePagination, buildPaginationMeta } from '../utils/response.util';
 import { summarizeProvenance } from '../lib/llm/provenance';
 import { verifyTraceOnChain } from '../services/trace-publish.service';
+import { formatTraceVerdict } from '../services/trace-audit.service';
 import { unwrapKey } from '../services/trace-crypto.service';
 import { parseUsdc } from '../lib/amounts';
 import {
@@ -88,18 +89,26 @@ export async function listTraces(req: Request, res: Response): Promise<void> {
         provenance:          true,
         lastAuditStatus:     true,
         lastAuditedAt:       true,
+        verdict:             true,
+        verdictReason:       true,
+        verdictEffectiveFrom: true,
+        verdictCheckedAt:    true,
         createdAt:           true,
         market: { select: { question: true, category: true, settlementCurrency: true, onChainMarketId: true } },
-      },
+      } as any,
     }),
     prisma.reasoningTrace.count({ where }),
   ]);
 
-  const formattedTraces = traces.map(({ provenance, ...t }) => ({
-    ...t,
-    provenance: { summary: summarizeProvenance(provenance) },
-    audit: t.lastAuditStatus ? { status: t.lastAuditStatus, checkedAt: t.lastAuditedAt } : null,
-  }));
+  const formattedTraces = traces.map((row: any) => {
+    const { provenance, verdict, verdictReason, verdictEffectiveFrom, verdictCheckedAt, ...t } = row;
+    return {
+      ...t,
+      provenance: { summary: summarizeProvenance(provenance) },
+      audit: t.lastAuditStatus ? { status: t.lastAuditStatus, checkedAt: t.lastAuditedAt } : null,
+      verdict: formatTraceVerdict({ verdict, verdictReason, verdictEffectiveFrom, verdictCheckedAt }),
+    };
+  });
 
   sendSuccess(res, formattedTraces, 200, buildPaginationMeta(page, limit, total) as any);
 }

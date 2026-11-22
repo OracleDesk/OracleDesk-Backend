@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { config } from '../config';
 import { secret } from '../config/secrets';
+import { getReceiptJwks } from '../controllers/receipt.controller';
 import { renderSep7StellarToml } from '../services/sep7.service';
 import { getEntitlementJwks } from '../services/entitlement/token.service';
 
@@ -48,6 +49,7 @@ export function createWellKnownRouter(resolveSecret?: () => string): Router {
       res.status(err.statusCode ?? 503).json({ error: err.code ?? 'ENTITLEMENT_KEYS_UNAVAILABLE' });
     }
   });
+  router.get('/oracledesk-receipt-keys.json', getReceiptJwks);
 
   return router;
 }

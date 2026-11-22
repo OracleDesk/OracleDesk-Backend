@@ -1,18 +1,43 @@
 {
-  "source": "OracleDesk-SmartContract@eb5f3fdaf00a39dabd7e7d41eb84e6d2c1940551",
-  "commit": "eb5f3fdaf00a39dabd7e7d41eb84e6d2c1940551",
+  "source": "OracleDesk-SmartContract@44547c219aa118dcd37bd2623f5d6f67660c0c30",
+  "commit": "44547c219aa118dcd37bd2623f5d6f67660c0c30",
   "network": "testnet",
   "contracts": {
     "marketCore": {
       "binding": "market-core.ts",
       "contractId": "CC4MMHWZ6ZRYAOQRR42KIIWNEZNFM4CWQ5Y4NNWTWNRUYH2O7E3SRK2O",
-      "specSha256": "59e1db633a7b43821ec35edc4c25cf7607508b6289b8e714b8298e0b9d604803",
+      "specSha256": "5c224104a3ab5fed56b1639b359c6279b858fd85cb291e9fad4788c0e2580ab8",
       "expectedWasmHash": null,
       "entries": [
         {
           "kind": "error",
           "name": "Error",
-          "sha256": "b5ff42f1d7dd8f42578cdeb26b994677e6c475849122deb70597465e2ef3021d"
+          "sha256": "5f963441401c84ef780a20a046c8fcc91914cb7406925fc879edc25fad2aed3b"
+        },
+        {
+          "kind": "event",
+          "name": "AdminTransferCancelled",
+          "sha256": "1c582c802d283137bca3ead164b92bd2abab5c4ce508228623d16164bc334c3a"
+        },
+        {
+          "kind": "event",
+          "name": "AdminTransferProposed",
+          "sha256": "4b192858830b8ff5b76ae3e72bd453d74b38a9347dc534c6507e8655922b3d26"
+        },
+        {
+          "kind": "event",
+          "name": "AdminTransferred",
+          "sha256": "9961930626a5f142712561e5c93e0be473db3008dcde48db7a14f1d98af6dc5e"
+        },
+        {
+          "kind": "event",
+          "name": "CollateralAdded",
+          "sha256": "3604aa3c10437c7c0f11a33816a81c3569fb4aa0a5748882f796435f513579dd"
+        },
+        {
+          "kind": "event",
+          "name": "CollateralEnabledSet",
+          "sha256": "cfc7959b107166cc2b792156143582c8c9dd4eea91281163f45a32751341d6ff"
         },
         {
           "kind": "event",
@@ -21,8 +46,33 @@
         },
         {
           "kind": "event",
+          "name": "FeesSweptTo",
+          "sha256": "ac35822db3b7506849259c25f7539c7112c83ba4e12199dfca8e49972c63568f"
+        },
+        {
+          "kind": "event",
+          "name": "LpFeesClaimed",
+          "sha256": "b74407f59d8c1759fea1782c0e1b6d299371dfae7afa634106062ee1e02b40e9"
+        },
+        {
+          "kind": "event",
+          "name": "LpTransferred",
+          "sha256": "86dfda07305e8c012072bc4c5334b271d14fb01ba89221817288da12fe313e9b"
+        },
+        {
+          "kind": "event",
+          "name": "MarketCollateralSet",
+          "sha256": "1955096b8f8f4ab7b1b905c97216e391082a940d94f89debaed44149fdf2c96c"
+        },
+        {
+          "kind": "event",
           "name": "MarketCreated",
           "sha256": "81d17a9b472bfae2fa72c05a66d0630c2db44ad59ab832f4fada42e36c63b630"
+        },
+        {
+          "kind": "event",
+          "name": "MarketFinalized",
+          "sha256": "e18aecbcfa00ae73c3972c3ab38213f011935161b60ab92e00cd648d678f7312"
         },
         {
           "kind": "event",
@@ -31,8 +81,33 @@
         },
         {
           "kind": "event",
+          "name": "PoolRemainderClaimed",
+          "sha256": "21706b90c8e6dc098780007f76dd295ac912c907d36a10a5d8d73575fa587347"
+        },
+        {
+          "kind": "event",
+          "name": "PositionTransferred",
+          "sha256": "befe3189f4eb4ef2a29f0b71bae91f0e04809de8960c32a68f0a03197163a5e7"
+        },
+        {
+          "kind": "event",
+          "name": "ProtocolFeeShareChanged",
+          "sha256": "10bd8691fdda235a0ce1db171921e11d6893e38e9b9bc677aba55d200eb6e7f4"
+        },
+        {
+          "kind": "event",
           "name": "Redeemed",
           "sha256": "71435248a6218e254fe4e1329f9ef43d29d404f3d809c993364fa5d57f377ef8"
+        },
+        {
+          "kind": "event",
+          "name": "ResolverChanged",
+          "sha256": "8b893021805c69414efb70eb0df8e3ed78160aa941232dfa4f084b774083dcba"
+        },
+        {
+          "kind": "event",
+          "name": "ResolverProposed",
+          "sha256": "3b1165743adca3aef62190b03aaa8d54b1cbcafb11af2fbb2ca4ddfb14933993"
         },
         {
           "kind": "event",
@@ -40,24 +115,104 @@
           "sha256": "d426d1a7a3c822f0a1e76dd8f531f4a319d8f1bad078d8fa0e4051a9e80e4241"
         },
         {
+          "kind": "event",
+          "name": "TreasuryChanged",
+          "sha256": "f5d22988e3b7cdb09d5973054003052817f515260a4db247ea9f80a7cda0e2f3"
+        },
+        {
+          "kind": "event",
+          "name": "TreasuryProposed",
+          "sha256": "ec0dadf2b7a6379db276bb3a9a379b1bc7b1e747afda5715302765881b2a703b"
+        },
+        {
           "kind": "function",
           "name": "__constructor",
-          "sha256": "6cb18a95c6b36b503a2412c4053fe250f0360d883109eb7d2c44e06e79ab7ae1"
+          "sha256": "38e944c514454eacfb2e5a82707b4d9a3ba1991a2d26c876ef8eb757a145f467"
+        },
+        {
+          "kind": "function",
+          "name": "accept_admin",
+          "sha256": "8696d4f7a8c60185d9f32475214a8e18524e1ddf5f477e808c2b601a01b216a0"
+        },
+        {
+          "kind": "function",
+          "name": "accept_resolver",
+          "sha256": "f384ac2761290e44f78f65000074896ba714b98386b1bef2ce2757841325524e"
+        },
+        {
+          "kind": "function",
+          "name": "accept_treasury",
+          "sha256": "1d161117566b4a80fb2ed8dce0db94fd0b8b5ba372c50871eece2b1429da108d"
+        },
+        {
+          "kind": "function",
+          "name": "add_collateral",
+          "sha256": "310adb9b89a63aac7407a3b035bdbaf589a547b81959a9561854f453f3c1815e"
+        },
+        {
+          "kind": "function",
+          "name": "admin",
+          "sha256": "5063ad2b063ca69155432532c2062ec526976fa9790e91f78eae8b9d38f369d5"
+        },
+        {
+          "kind": "function",
+          "name": "breaker_config",
+          "sha256": "b70308ba219d32450fb55697a3aad755d4e9803adeb6330b73569ddc31380015"
+        },
+        {
+          "kind": "function",
+          "name": "breaker_state",
+          "sha256": "59a1defaa7967cbaab908086d0bfdaee9e26dc1aba3fc0ffe77ae7b88a89fda9"
         },
         {
           "kind": "function",
           "name": "buy",
-          "sha256": "8cbb78fee8716415a5faa82688f995864cf56b4779c0c7251955cd7625e6f223"
+          "sha256": "4fa2053c4b3c4db6be8f17c501c24b399f54ab435be05183015d59840821267f"
+        },
+        {
+          "kind": "function",
+          "name": "buy_v2",
+          "sha256": "8097f1e3f5ba0a1207dc0084188158701d312eb4de0f4545e39c93d641c367b3"
+        },
+        {
+          "kind": "function",
+          "name": "cancel_admin_transfer",
+          "sha256": "afcba60cf6cc7ce612503880429e760cf8f18e3aeeb66d36462145d027cb0d3b"
+        },
+        {
+          "kind": "function",
+          "name": "claim_lp_fees",
+          "sha256": "8b34745f1fb739286ea0406ec11f6a4b58368e8dc574487597ea575705721634"
         },
         {
           "kind": "function",
           "name": "claim_pool_remainder",
-          "sha256": "a2f26ef5bd09b789033c7fe717ea4d5027abc0583c48a39942700644815cd816"
+          "sha256": "9a11731c32ce3e522f34988135675ef15a18b8d2fba6a3124e75a48e66e7f7f7"
+        },
+        {
+          "kind": "function",
+          "name": "claim_pool_remainders",
+          "sha256": "df6f6d7a8c798177a41a10b736109b1c25218a49ab3c9bf9f79ae1dd43d4f2f8"
+        },
+        {
+          "kind": "function",
+          "name": "collateral_params",
+          "sha256": "359b347bcff2d4ed3060546f5d371d020bd4ae61d0523e9e31038cdad799868f"
         },
         {
           "kind": "function",
           "name": "create_market",
-          "sha256": "1a6d567a4d5238bcc17a1d0212dbe5541e6f1ce703a580f32dcd43dfedadf614"
+          "sha256": "1b1ad8a1bc29d4b37fd515832e2c4bbf519bb4b95b7fb8c23c6ca7bc0ae0f0c9"
+        },
+        {
+          "kind": "function",
+          "name": "create_market_with_collateral",
+          "sha256": "695acc7a0f207080a82a7c05340eec2eaa7ba50ff29aa8740198c7d31c25e8a6"
+        },
+        {
+          "kind": "function",
+          "name": "finalize_market",
+          "sha256": "fc388c37b88917dbaa17fb131fc198787215c017cfde67dfd848d585964f302c"
         },
         {
           "kind": "function",
@@ -71,6 +226,11 @@
         },
         {
           "kind": "function",
+          "name": "get_market_collateral",
+          "sha256": "851de20c06d3491e0cb9ae5b5b08dcec118f3dd4f72e0996da54a4372b3fd057"
+        },
+        {
+          "kind": "function",
           "name": "get_position",
           "sha256": "1ecc91bba1814707bf485e3bc6b838a92c27bec91ab2ce432e193e6b31f3ebd7"
         },
@@ -81,8 +241,53 @@
         },
         {
           "kind": "function",
+          "name": "locked",
+          "sha256": "223a3bd31cf2dc796a79310e2903c0c34e0dedf345f78a539ab1ea2a6c81c89b"
+        },
+        {
+          "kind": "function",
+          "name": "market_collateral_info",
+          "sha256": "959009e9c805e1584b874506efb18f4ddd55fd8e7f810cd035bff5885f2bf3ea"
+        },
+        {
+          "kind": "function",
           "name": "market_count",
           "sha256": "90c844cd92e1d0a4196cbcb2c26dd139dec02ef00d288c364aca56ecea8e4f16"
+        },
+        {
+          "kind": "function",
+          "name": "max_batch",
+          "sha256": "5d679cf268ef9d91dbd0fc79318fe43da288598e7461ddf3b868c75a7f7b9ab3"
+        },
+        {
+          "kind": "function",
+          "name": "observe",
+          "sha256": "f358cdc5d0adb8fb0f373c65f08af8199b82f5dcfa86d31db470b673254f8698"
+        },
+        {
+          "kind": "function",
+          "name": "pending_admin",
+          "sha256": "ae66dedfa0e865a8a65ad9975786ec1c0d452d6307d24a04c7b44398002d1fd1"
+        },
+        {
+          "kind": "function",
+          "name": "price_cumulative",
+          "sha256": "9c687a26c936d47f8f4ba299a83864262f78152a6484e71b6de0a0d8ee75f60a"
+        },
+        {
+          "kind": "function",
+          "name": "propose_admin",
+          "sha256": "e324e42a41e9c7f0b68dc814aba21a270dce93c4368e0dfeb73415a807577db3"
+        },
+        {
+          "kind": "function",
+          "name": "propose_resolver",
+          "sha256": "2d419a267d8ba432e2c861799bc2654c5b1fe82de4c695c3f222c6c3b9bf8fb8"
+        },
+        {
+          "kind": "function",
+          "name": "propose_treasury",
+          "sha256": "2dc2677972791514b94fbf4a96bf80814681ab4c062a109c1473f6277bb10dee"
         },
         {
           "kind": "function",
@@ -101,13 +306,38 @@
         },
         {
           "kind": "function",
+          "name": "redeem_deadline",
+          "sha256": "f41c879b4b23244f51b39a0cfe8d999da99a6e165713c1612078828d29eae612"
+        },
+        {
+          "kind": "function",
+          "name": "redeem_many",
+          "sha256": "e28054b3b0b89d1ececf0902f7e72ffdf74a759a8e5ed46b2b2927213505c521"
+        },
+        {
+          "kind": "function",
           "name": "resolve",
           "sha256": "3364ff85517bbff1faf1f577336e6bcb8369b7939a482656c818060e1ff38987"
         },
         {
           "kind": "function",
           "name": "sell",
-          "sha256": "e7c9e729d8cda6cc8e2d4028dfbabea525de145a630400bd2eaa38111ee75a2d"
+          "sha256": "97f83e093f1fe55d042816b67b0d0da0d50652b705f3ae9041ecb6e5a3110c32"
+        },
+        {
+          "kind": "function",
+          "name": "sell_v2",
+          "sha256": "4adb78a184e25e1eff2b4c4ee2eaba0a93b8c75a0b16e7206d1260deb40bcba9"
+        },
+        {
+          "kind": "function",
+          "name": "set_collateral_enabled",
+          "sha256": "68697049d3b2fc6e548ee4b9872eb1c7382360227a6d5797c5528291229581a1"
+        },
+        {
+          "kind": "function",
+          "name": "set_default_breaker",
+          "sha256": "8b3059e4387994ebabea5ba06a08a108f5cdf517dce6fb92a62326f31d916826"
         },
         {
           "kind": "function",
@@ -116,23 +346,43 @@
         },
         {
           "kind": "function",
+          "name": "set_default_redeem_horizon",
+          "sha256": "ff097662dc7859a1fd4375d2ed7bb5c03ff1a4e5c1a22bcbcc9eb21a80fb9723"
+        },
+        {
+          "kind": "function",
           "name": "set_paused",
           "sha256": "b9160639fdbaebbe261664bbb58d8dbba3ea1b6d3b9b6c28a20b55965a914407"
         },
         {
           "kind": "function",
-          "name": "set_resolver",
-          "sha256": "8a4ec6c6dbc395d52032725c518ff1822df742b825d3683461c895682fe60e6f"
+          "name": "set_protocol_fee_share_bps",
+          "sha256": "9165cde20aebe18bfc1e739cbc50ab63bd8094749d6e30e2da8bf4715d3d85a5"
         },
         {
           "kind": "function",
-          "name": "set_treasury",
-          "sha256": "a290c83cd905502fc867a29483926e04c3d1ab926ab46b10b89a9b93520d5f14"
+          "name": "settle_state",
+          "sha256": "cbdfd0ba6c6cdd2683dc87d2fd58bf5a66b7a7e385489f40cde9da9db9669066"
         },
         {
           "kind": "function",
           "name": "sweep_fees",
-          "sha256": "b8a652873c48b407b3d52c2c9c952cda531f54ab67545501be9c2f8a6bbb8e7f"
+          "sha256": "a7fdd1db61625c0b5d0f6bf4ee5ba1a08e454497ef3897dd4f228790c92ed9c2"
+        },
+        {
+          "kind": "function",
+          "name": "transfer_lp",
+          "sha256": "e05b1ff2f4e05e72cf0724023b1f7748c99a29a8e59e4d1c4f181d0e28f77b05"
+        },
+        {
+          "kind": "function",
+          "name": "transfer_position",
+          "sha256": "816b8295df3659b88cd1bafeedc73df10130d3da82296198f08c72ed686032e1"
+        },
+        {
+          "kind": "function",
+          "name": "twap",
+          "sha256": "37f3a2d3f0f13b4cade255fb647ce09a4318b16e64773ea6ea98db93b2cb7048"
         },
         {
           "kind": "function",
@@ -140,9 +390,59 @@
           "sha256": "eed1e7c8836b4b1325e617e98e3ffc9f6037c5dd2d8611142923c3b1b1e6f3a2"
         },
         {
+          "kind": "function",
+          "name": "would_trip",
+          "sha256": "2e09165ea5c821a7713c4a2ff90765f2e621a52f564f8d149d7a5ac10f3474ec"
+        },
+        {
+          "kind": "struct",
+          "name": "BandState",
+          "sha256": "1b340f05cc38732c9941339f413d6de112fb86da32d4cc96573ec9026f181430"
+        },
+        {
+          "kind": "struct",
+          "name": "BatchItem",
+          "sha256": "87fa3f19969cd168c6fd54e087ee692c5ea744dc72f9adc8073afc46070957ab"
+        },
+        {
+          "kind": "struct",
+          "name": "BatchResult",
+          "sha256": "0753925da3923def1ad38019c3f8e95560198abc482d94a39b20b51052a43912"
+        },
+        {
+          "kind": "struct",
+          "name": "BreakerConfig",
+          "sha256": "ae4b1686b67ee80842a83aed6ed07f1b4cd34d661db2b0cc409b9d6f097514a5"
+        },
+        {
+          "kind": "struct",
+          "name": "CollateralParams",
+          "sha256": "4abdd15528d3b4b46ef70647641a5f5333e8471ea1da3b7b48627e988887984a"
+        },
+        {
+          "kind": "struct",
+          "name": "CommitteeRef",
+          "sha256": "f019a4df29ce3a789b35b411331a2e7a5fb540d9de936f1b62452fbdeab70006"
+        },
+        {
           "kind": "struct",
           "name": "Config",
-          "sha256": "64610de63a3f8cd119c6df8c989975af1ac3d00aff9bfe8cea0bb52b93b675e0"
+          "sha256": "dafa5fad1351a52f4896ec7c5312384d19b18be5ac5cae523e2998802a5489cc"
+        },
+        {
+          "kind": "struct",
+          "name": "DisputableSignerConfig",
+          "sha256": "9f4bae0d37091f0bb641edde7aa91eae68fa40b45bb16ded60841e24d57b7c5c"
+        },
+        {
+          "kind": "struct",
+          "name": "FeeTerms",
+          "sha256": "9f57793180d62e239618908ed0cfeb58b0b5cdb26a578dbfec7ff634871d5c9f"
+        },
+        {
+          "kind": "struct",
+          "name": "HybridConfig",
+          "sha256": "78258574c4f4c2cda29381f2371e939c9f0aed909adeab1e536b780d97d8651e"
         },
         {
           "kind": "struct",
@@ -151,8 +451,68 @@
         },
         {
           "kind": "struct",
+          "name": "MarketCollateralInfo",
+          "sha256": "344c0a331c114ea3d2bbdb43d2b8483bc133cd36d76c66fb381d90c0c73b82e5"
+        },
+        {
+          "kind": "struct",
+          "name": "Observation",
+          "sha256": "977926803b3dec4e211a09142e073e12d004e12bd130f741797a8d8722a69d96"
+        },
+        {
+          "kind": "struct",
+          "name": "OracleState",
+          "sha256": "b92572857ff0857ba16a5aae8b0fe1e0a591ccc7dcdf6a0174c4d3e9c2e44df4"
+        },
+        {
+          "kind": "struct",
+          "name": "PendingAdmin",
+          "sha256": "ce2fee87bac2845b8b280108a70bc0aaa0ab4af12851c031b168a3395ea0396e"
+        },
+        {
+          "kind": "struct",
           "name": "Position",
           "sha256": "71204b58274f78132528a66f3d35777a0ac730f7bcac604b668869d72d64f631"
+        },
+        {
+          "kind": "struct",
+          "name": "PriceConfig",
+          "sha256": "d8c6c5b943c95c6cc20166fc7888c5916324963e50975390f20b95e1fa71421a"
+        },
+        {
+          "kind": "struct",
+          "name": "PriceData",
+          "sha256": "91b7f65d56c4704a51811c1eaf74bfb7a64b0321b761009762ad73cff05818fe"
+        },
+        {
+          "kind": "struct",
+          "name": "ResolutionSpecV2",
+          "sha256": "7bf87824e57ac2b2514b770d1597a1ede981f75d86d963c59d959dda43cb3407"
+        },
+        {
+          "kind": "struct",
+          "name": "SettleState",
+          "sha256": "3a21a23204d80e2a8d48cbaa8804d5e56a7dd7d9b325e95465d20ca564a63479"
+        },
+        {
+          "kind": "struct",
+          "name": "SignerConfig",
+          "sha256": "093cf853646ed9c64c3755c1b50dd10df2bdbc0e6c1d9787d2070a12ba14cc40"
+        },
+        {
+          "kind": "struct",
+          "name": "WeightedKey",
+          "sha256": "fc92c7f73fdd979e46a28915334d1a13b6e5f3e271a15161a0166674b80a18e0"
+        },
+        {
+          "kind": "struct",
+          "name": "WeightedKeyConfig",
+          "sha256": "2c48e77babf249415aa28ff7ee82a618b7c8db4444eec60baeb3e8cf03596ccb"
+        },
+        {
+          "kind": "union",
+          "name": "BatchStatus",
+          "sha256": "a017f9d50495f80a30e05113b9487648fde42c992c13e1fd17e4e64b18190a8e"
         },
         {
           "kind": "union",
@@ -162,218 +522,17 @@
         {
           "kind": "union",
           "name": "DataKey",
-          "sha256": "78afc22a59bac66acf3e053054931284f82461380bd858584e74e92d4aa0c213"
+          "sha256": "5166a2eb24c1be27fb6b00fe8f255ac5dedbf83ba47ea6e0865521cc64d803aa"
+        },
+        {
+          "kind": "union",
+          "name": "Escalation",
+          "sha256": "e8fc4399cb9635272c81b57710a4cad59cd6c43afc3cf0137e4f3d1ce72d1ddd"
         },
         {
           "kind": "union",
           "name": "MarketStatus",
           "sha256": "f63f95a8a623b794169fa47dcbcb3fad0dab1e3a1ee22ed16ea2e7eb91ea2b73"
-        },
-        {
-          "kind": "union",
-          "name": "Outcome",
-          "sha256": "f48fd29535a11cc7b94a3d3b0b4eb69bab0dd5becf4e7e4545c137e9ed1ef00f"
-        }
-      ]
-    },
-    "treasury": {
-      "binding": "treasury.ts",
-      "contractId": "CBTFA3EPQ63PL5XXHOMU4LRDCAB2MHKOLEPDQI7E7TNK454YNBOMZLYB",
-      "specSha256": "0ab3b41951cd3d6593f48ca60acf2e5b0156b91e2afb12d4779c754063fb6fa0",
-      "expectedWasmHash": null,
-      "entries": [
-        {
-          "kind": "error",
-          "name": "Error",
-          "sha256": "4115e304ab410894b5f3fbf5c95cf6c182ccb73382059c78678748e253e89538"
-        },
-        {
-          "kind": "event",
-          "name": "FeesCollected",
-          "sha256": "01d90340031e7dedae314472786f04d2d91151fc54e93b7162b10cbd28e2ca2f"
-        },
-        {
-          "kind": "event",
-          "name": "PositionClosed",
-          "sha256": "c45c7b7a63cda5e547f9a67af0c0ff2a85e38ba82a72e972ed2c9895c57b2b97"
-        },
-        {
-          "kind": "event",
-          "name": "TradeAuthorized",
-          "sha256": "6a624cb74b3cff30fb7cd88d134960b4d873850ad1832dc614a5400b9fe191b2"
-        },
-        {
-          "kind": "function",
-          "name": "__constructor",
-          "sha256": "80662bf77729340acd6597ac7e117bd2b23c79070224304f6ee8b230796f82f4"
-        },
-        {
-          "kind": "function",
-          "name": "agent_buy",
-          "sha256": "9b9edd63915aab93f3405593a10499c8ddf19f6a6e44dccd0cf5e54019b5ddd7"
-        },
-        {
-          "kind": "function",
-          "name": "agent_create_market",
-          "sha256": "73fba65f67fa3fe0fb061ecb09d9ea0b9d38ab80c49d0501f58e1527b8bf6401"
-        },
-        {
-          "kind": "function",
-          "name": "agent_sell",
-          "sha256": "4eccec81fbb8ec011e640539b998aacfe3fd9be6a4ed4fbfb9783214abcac05f"
-        },
-        {
-          "kind": "function",
-          "name": "available_capital",
-          "sha256": "5348596a50d21e6157b577cab8bf2275aa7c2163d272c1d456b1ab1c8d0bdb66"
-        },
-        {
-          "kind": "function",
-          "name": "claim_pool_remainder",
-          "sha256": "874c1c8fe62d5dea3d12e9f3f6c7bbf306047b22214c1db83a70e2cc81ceb4e2"
-        },
-        {
-          "kind": "function",
-          "name": "close_trade",
-          "sha256": "40bf0d76812c3cc8cfbabafbdca4b749eb1a05c6f7f74e8123d15c98b4a95376"
-        },
-        {
-          "kind": "function",
-          "name": "collect_market_fees",
-          "sha256": "f46513b03b23a864c2f151f123defdb69dc6f97c55027c2116e658fe0ca47612"
-        },
-        {
-          "kind": "function",
-          "name": "daily_usage",
-          "sha256": "1a15abfe53ae4d66fbbef78e41bd67fc8d28f3c7ec549a730088dd54abf23ba1"
-        },
-        {
-          "kind": "function",
-          "name": "deposit",
-          "sha256": "0cca13fb5acf46028d482a197309dfaf75741627f96309dcf6b342fa425d738e"
-        },
-        {
-          "kind": "function",
-          "name": "get_config",
-          "sha256": "ce1239567381eb53e2fbdb10bf4e03534772e2206ba790dae30db114c20c117c"
-        },
-        {
-          "kind": "function",
-          "name": "redeem",
-          "sha256": "d548a13784ecb61947ca7898853f741cad0741e199b32375447cc961cd2a2456"
-        },
-        {
-          "kind": "function",
-          "name": "set_paused",
-          "sha256": "b9160639fdbaebbe261664bbb58d8dbba3ea1b6d3b9b6c28a20b55965a914407"
-        },
-        {
-          "kind": "function",
-          "name": "withdraw",
-          "sha256": "8379d16ff45699a755ef8340317491d96b65e4bf595245a28cd39dcf44102236"
-        },
-        {
-          "kind": "struct",
-          "name": "DailyUsage",
-          "sha256": "dc50bc8149ae477a1aebf241e1396d89311f9c803e97ac035ce158d092ddf654"
-        },
-        {
-          "kind": "struct",
-          "name": "RiskConfig",
-          "sha256": "d12646f677ab3a3f1323e0e9270e0c8dce665bec08a29471a29fa3655ac4d0d0"
-        },
-        {
-          "kind": "union",
-          "name": "Category",
-          "sha256": "97d0fa9e22e7ba56105ae8764289b6da9db76f296068db09bff33163b2c5ce6b"
-        },
-        {
-          "kind": "union",
-          "name": "Outcome",
-          "sha256": "f48fd29535a11cc7b94a3d3b0b4eb69bab0dd5becf4e7e4545c137e9ed1ef00f"
-        }
-      ]
-    },
-    "resolver": {
-      "binding": "resolver.ts",
-      "contractId": "CDDJU3PH6T3Z4O6EYLALXXB5XBFPYO2G5P5RBDEIZ7ZVN6V37OQSVYGR",
-      "specSha256": "49c98acd9a1fe301e7bff438567b9983c07dae3ee073f16c3e92dc441dd62102",
-      "expectedWasmHash": null,
-      "entries": [
-        {
-          "kind": "error",
-          "name": "Error",
-          "sha256": "aab5b5a399d5e7c5eea7e9715a126aaef0b800be01fd30219bfc41b78d893248"
-        },
-        {
-          "kind": "event",
-          "name": "PriceResolution",
-          "sha256": "fb85fe050189f82b52880187376811f9f546f0e762c795f44b9aa72428d09139"
-        },
-        {
-          "kind": "event",
-          "name": "ResolutionFinalized",
-          "sha256": "ed4035efc97291be713bef93d342d13735beff53f7ec5e055f80f7a81cf125a9"
-        },
-        {
-          "kind": "event",
-          "name": "ResolutionProposed",
-          "sha256": "37a1995018127b1165fc11220733747c665b84b9d2cf4be2393606892964d3a9"
-        },
-        {
-          "kind": "function",
-          "name": "__constructor",
-          "sha256": "c26f63914b37d271a632832b6c43be60cd14dfd85d0606105995dbafa3c95ba0"
-        },
-        {
-          "kind": "function",
-          "name": "attest",
-          "sha256": "bb3cda30830c4d9f8dbb1431d81d09bf337fd358e20d69d94125e355886062ee"
-        },
-        {
-          "kind": "function",
-          "name": "cancel_proposal",
-          "sha256": "0db7e25a3a97541bb07078437faa20b341fbace2655fba2cfec0512eccc203a0"
-        },
-        {
-          "kind": "function",
-          "name": "finalize_signers",
-          "sha256": "cc43349dacf8aa25441f77a4c83d7648a7d72ad4dad77a0c9cb00d7839b15088"
-        },
-        {
-          "kind": "function",
-          "name": "guardian_void_market",
-          "sha256": "382abd20db0760b009961660dc0fb37f32863790dca93fc6c3e6522b79e7d5ef"
-        },
-        {
-          "kind": "function",
-          "name": "register_price_spec",
-          "sha256": "9f4ca8ed50e60437a8086bccf0ec493605c8a094fd75c5b7e693728e69609033"
-        },
-        {
-          "kind": "function",
-          "name": "register_signer_spec",
-          "sha256": "cc9e66d063387e4cf40d9ecc27da767a5414229a30bd1fa3294a2b8f85572be7"
-        },
-        {
-          "kind": "function",
-          "name": "resolve_price",
-          "sha256": "3817970f0104aaaadc02fba742403c15c2157418c3d070893630a1e3c1002901"
-        },
-        {
-          "kind": "function",
-          "name": "state",
-          "sha256": "3bf9abfd74c85ce2840858b9fa10c2be445c0f63af961eff0aaaa2107c761311"
-        },
-        {
-          "kind": "struct",
-          "name": "PriceConfig",
-          "sha256": "d8c6c5b943c95c6cc20166fc7888c5916324963e50975390f20b95e1fa71421a"
-        },
-        {
-          "kind": "struct",
-          "name": "SignerConfig",
-          "sha256": "093cf853646ed9c64c3755c1b50dd10df2bdbc0e6c1d9787d2070a12ba14cc40"
         },
         {
           "kind": "union",
@@ -392,26 +551,1752 @@
         },
         {
           "kind": "union",
+          "name": "ResolutionSpec",
+          "sha256": "c50c6d81087a2149cccbec9d5274978939f2fd53cdc3d701e88f5f0f1dd57143"
+        },
+        {
+          "kind": "union",
+          "name": "SkipReason",
+          "sha256": "f1128d7dcc960aba6816ff0c4199ca34ba3b9a4b346779cf0172e154e82f54df"
+        }
+      ]
+    },
+    "treasury": {
+      "binding": "treasury.ts",
+      "contractId": "CBTFA3EPQ63PL5XXHOMU4LRDCAB2MHKOLEPDQI7E7TNK454YNBOMZLYB",
+      "specSha256": "d2f8afbf9eb8cb169d5b8eca3f3671b09ed9963666e63dcf1d380245c40c6128",
+      "expectedWasmHash": null,
+      "entries": [
+        {
+          "kind": "error",
+          "name": "Error",
+          "sha256": "97b4c432996a1f8be17e4e074aac968146e86f23ad7d6d477deb3029c69eb9bf"
+        },
+        {
+          "kind": "event",
+          "name": "AdminOpCancelled",
+          "sha256": "ac285d24293b8eb1648c9eac1696357bc042be122dc786956c3d4a2b02a98a8f"
+        },
+        {
+          "kind": "event",
+          "name": "AdminOpExecuted",
+          "sha256": "4dd7b9de0ca3d539faaedbdc0910959a8b911d0e7c7aa98db0f69a5a7d71b758"
+        },
+        {
+          "kind": "event",
+          "name": "AdminOpProposed",
+          "sha256": "5bc2f2624bc465c24c54667d6e5590de9244c7d69744204fb378c777de94b938"
+        },
+        {
+          "kind": "event",
+          "name": "AgentHalted",
+          "sha256": "e8357bbc78e465c780dbe6515fe4fc9851e416c15aa246880c96e94139839d2e"
+        },
+        {
+          "kind": "event",
+          "name": "AgentPolicyCancelled",
+          "sha256": "249d5d53bef61252390bfe5e583fea52eb7403a06c9659ab354ded03dc61aef8"
+        },
+        {
+          "kind": "event",
+          "name": "AgentPolicyProposed",
+          "sha256": "b00f2c8c346b45fa44049a65f08ef98488e9a891454179683d6addd9b995f783"
+        },
+        {
+          "kind": "event",
+          "name": "AgentPolicySet",
+          "sha256": "0d8cdd6f77069e9ad963b7277f31d5ae07f1cbe428ebbe48e1c111a369c5f06f"
+        },
+        {
+          "kind": "event",
+          "name": "AgentRemoved",
+          "sha256": "db6ec92c44c42bb09d606347deb73c04d350e2a17afc20c1e09b6fa3808a71aa"
+        },
+        {
+          "kind": "event",
+          "name": "ConfigCancelled",
+          "sha256": "087bb33c09c8e00e8fbc96d8a76b79d941c738d791a227ed44f433bd1738971c"
+        },
+        {
+          "kind": "event",
+          "name": "ConfigDelaySet",
+          "sha256": "500ad500899d3549c75588415f4cd75cf30e43f7fc78217dace02b62b1598041"
+        },
+        {
+          "kind": "event",
+          "name": "ConfigExecuted",
+          "sha256": "946ff8ea3245577cd158c51871bbbded8516e8b07aa5309072118d139e2e6d7f"
+        },
+        {
+          "kind": "event",
+          "name": "ConfigProposed",
+          "sha256": "d07c22f24077ce02e6397f53e63e5275037c73835fc82bd92e7ac945345ca3b3"
+        },
+        {
+          "kind": "event",
+          "name": "CorrelatedExposureUpdated",
+          "sha256": "fc736b0a90839a58ddc23003a0283c3066235162c65694f85da23041cf19024d"
+        },
+        {
+          "kind": "event",
+          "name": "CorrelationCapsCancelled",
+          "sha256": "a569107c4d7ad18c923213499470113c8a46c2ee52a38cef8da2a76a0771fe93"
+        },
+        {
+          "kind": "event",
+          "name": "CorrelationCapsExecuted",
+          "sha256": "c5b0ec89af8e04a2f2df915cc3e464773bfdc89aaa7a10c05c1556d02e99d415"
+        },
+        {
+          "kind": "event",
+          "name": "CorrelationCapsProposed",
+          "sha256": "78c26c0369dcd494dc9aaf9876761fe3a8524367f7e19e041577e029356082b0"
+        },
+        {
+          "kind": "event",
+          "name": "CreationPolicyUpdated",
+          "sha256": "28103b75e4c6ba0ec24f4b8203cde64e096505a656517bef79540da0d2df5275"
+        },
+        {
+          "kind": "event",
+          "name": "Deposited",
+          "sha256": "eb292fb46dec3b4d0154236e9f93f8280432da4bdc37f827f7d70e70e96de0ab"
+        },
+        {
+          "kind": "event",
+          "name": "DrawdownConfigSet",
+          "sha256": "a89744dbea4b8e15547b27c9581356377c7c37f5dfdada3b8bd403b8d9b64c80"
+        },
+        {
+          "kind": "event",
+          "name": "DrawdownPause",
+          "sha256": "fb4bdfaeb93906fe6659ea54793d8f07910b4b263b36e4b62db763afcfa1c8de"
+        },
+        {
+          "kind": "event",
+          "name": "EmergencyWithdrawn",
+          "sha256": "ccd273c041e1f2933c6e5da7e0d479c1396edf183adc3507d92039153e8d839e"
+        },
+        {
+          "kind": "event",
+          "name": "ExitFloorSet",
+          "sha256": "e723b4af399bd599ac5cbad1e992a05ca2ff9b5cba034932ac575b12bb51dab7"
+        },
+        {
+          "kind": "event",
+          "name": "FeesCollected",
+          "sha256": "01d90340031e7dedae314472786f04d2d91151fc54e93b7162b10cbd28e2ca2f"
+        },
+        {
+          "kind": "event",
+          "name": "MarketMigrated",
+          "sha256": "16e82e7b273e110cede621ff4d463687e39eccaceb89b727ac7fab7036b2fb09"
+        },
+        {
+          "kind": "event",
+          "name": "MarketSettled",
+          "sha256": "22a6f4a2c1c19b9afe8658478cd4c773d192101461996dd194d45b11f68795a0"
+        },
+        {
+          "kind": "event",
+          "name": "ModeChanged",
+          "sha256": "26c51550a7eb048655f8ed9bd739ee491d2f83e23e874d5415f09e59f0ed1d22"
+        },
+        {
+          "kind": "event",
+          "name": "NetExposureUpdated",
+          "sha256": "76ca86f2083569c39b603b37417a73ab9d44662189aff9159dbef93e98ea8e63"
+        },
+        {
+          "kind": "event",
+          "name": "PnlRealized",
+          "sha256": "c4d7358969851aa43df8a90d598983d8c08c15770b19207887de2d45ac330fe5"
+        },
+        {
+          "kind": "event",
+          "name": "PnlWindowReset",
+          "sha256": "408b6a3dd777fb58446908a839c969087830104d753e48b40df0b3429bee15b9"
+        },
+        {
+          "kind": "event",
+          "name": "PositionClosed",
+          "sha256": "c45c7b7a63cda5e547f9a67af0c0ff2a85e38ba82a72e972ed2c9895c57b2b97"
+        },
+        {
+          "kind": "event",
+          "name": "PricePolicyCancelled",
+          "sha256": "f75376e1c68f65772382fb6cf04be0d4d6a9413c41b34b3e187cce5f58f66969"
+        },
+        {
+          "kind": "event",
+          "name": "PricePolicyProposed",
+          "sha256": "5afc296644a773fb180eaff142f88de6e086d3cec750c5339d738f3f830e26cd"
+        },
+        {
+          "kind": "event",
+          "name": "PricePolicySet",
+          "sha256": "62f2dc5e9f8928c39dfd90fbe5553a920a79b7c80d4137a78a1ab5aaa58f9b4e"
+        },
+        {
+          "kind": "event",
+          "name": "ResolvabilityPolicyCancelled",
+          "sha256": "267c757fc347e9c683f99ac09d702f807b97c6843cb9c3a6ad6a32aeba393c90"
+        },
+        {
+          "kind": "event",
+          "name": "ResolvabilityPolicyProposed",
+          "sha256": "bb644d73e05113600392bcca4cd2bccd9def077c4461740f118cfe2e255936ef"
+        },
+        {
+          "kind": "event",
+          "name": "ResolvabilityPolicySet",
+          "sha256": "00b15de7d60a0e2bad249599dcda25624da2a7d710882a3e8f5e38f57314c807"
+        },
+        {
+          "kind": "event",
+          "name": "SuccessorSet",
+          "sha256": "81a5bb6b12b6be7437183d8ee72950287290009ffde138f2238201cf115f207b"
+        },
+        {
+          "kind": "event",
+          "name": "TokenDeposited",
+          "sha256": "f84779eb429b5c408975f8268d5a3e68d43252b01ac3f87f6eeef35c1d7a534c"
+        },
+        {
+          "kind": "event",
+          "name": "TradeAuthorized",
+          "sha256": "6a624cb74b3cff30fb7cd88d134960b4d873850ad1832dc614a5400b9fe191b2"
+        },
+        {
+          "kind": "event",
+          "name": "UnwindSell",
+          "sha256": "f9f108e98dda516b7d56b3dc826bd09045cf7e291b741b99ce7783025882834b"
+        },
+        {
+          "kind": "event",
+          "name": "WithdrawPaid",
+          "sha256": "921fff23678be67f6d0827dd2ecf47e4df3a57e233f0ceb277fc9ddbdb99ce4f"
+        },
+        {
+          "kind": "event",
+          "name": "WithdrawRequested",
+          "sha256": "bd8c3f5c6ffc3b78e328d6930f0576c32f80218544275de564a1851179bf9e7f"
+        },
+        {
+          "kind": "event",
+          "name": "YieldAllocated",
+          "sha256": "7d92a64c8e621a60f62e1712d6b6278befdb854b9638e3cd6beaf129dc893885"
+        },
+        {
+          "kind": "event",
+          "name": "YieldRecalled",
+          "sha256": "7ee1308b201402f8b5784f993ab1542cb00e0dadcbf0224890952c5dc46648dc"
+        },
+        {
+          "kind": "event",
+          "name": "YieldVenueSet",
+          "sha256": "7fc9d3c8f87a252c79dc388397807c3d9d67422e80398c91eb7eec34673f8d8c"
+        },
+        {
+          "kind": "function",
+          "name": "__constructor",
+          "sha256": "b65d6f3704625e5f2936dedddcb648f8976606afd2bfa477d81b0902a1415cc7"
+        },
+        {
+          "kind": "function",
+          "name": "acknowledge_drawdown",
+          "sha256": "4bc20687c7588d336b458f31fd788faf349cb7f01293cc499eb56b2f64e729d5"
+        },
+        {
+          "kind": "function",
+          "name": "agent_at",
+          "sha256": "7e91dc7dd91de23af2821350546046a61a5d498aff2c38de9c11b17f3959e494"
+        },
+        {
+          "kind": "function",
+          "name": "agent_buy",
+          "sha256": "37e86e4c72952965296545e4ed064732ab50e0c8e84f388b2aac12376dabc3b1"
+        },
+        {
+          "kind": "function",
+          "name": "agent_buy_traced",
+          "sha256": "3571c1efdd89ccedee70ae3ff84e2db85397ce382462c71189ef0a1ada1ca5e2"
+        },
+        {
+          "kind": "function",
+          "name": "agent_buy_v2",
+          "sha256": "a81959c3c4a800abfc300c4baa8b24c8317678911c193229c9c73a408740ff2c"
+        },
+        {
+          "kind": "function",
+          "name": "agent_claim_lp_fees",
+          "sha256": "ed3280e7f4657b782d1c4fee580864b839b9a104a7ed45f947e3f2b07019f704"
+        },
+        {
+          "kind": "function",
+          "name": "agent_count",
+          "sha256": "6e66b34fa884482c13750cf27cc016cef2c0d2457c9b637f0f44c5f472e8ca74"
+        },
+        {
+          "kind": "function",
+          "name": "agent_create_market",
+          "sha256": "447e911d84d0952d1ffafb8b6ebe0b02918e5037ab5223e87b93a583440c2c2d"
+        },
+        {
+          "kind": "function",
+          "name": "agent_create_market_and_reveal",
+          "sha256": "ee9eca65f9d83f26e35103cd0b21c7db295c02853ba38d7c7ce258801a1dd3d8"
+        },
+        {
+          "kind": "function",
+          "name": "agent_create_market_collateral",
+          "sha256": "439033bf39ec80abe496001dc9f664a17d1b7a78bdd38384cb84a482fe90b44c"
+        },
+        {
+          "kind": "function",
+          "name": "agent_create_market_reveal_v2",
+          "sha256": "71486097a170c6bbe638765ebe1cd443ffa7c0b6e830f17f930535a8403bb341"
+        },
+        {
+          "kind": "function",
+          "name": "agent_daily_usage",
+          "sha256": "c1df9396b656d5da91a2683d03c3679f804149314ab46467f5ca0f5db91457c9"
+        },
+        {
+          "kind": "function",
+          "name": "agent_halt",
+          "sha256": "a68440d622d681a6fe83a224b36145432732df9390e5e25d18b3c993470a0784"
+        },
+        {
+          "kind": "function",
+          "name": "agent_sell",
+          "sha256": "0cd27d9d92f722aa3a811a20f778db5afa7e3dce10e3ed9eb0b9a8aeaa8f24a5"
+        },
+        {
+          "kind": "function",
+          "name": "agent_sell_traced",
+          "sha256": "491a27de812df43a1ee472a14623d1430e6431905e4b59d6307d1f46625968ce"
+        },
+        {
+          "kind": "function",
+          "name": "agent_sell_v2",
+          "sha256": "0e5f3a2e48b561c3ff02f723d3c38c79dc4feb1adde195329e7fdc09ed858987"
+        },
+        {
+          "kind": "function",
+          "name": "allocate_to_yield",
+          "sha256": "195dd92103fbb4031bd2ec7de178c40627856d2cfbf440a099a6769e2aed5b8d"
+        },
+        {
+          "kind": "function",
+          "name": "allowed",
+          "sha256": "8a99ca82fdfa86ed792129ef4ffdec2b9f781b8be473ddc4f77264a32abc29c4"
+        },
+        {
+          "kind": "function",
+          "name": "audit_mark",
+          "sha256": "35acfd3e9b08b8f853ebb9fe16a4e7c05b105a80fae3aeb4f3ce35c8d53348fa"
+        },
+        {
+          "kind": "function",
+          "name": "available_capital",
+          "sha256": "5348596a50d21e6157b577cab8bf2275aa7c2163d272c1d456b1ab1c8d0bdb66"
+        },
+        {
+          "kind": "function",
+          "name": "available_capital_of",
+          "sha256": "002d62eaeaa01aa95c0e10afd80ed2affdb5de2f38be03114d76f42d9478e096"
+        },
+        {
+          "kind": "function",
+          "name": "bucket_exposure",
+          "sha256": "9a3a56f5ada2fe37f60cce9c71bc11bd641577d9436f71d232fa92a78bf838fb"
+        },
+        {
+          "kind": "function",
+          "name": "cancel_agent",
+          "sha256": "125d6f07da186ab3d20d485f345c03c03791ef285a5980ab59f4431dba7c8e9a"
+        },
+        {
+          "kind": "function",
+          "name": "cancel_config",
+          "sha256": "075d1a50d858b34ee87979173c96aed878b0ca6817ea9b19e32a6b5ef3c0a2e6"
+        },
+        {
+          "kind": "function",
+          "name": "cancel_correlation_caps",
+          "sha256": "22c794ad15774e1236a47e566962a709f29c3cedc99fe7a1487d6673719b76ec"
+        },
+        {
+          "kind": "function",
+          "name": "cancel_max_mark_age",
+          "sha256": "e22f2def897b62acc3a0a378a6defb96593cba9b577ac6fe44d23286604b12eb"
+        },
+        {
+          "kind": "function",
+          "name": "cancel_op",
+          "sha256": "e3c767e24f12467c1e85c6d2920a765255371e76717566faa3fcd5467cefad33"
+        },
+        {
+          "kind": "function",
+          "name": "cancel_price_policy",
+          "sha256": "86f2e3fdbbb6394dee736118ca92f3df90fa595929562f7f189037fac9fb8798"
+        },
+        {
+          "kind": "function",
+          "name": "cancel_resolvability_policy",
+          "sha256": "df3569ed00afa850ce7c0272ac70aac8a3e65b37fa81582a0f52be40cbfcb8ff"
+        },
+        {
+          "kind": "function",
+          "name": "cancel_trace_policy",
+          "sha256": "f2fe5d8dee76a8c3e01928a52314c6ef7b810cef2d27aaf830c7bff7a06e5599"
+        },
+        {
+          "kind": "function",
+          "name": "capital_breakdown",
+          "sha256": "2e09c6b15f99a698d28025818a499910ba6efb1f53a99a9f818878ff34c88bec"
+        },
+        {
+          "kind": "function",
+          "name": "category_exposure",
+          "sha256": "9ec6161199a7563452868ae42849a13cfd7a7d0bfc3978994d9a5e0784e1767d"
+        },
+        {
+          "kind": "function",
+          "name": "claim_pool_remainder",
+          "sha256": "a06949f25eab6eec05754b9bbb6425fba39969df465827e98938150c586eb2a9"
+        },
+        {
+          "kind": "function",
+          "name": "claim_pool_remainders",
+          "sha256": "27964800f27467d5a458d9c0e9ed17a4fec1d05c722d0bd2a78d520270614e73"
+        },
+        {
+          "kind": "function",
+          "name": "claim_withdraw",
+          "sha256": "c50f8a072a809d569f723f1825f8c36c7696e2da9c5b18f10dc34c3aa2004f24"
+        },
+        {
+          "kind": "function",
+          "name": "close_trade",
+          "sha256": "bc7895beb440b8c2fa22544389009aba78e1bbc147bbd087a430e1b232724a85"
+        },
+        {
+          "kind": "function",
+          "name": "collect_market_fees",
+          "sha256": "f15bbba26d7f374548580858dffa996e544b024d8290eeeb8efeb8cd462f0222"
+        },
+        {
+          "kind": "function",
+          "name": "config_delay",
+          "sha256": "b64829d4e6b5079d1a3affb3a39ecf5e2d07f89720243416423af6c2964410bc"
+        },
+        {
+          "kind": "function",
+          "name": "correlation_caps",
+          "sha256": "c1c4cd0c2e9fa558d37913a17d7182855a84783ed6d12fc53c1d29f1fe4816c4"
+        },
+        {
+          "kind": "function",
+          "name": "correlation_headroom",
+          "sha256": "427d1ea1e67e7aa7ce3e65df2ffae281bab3fb770373678c1f2ddb7b0e0ddad7"
+        },
+        {
+          "kind": "function",
+          "name": "creation_usage",
+          "sha256": "1d3338acf86391164595fcedabdb87789f642b4f645760d2fcf492dfbde035b5"
+        },
+        {
+          "kind": "function",
+          "name": "daily_headroom",
+          "sha256": "00ac2350e5b441e4e3f1bc2f8b08145299118a9b8fe63a611ce1baec7abe4efa"
+        },
+        {
+          "kind": "function",
+          "name": "daily_usage",
+          "sha256": "1a15abfe53ae4d66fbbef78e41bd67fc8d28f3c7ec549a730088dd54abf23ba1"
+        },
+        {
+          "kind": "function",
+          "name": "daily_usage_detail",
+          "sha256": "da04f0fff14cf86fc6fdff57935324b0e696c2093c22d45fe201f098eb840638"
+        },
+        {
+          "kind": "function",
+          "name": "declare_emergency",
+          "sha256": "d0bb7e29be8e1023c1a15750b980464eef85ddf947392166121b63fd89a9d778"
+        },
+        {
+          "kind": "function",
+          "name": "deposit",
+          "sha256": "ee11ded099475d084110c47129da735907e3b6571491ad68d630d6a9fef7a20d"
+        },
+        {
+          "kind": "function",
+          "name": "deposit_token",
+          "sha256": "5ff11defc18361825012b4e8db2802370d2bcb8cb7b9de293e27f84363f15f19"
+        },
+        {
+          "kind": "function",
+          "name": "disable_yield",
+          "sha256": "fc55e63d6de33ad8f8abc9fec5629ac3bbf39db900f37f3815589a7dbc929e44"
+        },
+        {
+          "kind": "function",
+          "name": "drawdown_status",
+          "sha256": "eb22805f12cdb341e20112dc8ec48707446ca994e84fd11c50744d9fed15a6c6"
+        },
+        {
+          "kind": "function",
+          "name": "emergency_withdraw",
+          "sha256": "190de99c3d3cc76783a6ab2800b365cae08fae26205a638397390ac7e58c10af"
+        },
+        {
+          "kind": "function",
+          "name": "end_emergency",
+          "sha256": "c9c429f3498abf79510d3584a6cefcef7c6299d84a1a44ab025cff0875c661ea"
+        },
+        {
+          "kind": "function",
+          "name": "execute_agent",
+          "sha256": "05b7ae0fc13383736b64dfd5c6c55be52380af00ce6011cbbe46e83d021cf8b7"
+        },
+        {
+          "kind": "function",
+          "name": "execute_config",
+          "sha256": "ad6c88757952dbd876804c1c822438e80982f85e2313e68cbc8fe09caf495089"
+        },
+        {
+          "kind": "function",
+          "name": "execute_correlation_caps",
+          "sha256": "a16026a598353ad4481e7f5be38beb0ef1951d94aaed4e36dfa65141a04cd3cc"
+        },
+        {
+          "kind": "function",
+          "name": "execute_max_mark_age",
+          "sha256": "17f00af602a5d76cf8dbb82c05537c6a66254b5272e68763ced28fa7ae8cf5a2"
+        },
+        {
+          "kind": "function",
+          "name": "execute_op",
+          "sha256": "58cacf80a06da23c9b442e27c63d9b774884236e37466c5f7e4b87131b7cd419"
+        },
+        {
+          "kind": "function",
+          "name": "execute_price_policy",
+          "sha256": "e6dc27ed4e8d7316e44bcdd6925d02e8011ab284c4069f961929793ae10dac33"
+        },
+        {
+          "kind": "function",
+          "name": "execute_resolvability_policy",
+          "sha256": "dcd4bbf8f56fe198f7488bd120c2632d347509129f4b13f02b38ba90e383d07e"
+        },
+        {
+          "kind": "function",
+          "name": "execute_trace_policy",
+          "sha256": "ef8d0fc7db352ac01c5622829f12ec4f203e555c268d33f5b88dc474a74b7ce0"
+        },
+        {
+          "kind": "function",
+          "name": "exit_floor",
+          "sha256": "a75db7660e42938549a1f3962541f2a88de19d3aaee4209dcfd1c3eac20fa232"
+        },
+        {
+          "kind": "function",
+          "name": "get_agent",
+          "sha256": "4a4b3fe58f06ba82cc73a8e4ed82a7d04698a9166cdb306456b8667cdccccabf"
+        },
+        {
+          "kind": "function",
+          "name": "get_config",
+          "sha256": "ce1239567381eb53e2fbdb10bf4e03534772e2206ba790dae30db114c20c117c"
+        },
+        {
+          "kind": "function",
+          "name": "get_creation_policy",
+          "sha256": "266984003e0750085eb1b381d541ab3a6176e5a764d241b7adf808ca6a3f6544"
+        },
+        {
+          "kind": "function",
+          "name": "get_global",
+          "sha256": "d7e3baf1cf7a2cd82d3649cc3deb6e7fa860e74e4592f071876805228fd845ce"
+        },
+        {
+          "kind": "function",
+          "name": "get_net_cap",
+          "sha256": "c97a7154d87f571f00ce110ee8a473017e49ede3d71bc319771dddb84f06a08e"
+        },
+        {
+          "kind": "function",
+          "name": "get_price_policy",
+          "sha256": "fc3c07e1bc816d732beba066db65e1c7f9a18d653ee8f5774a6ca5f39696fd43"
+        },
+        {
+          "kind": "function",
+          "name": "get_resolvability_policy",
+          "sha256": "0232260bd223e400b58150f30f28b1a0963c5fad8b746632dedceac8f44737d0"
+        },
+        {
+          "kind": "function",
+          "name": "legacy_claim_pool_remainder",
+          "sha256": "86938a1d8d47c948f7758b4e080d37942928df505101d09e374aea4a8ef8e53c"
+        },
+        {
+          "kind": "function",
+          "name": "legacy_redeem",
+          "sha256": "2a4aa7a0567c967632e90afcb29384d34a9419076c4d4f9bd50adf53ac102279"
+        },
+        {
+          "kind": "function",
+          "name": "liquid_capital",
+          "sha256": "8d844e12bd4290f763864eb06b55139a147ecbfe1d860a17b60632b62da8a0db"
+        },
+        {
+          "kind": "function",
+          "name": "market_pnl",
+          "sha256": "6ce73a39d8b26d55f9d1086964089c07e386ae55117653f9a043b4236a115da0"
+        },
+        {
+          "kind": "function",
+          "name": "market_valuation",
+          "sha256": "737f37e10fd5d7530735825d8934422e5f51792a826b85695f5627ca5e1170a1"
+        },
+        {
+          "kind": "function",
+          "name": "max_mark_age_ledgers",
+          "sha256": "712e14f7a2224cfff93fac725482e433be541a4b0066c76224a77e69d8143ecf"
+        },
+        {
+          "kind": "function",
+          "name": "migrate_markets",
+          "sha256": "e0c8534d3c227e13743d67698ba782034988e60b46b30a0acdb7801de3eae1ff"
+        },
+        {
+          "kind": "function",
+          "name": "migrate_marks",
+          "sha256": "a5ede3e387089d43b959a2a5d9618fac6a3ffd8f783c19ad26d39cb37d2adf70"
+        },
+        {
+          "kind": "function",
+          "name": "mode",
+          "sha256": "bd19341e7bb98e196dd59c75c5d6d33cf4771aa49e1fb9889269b82ef02df882"
+        },
+        {
+          "kind": "function",
+          "name": "mode_state",
+          "sha256": "3b92a575f76b723058a75f7a0b7e36fb3c802b5f3cba16ec34d02550895eacad"
+        },
+        {
+          "kind": "function",
+          "name": "nav",
+          "sha256": "ff53f4c29935ed2ac924621134e08fd0a537459ab0c1ff298ca7d04a9afd0669"
+        },
+        {
+          "kind": "function",
+          "name": "nav_detail",
+          "sha256": "0bf4ed864554e11b5876c169714c3bb97df6f550a5af7a0816ff806c1271ff54"
+        },
+        {
+          "kind": "function",
+          "name": "net_exposure",
+          "sha256": "b27d71541ef422c590c881575e2b8f2b043c9d29def84b37622723d13ba69cbf"
+        },
+        {
+          "kind": "function",
+          "name": "net_position",
+          "sha256": "32753b3a6c46a10bf2f82493300ca0a75e85a1c31ba8bd506ff6a9b362a5a7ba"
+        },
+        {
+          "kind": "function",
+          "name": "open_market_at",
+          "sha256": "541ce3980f1c4e3a74fa1050e0a93d5f01d8c0da99e1e00f89ba4999c37bb077"
+        },
+        {
+          "kind": "function",
+          "name": "open_market_count",
+          "sha256": "8478180bfe55f7126091b1ef3e37d40139ee4134e9c40b147a52fd1091ee6ffd"
+        },
+        {
+          "kind": "function",
+          "name": "pause",
+          "sha256": "b5c1cc2ff0859cee66febf58eb497d59f054f98a780581f18e376b703724a1c2"
+        },
+        {
+          "kind": "function",
+          "name": "pending_agent",
+          "sha256": "0973be517168194853dc86223ed40887fa7a1cd05e2845048ae0e4b6f1a5726c"
+        },
+        {
+          "kind": "function",
+          "name": "pending_config",
+          "sha256": "4d1f8272eda18915300bbf3f1a86d876aa39cd319f8e4be941f37d0661754811"
+        },
+        {
+          "kind": "function",
+          "name": "pending_correlation_caps",
+          "sha256": "91c8fb62f6c822cafeed1c614819b502c9c0f3681bf78e42987d62b59ed9a9de"
+        },
+        {
+          "kind": "function",
+          "name": "pending_max_mark_age",
+          "sha256": "c986c30bf7a2963b93531e831a21a343f9713adb65573b7bf01af915282bca0c"
+        },
+        {
+          "kind": "function",
+          "name": "pending_op",
+          "sha256": "0203128c1a1bacbb2560a06021d0982676065dd6bb8f74ba0c1839fae984c398"
+        },
+        {
+          "kind": "function",
+          "name": "pending_price_policy",
+          "sha256": "8090c561d99058de0e8513d5f7a4006ca9eec8bb914b9c9417385a02a778b757"
+        },
+        {
+          "kind": "function",
+          "name": "pending_resolvability_policy",
+          "sha256": "5b02173bd8fae352bb9f5db7ffb3875aebefd4b16339196d91f0ef19bf127277"
+        },
+        {
+          "kind": "function",
+          "name": "propose_config",
+          "sha256": "f9083def2d00fb93201f1bb69bd5d2c9ea736c556955dd11152fe979c60d330e"
+        },
+        {
+          "kind": "function",
+          "name": "propose_correlation_caps",
+          "sha256": "24836bf085a15ddc2a39f4c93f6fdf4490239761571284cf4b4bd2f8489ad2a5"
+        },
+        {
+          "kind": "function",
+          "name": "propose_op",
+          "sha256": "7d0a666f4f810866a44e03efe20519295765cc91ad7a5814f2a80e3f46f32eae"
+        },
+        {
+          "kind": "function",
+          "name": "propose_trace_policy",
+          "sha256": "454b4154ada27ff6555502b4dac82fee04578511c0024e39a12278ef75062a13"
+        },
+        {
+          "kind": "function",
+          "name": "queue_bounds",
+          "sha256": "f1c4dad645827b56841131521125eba12dca1669d457f0139a78d56130d120f3"
+        },
+        {
+          "kind": "function",
+          "name": "queue_reserved",
+          "sha256": "9b5561d5f0ee18496ee75070b5d66f7e0bc8e98ac6c23efc0ba76f30851a5a89"
+        },
+        {
+          "kind": "function",
+          "name": "realize",
+          "sha256": "993b97064436ec72ee6d8aec8a931a269d0b94b80cc73f3540f4e60361be481b"
+        },
+        {
+          "kind": "function",
+          "name": "realized",
+          "sha256": "d4d4e666b147c73969541a824f2f55df08ce57b77d4b4f8ca9de06ff322fe4b0"
+        },
+        {
+          "kind": "function",
+          "name": "recall_from_yield",
+          "sha256": "3b4aa6a9965b28075b9e5fde51e21187f1d32116388fc4e3616a4d25984ac9d9"
+        },
+        {
+          "kind": "function",
+          "name": "redeem",
+          "sha256": "23e65cfee63939da73d926e0ed783e0904770dea2d0f2280cb8149db31c27e23"
+        },
+        {
+          "kind": "function",
+          "name": "redeem_many",
+          "sha256": "e383708dd552eff7923ed910b0b2148002ec48ce5e34c1bea33038d3f4b85609"
+        },
+        {
+          "kind": "function",
+          "name": "refresh_mark",
+          "sha256": "7ba8fc921c291769e2626a6ddbeb36f23fc435328a0a593744855a6e54e4563d"
+        },
+        {
+          "kind": "function",
+          "name": "remove_agent",
+          "sha256": "b2011f2420ecea6cceefcb263dff965eafb85a792588c363348df87bce94f9db"
+        },
+        {
+          "kind": "function",
+          "name": "request_withdraw",
+          "sha256": "cc3ca003cf30aeff520bc42a2382ea22cba66702f599be0a1ee41fe10b8781ad"
+        },
+        {
+          "kind": "function",
+          "name": "reset_pnl_window",
+          "sha256": "3cef648d078634165710dc15391ed218a2e55e30356ef1f80b2dd8587af5d3f3"
+        },
+        {
+          "kind": "function",
+          "name": "resume_agents",
+          "sha256": "b09c23e09f1744e7c701f11c14e254ff0a30821359b30b964ac059891edda1b8"
+        },
+        {
+          "kind": "function",
+          "name": "set_agent",
+          "sha256": "9d95d84699c4a4985fa7e707f065e45230f98dad1586ac3a31ee0cf90cdca2b0"
+        },
+        {
+          "kind": "function",
+          "name": "set_config_delay",
+          "sha256": "d0526a38b018d473b0ce0d20cf060acdd789133b9121f54e6eed3919d75cfe5d"
+        },
+        {
+          "kind": "function",
+          "name": "set_creation_policy",
+          "sha256": "413f44454d23cc986746d6fbfbf09bb43ab451ab886d599eecce89c6e442272a"
+        },
+        {
+          "kind": "function",
+          "name": "set_default_exit_floor",
+          "sha256": "f135e570a521c9028085957fd26c6a958e34efd599b2811ee1e329ff3264bf12"
+        },
+        {
+          "kind": "function",
+          "name": "set_drawdown_config",
+          "sha256": "a815dedb892bdf89e7a521d26f1633723193d31ae522b251d014a691977df2ac"
+        },
+        {
+          "kind": "function",
+          "name": "set_exit_floor",
+          "sha256": "f384d76e051ca8dcd8330ac03ee1503a0949905f2f135b426badf4ecea39f9a1"
+        },
+        {
+          "kind": "function",
+          "name": "set_max_mark_age",
+          "sha256": "031b250cb2e68374c9aeab16f3128a55a1a00214b363c35c27f6ff0cc4593996"
+        },
+        {
+          "kind": "function",
+          "name": "set_mode",
+          "sha256": "b00d62dfeb216f15e00d8e0f147f06418e80c2b55ba190593105abb0b75f342b"
+        },
+        {
+          "kind": "function",
+          "name": "set_paused",
+          "sha256": "88e6265a01838eb06e7fdc4d670037cf2586b352fcb81f4f37b1790cf16cac88"
+        },
+        {
+          "kind": "function",
+          "name": "set_price_policy",
+          "sha256": "40b7455a60e9c8b5506d2bf2a3b4c375a304f2676783dc9af440e2fca7456473"
+        },
+        {
+          "kind": "function",
+          "name": "set_resolvability_policy",
+          "sha256": "40de57be816c0877264948da2a1b2219e5a5d3eb6da28bfd5a616f54cce9ae47"
+        },
+        {
+          "kind": "function",
+          "name": "set_successor",
+          "sha256": "1aa537069a64ca8051f089b72ecc285cef2e78187a7a83ec9ba6e2f14c122b81"
+        },
+        {
+          "kind": "function",
+          "name": "set_token_caps",
+          "sha256": "c02902c60b226e76a61ab663b7a55439b88f0cab39459d1464469862753d998c"
+        },
+        {
+          "kind": "function",
+          "name": "set_unwinder",
+          "sha256": "f3b5159c07dda488e0b5cee54c2ea630b8a1661798317dc6d826d62581d773b7"
+        },
+        {
+          "kind": "function",
+          "name": "set_yield_venue",
+          "sha256": "e4412137c5ecb0431fa4b494e6794922c9059f142e330e22e95bebd72bf138dc"
+        },
+        {
+          "kind": "function",
+          "name": "settle_market",
+          "sha256": "3b04f4d185c4417a3ac859ba46d119143df2480573eeee0c2630c9b881d6cd9c"
+        },
+        {
+          "kind": "function",
+          "name": "shares_of",
+          "sha256": "aa9c290139de435be02c5f1adac3fb4d70995fc97469da9d3003ae7176023ec5"
+        },
+        {
+          "kind": "function",
+          "name": "token_caps",
+          "sha256": "f1ffdda26fa99f234cd0b836c9e267350b1224dd2b35c20a73b0e1fe04ac4d20"
+        },
+        {
+          "kind": "function",
+          "name": "total_shares",
+          "sha256": "a1c197f449e5a25799545ae24f1804288be033ec4bc7b0361a71690b5019c4eb"
+        },
+        {
+          "kind": "function",
+          "name": "trace_policy",
+          "sha256": "1156e72eda3b0dac7c27958007b82ca57a50125874d18f1b6f175b7b9b54453e"
+        },
+        {
+          "kind": "function",
+          "name": "unpause",
+          "sha256": "9d27089f6cc03e8865dd3d40290ccb1e7a4dcd144a442de4d4b2a939aee8d281"
+        },
+        {
+          "kind": "function",
+          "name": "unwinder",
+          "sha256": "5131927c7a67354f5aa8e2f48964104da688d9a42ad3039d5360a281275a242a"
+        },
+        {
+          "kind": "function",
+          "name": "unwound",
+          "sha256": "17e04854136d7c19dbc624ed73e255b141a4cbfb98238a35f8d44dde8540a656"
+        },
+        {
+          "kind": "function",
+          "name": "window_pnl",
+          "sha256": "82a39d8687af7b03a14b7059593cd84112161da6701206838b0a2560f8f34f7e"
+        },
+        {
+          "kind": "function",
+          "name": "withdraw_ticket",
+          "sha256": "c01516f4b5105cbf1e6835605ee303a1f99225e19266f5fb24d770dd36761523"
+        },
+        {
+          "kind": "struct",
+          "name": "AgentPolicy",
+          "sha256": "e6b9906f545aeccff24f3ff83888f096104023022737e974a4bf51b3a9dbba64"
+        },
+        {
+          "kind": "struct",
+          "name": "BatchItem",
+          "sha256": "1e7a4ebfb0834597151b2f694b1dbbf7b3084ad9b913b6117621c339325dbd75"
+        },
+        {
+          "kind": "struct",
+          "name": "BatchResult",
+          "sha256": "307b3738ea6af86614cf7a244f14f1ef40609b77888287452774594cc3e76103"
+        },
+        {
+          "kind": "struct",
+          "name": "CapitalBreakdown",
+          "sha256": "73be9339e920c1af937aa38b96841e6ddc69d3069dbdbd9acf1003657b572ced"
+        },
+        {
+          "kind": "struct",
+          "name": "CommitteeRef",
+          "sha256": "e71c1ff13a2b01f74722c12f92f69d546e151db49e61bcba0e06cc17484e88b5"
+        },
+        {
+          "kind": "struct",
+          "name": "CorrelationCaps",
+          "sha256": "f5b729e5971678cda29e28588ce27ffce8e896eac0ce76ba7c8430120c126dfc"
+        },
+        {
+          "kind": "struct",
+          "name": "CreationPolicy",
+          "sha256": "0c7869593b1ca670e294415846afc64571f0bcb869347a440eda8c0cae888206"
+        },
+        {
+          "kind": "struct",
+          "name": "DailyUsage",
+          "sha256": "dc50bc8149ae477a1aebf241e1396d89311f9c803e97ac035ce158d092ddf654"
+        },
+        {
+          "kind": "struct",
+          "name": "DisputableSignerConfig",
+          "sha256": "7c2bf7bbeb1f69f3898d0f9fa8d1487c8cbc87a448251a9817174e7c7eb880e8"
+        },
+        {
+          "kind": "struct",
+          "name": "DrawdownStatus",
+          "sha256": "5efe514f8d41d833d6e4c7b12b2df502a9935f7338f57b35efbb433168bc428d"
+        },
+        {
+          "kind": "struct",
+          "name": "GlobalConfig",
+          "sha256": "54457c4e4525af8887823c42c1e4ddfe675b22aa2f6284856046448f161aecee"
+        },
+        {
+          "kind": "struct",
+          "name": "HybridConfig",
+          "sha256": "4f71d5d6678db3ac45463fd4ec16a9e0e10680a8d93726865b3555d0e5f6dcb2"
+        },
+        {
+          "kind": "struct",
+          "name": "MarketPnl",
+          "sha256": "d4d84d0a7031234a8f23c96a988119f618b0305c4eca1ee3bd71a54421f70ba2"
+        },
+        {
+          "kind": "struct",
+          "name": "MarkRecord",
+          "sha256": "2eafacff5ee04a7cab85c5fbaca51b31dabc8351106d009ce6f49c4265958b85"
+        },
+        {
+          "kind": "struct",
+          "name": "ModeState",
+          "sha256": "1eb102242430febcfe082d2df0fb2e9081535fb42f1958f8eb4c561cd882d01a"
+        },
+        {
+          "kind": "struct",
+          "name": "NavDetail",
+          "sha256": "a71e49d65a7c736d53d471c31d8f37495cd08fae1d0da776082c7fa7fe26fcca"
+        },
+        {
+          "kind": "struct",
+          "name": "NetPosition",
+          "sha256": "d7c110b94959be2d434fd19af95a02a5b4ed788463a733d683ba6a26482d4914"
+        },
+        {
+          "kind": "struct",
+          "name": "OpenMarket",
+          "sha256": "b80b5d47869cdd7949d4a9c7c48d3114cdc8ec068e62fbdd752457972a048d79"
+        },
+        {
+          "kind": "struct",
+          "name": "PendingAdminOp",
+          "sha256": "847d18d0717541ce9816a4e852faacd6645639da314d093cf73bbf992c99343d"
+        },
+        {
+          "kind": "struct",
+          "name": "PendingAgent",
+          "sha256": "dd18f0e4415f8005fb2c5b2a14ecdd7c27fa29700bf57508c4ef8bc05f319e07"
+        },
+        {
+          "kind": "struct",
+          "name": "PendingConfig",
+          "sha256": "cd9761d5fb724a04c7f5a82b9b1068b2d0567456bec7daccf02f5a326addb812"
+        },
+        {
+          "kind": "struct",
+          "name": "PendingCorrelation",
+          "sha256": "57b687599a1a46dbe504a6f40d61c01908d1cbc724133a565547f7437a8e5895"
+        },
+        {
+          "kind": "struct",
+          "name": "PendingMarkAge",
+          "sha256": "dac69f6f70f4df544073d8eeb34d10301dcddb98c6e81bacd7cecc096510d0c9"
+        },
+        {
+          "kind": "struct",
+          "name": "PendingPricePolicy",
+          "sha256": "9b1a76e2a026db8205a9a02f75373eea8b0005fe5cd34c418cf848975094bc1f"
+        },
+        {
+          "kind": "struct",
+          "name": "PendingResolvability",
+          "sha256": "3947a54bfa423bc3cf0b85c3f76c4bcf0428a6fb7320fd31a31fdc621388da90"
+        },
+        {
+          "kind": "struct",
+          "name": "PriceConfig",
+          "sha256": "d8c6c5b943c95c6cc20166fc7888c5916324963e50975390f20b95e1fa71421a"
+        },
+        {
+          "kind": "struct",
+          "name": "PricePolicy",
+          "sha256": "998b73ef02f1d96ef7312c22832b3fa95fbcc5e8480a96177152e5ee18193b1b"
+        },
+        {
+          "kind": "struct",
+          "name": "Realized",
+          "sha256": "7cc554f52b4e416a161881afb25d53de03084fefd9fd36ee45005376fe0a13f6"
+        },
+        {
+          "kind": "struct",
+          "name": "ResolutionSpecV2",
+          "sha256": "be4c46679057a5634182a4d09d916ba032e759b6a4d6139661efcb2ad574adc0"
+        },
+        {
+          "kind": "struct",
+          "name": "ResolvabilityPolicy",
+          "sha256": "8d81296502920d0fbeb88be92ca6d1eea3958b9b812090edfc66234017ca4c61"
+        },
+        {
+          "kind": "struct",
+          "name": "RiskConfig",
+          "sha256": "d12646f677ab3a3f1323e0e9270e0c8dce665bec08a29471a29fa3655ac4d0d0"
+        },
+        {
+          "kind": "struct",
+          "name": "SettlementReport",
+          "sha256": "9a3bc0764995cc6600c85951ded400cf3c51f6aeaefe23d229187a8e6c269ac0"
+        },
+        {
+          "kind": "struct",
+          "name": "SignerConfig",
+          "sha256": "093cf853646ed9c64c3755c1b50dd10df2bdbc0e6c1d9787d2070a12ba14cc40"
+        },
+        {
+          "kind": "struct",
+          "name": "TokenCaps",
+          "sha256": "c32e30a60fc05e44d2d4186cd07d4e13350898af6402c37fe8048e6d91d04c3a"
+        },
+        {
+          "kind": "struct",
+          "name": "TracePolicyConfig",
+          "sha256": "21d9fe35b2ea4ca18cf7df565787f88c9dd415f76f583d3cff925bd4abbd89eb"
+        },
+        {
+          "kind": "struct",
+          "name": "UsageWindow",
+          "sha256": "9cfd5731607aa8a6136d15f82890cae8c4ba969f0b5967515647374c851d019e"
+        },
+        {
+          "kind": "struct",
+          "name": "Valuation",
+          "sha256": "e01fffdb46403b25887a023135018333c26a17adc153a2555afc24cbb86a4ba4"
+        },
+        {
+          "kind": "struct",
+          "name": "WeightedKey",
+          "sha256": "ba9a2ffbdd5ba12fbcd04324b101b69bf1c23a4b751151cfe1092289155db75d"
+        },
+        {
+          "kind": "struct",
+          "name": "WeightedKeyConfig",
+          "sha256": "481e6be6f904eb9e647320a8f60b0b7407fea2f89e1899647d3fd843f118b90b"
+        },
+        {
+          "kind": "struct",
+          "name": "WithdrawTicket",
+          "sha256": "3072cb152dff4f935bb4badf9d2693fdc60411b1c1137a2cc2450cbe71d7dbd1"
+        },
+        {
+          "kind": "union",
+          "name": "AdminOp",
+          "sha256": "c7487952499db44835d7f8ddcdaa828e6675041b140ee0b0af9a47ccee56dc76"
+        },
+        {
+          "kind": "union",
+          "name": "BatchStatus",
+          "sha256": "39e0f853242861706e2f176c2a70b5fc48ff5b8845e8eae39150b18b4d764136"
+        },
+        {
+          "kind": "union",
+          "name": "Category",
+          "sha256": "97d0fa9e22e7ba56105ae8764289b6da9db76f296068db09bff33163b2c5ce6b"
+        },
+        {
+          "kind": "union",
+          "name": "Escalation",
+          "sha256": "762921a5e459d5ed6216cf7c24dccb1f10dabd06fd97f43447ecf6ac841e2d23"
+        },
+        {
+          "kind": "union",
+          "name": "Mode",
+          "sha256": "bfffbc35b00e1adbc903d9d5f6b61c4882683b578ba8b253b1bb67e8bc53168d"
+        },
+        {
+          "kind": "union",
+          "name": "Op",
+          "sha256": "2d4fbd2a04d1af3a1127e8521ce8271ab03dca69ea263092fee807cbdd8a2476"
+        },
+        {
+          "kind": "union",
+          "name": "OracleAsset",
+          "sha256": "60c4066089ab9567a017be443298408fd61f62df143adba4b156fdd3debf9f81"
+        },
+        {
+          "kind": "union",
+          "name": "Outcome",
+          "sha256": "f48fd29535a11cc7b94a3d3b0b4eb69bab0dd5becf4e7e4545c137e9ed1ef00f"
+        },
+        {
+          "kind": "union",
+          "name": "PriceDirection",
+          "sha256": "a1054365fe3478a22eb1bc4b10a67f1972a6a6c3832155a1bb35569aab3d857f"
+        },
+        {
+          "kind": "union",
+          "name": "ResolutionSpec",
+          "sha256": "e7a32bf42a048c3a9cdcbb3e10184376e95122c51b33bfcb1b6566ad847944d5"
+        },
+        {
+          "kind": "union",
+          "name": "SkipReason",
+          "sha256": "5826844249adcba8131eb996c636916451cd61cd90315f22329ab8c846d8ea13"
+        },
+        {
+          "kind": "union",
+          "name": "TracePolicy",
+          "sha256": "61b9982952575a9d36777210f8b2063eb94cdbb3848d6d5b30b68b5c9d0d7121"
+        }
+      ]
+    },
+    "resolver": {
+      "binding": "resolver.ts",
+      "contractId": "CDDJU3PH6T3Z4O6EYLALXXB5XBFPYO2G5P5RBDEIZ7ZVN6V37OQSVYGR",
+      "specSha256": "79cc8c39fca0f0f5068a83c3c66293ee4ddba15c4d417758442078ed5e302ccc",
+      "expectedWasmHash": null,
+      "entries": [
+        {
+          "kind": "error",
+          "name": "Error",
+          "sha256": "e3072d66e8fe989d909f1a4cf9dedf6855b2cf2558bfa2f5c5d9816debe44dd1"
+        },
+        {
+          "kind": "event",
+          "name": "AdminTransferCancelled",
+          "sha256": "1c582c802d283137bca3ead164b92bd2abab5c4ce508228623d16164bc334c3a"
+        },
+        {
+          "kind": "event",
+          "name": "AdminTransferProposed",
+          "sha256": "4b192858830b8ff5b76ae3e72bd453d74b38a9347dc534c6507e8655922b3d26"
+        },
+        {
+          "kind": "event",
+          "name": "AdminTransferred",
+          "sha256": "9961930626a5f142712561e5c93e0be473db3008dcde48db7a14f1d98af6dc5e"
+        },
+        {
+          "kind": "event",
+          "name": "Attested",
+          "sha256": "3c576c8d090c00b0832ebce89a2822b187957f2377b0e4b877c28d95ae167b9a"
+        },
+        {
+          "kind": "event",
+          "name": "CommitteeCreated",
+          "sha256": "9c280afb10dddffeb4385da9bb95b2d72506de0f0c060491ae4a7b40ed1a9024"
+        },
+        {
+          "kind": "event",
+          "name": "CommitteeVoided",
+          "sha256": "f5a0099bee8bc054465d518a288d8374776f36ebdea0dac4f78fe391879aab00"
+        },
+        {
+          "kind": "event",
+          "name": "Disputed",
+          "sha256": "6d5093e2869ecc2ad63c2b99c991849b4f898eb53a4ce5c03148c72bcd3cfdca"
+        },
+        {
+          "kind": "event",
+          "name": "DisputeSettled",
+          "sha256": "8749e8c3c6f67dc80a17c3c2e7eb337074abec60c47e8d397753745ff947657f"
+        },
+        {
+          "kind": "event",
+          "name": "FallbackOpened",
+          "sha256": "c34a4ae10927b666e1326c1b7479f1c9c579e40bca1d98d18711686de83481d6"
+        },
+        {
+          "kind": "event",
+          "name": "FallbackSuperseded",
+          "sha256": "ff856d275ebd2f20e22ffaa1e86d2b46ceb88ce4467ebae30217e99269dbd3fb"
+        },
+        {
+          "kind": "event",
+          "name": "GuardianAction",
+          "sha256": "e1c4e349a56a39b85fea141dc2f8a783c9e20e14b1b33d0c6a7ef0b9b261ea3b"
+        },
+        {
+          "kind": "event",
+          "name": "MarketExpired",
+          "sha256": "8642b8ce4d6f4ce97be752d66108d778b0cc72f4645279c8e5913842df260ca3"
+        },
+        {
+          "kind": "event",
+          "name": "PriceResolution",
+          "sha256": "fb85fe050189f82b52880187376811f9f546f0e762c795f44b9aa72428d09139"
+        },
+        {
+          "kind": "event",
+          "name": "PriceResolutionScaled",
+          "sha256": "0d05c4290351251ee3a3520c641702fe370df17168edf48fcc95c9db386a84f8"
+        },
+        {
+          "kind": "event",
+          "name": "PriceResolutionV2",
+          "sha256": "590adc8b6bcf46167826db095847465ff085115668c48f9f198ae0bd3808c53a"
+        },
+        {
+          "kind": "event",
+          "name": "PriceSnapshotted",
+          "sha256": "86ff9599f37186bdffd032394349222bedeb12d034e73895d43adfcaf6428750"
+        },
+        {
+          "kind": "event",
+          "name": "ResolutionFinalizedV2",
+          "sha256": "82af7d7aa87cad056311bb6512fb751660cf21729ac4196e3af17b0e2dc59203"
+        },
+        {
+          "kind": "event",
+          "name": "ResolutionProposedV2",
+          "sha256": "d955a1631ebe36cb8e7114b87367f5f4b5f38364a5c368319ebdd27b1ddeec89"
+        },
+        {
+          "kind": "event",
+          "name": "RotationCancelled",
+          "sha256": "b796dd9c5dd732ff6feb7ec91bd7c6854d0ba54937e0bed98d4c9a2199d0d1a3"
+        },
+        {
+          "kind": "event",
+          "name": "RotationExecuted",
+          "sha256": "7f84539d19721103eeb7e5567df841ddc5fb2ada958d000b2e83fe95f0c29c02"
+        },
+        {
+          "kind": "event",
+          "name": "RotationProposed",
+          "sha256": "6f7f34b79c3b00d55e7d9a8950082e0dab738119fd40a9aadd52e281de3d45fa"
+        },
+        {
+          "kind": "event",
+          "name": "TwapResolution",
+          "sha256": "91c323a2a40eff130bb4c6341f5c1c81fb5558f96688752033a6923f7fb97ce9"
+        },
+        {
+          "kind": "function",
+          "name": "__constructor",
+          "sha256": "c26f63914b37d271a632832b6c43be60cd14dfd85d0606105995dbafa3c95ba0"
+        },
+        {
+          "kind": "function",
+          "name": "accept_admin",
+          "sha256": "8696d4f7a8c60185d9f32475214a8e18524e1ddf5f477e808c2b601a01b216a0"
+        },
+        {
+          "kind": "function",
+          "name": "accept_market_core_role",
+          "sha256": "609448b211c0eee0bc3c7a6e25bf536b4936392e03037832a1a44add39400547"
+        },
+        {
+          "kind": "function",
+          "name": "admin",
+          "sha256": "5063ad2b063ca69155432532c2062ec526976fa9790e91f78eae8b9d38f369d5"
+        },
+        {
+          "kind": "function",
+          "name": "attest",
+          "sha256": "732a4e6cb7b01bb9c475e291ee5288166b3b514556073dbf1551ef48d6132f5b"
+        },
+        {
+          "kind": "function",
+          "name": "attest_with_evidence",
+          "sha256": "b212d76e6c09e6ffa026ce93f8530aa782caa52ad1799ab1f41abc5651cb22df"
+        },
+        {
+          "kind": "function",
+          "name": "cancel_admin_transfer",
+          "sha256": "afcba60cf6cc7ce612503880429e760cf8f18e3aeeb66d36462145d027cb0d3b"
+        },
+        {
+          "kind": "function",
+          "name": "cancel_count",
+          "sha256": "691221a84db939d5c15bfa0d673e2705b0d444e8b19eb9d39f4bf01e0d31a262"
+        },
+        {
+          "kind": "function",
+          "name": "cancel_proposal",
+          "sha256": "89f5829f277f4075cc78f5dc9042ceca19bb400a401f5c881b0167cdb26cf125"
+        },
+        {
+          "kind": "function",
+          "name": "cancel_rotation",
+          "sha256": "6b89ed95f01a6dc1c5bca6bf01868164c57ba27213bdd1c42321806cdd644d8a"
+        },
+        {
+          "kind": "function",
+          "name": "claim_dispute_bond",
+          "sha256": "ab328be7a3c8d966f1203b68a64eaeb72a15e341f14809cce8cde22717118e88"
+        },
+        {
+          "kind": "function",
+          "name": "create_committee",
+          "sha256": "b366d08b614d19ac89ecc0917f08c0057d0c008c254b55b8e1735a9f89d9dec5"
+        },
+        {
+          "kind": "function",
+          "name": "current_round",
+          "sha256": "e4d2732a2a689bd5adc481397597bbd1ab0d73ff28f91d6750ccf082cde41470"
+        },
+        {
+          "kind": "function",
+          "name": "dispute",
+          "sha256": "06cb2a93aa73cea0c37f8d001c1e1c9872481f04d37a8742ff0537be8c286ae8"
+        },
+        {
+          "kind": "function",
+          "name": "escalation_attest",
+          "sha256": "c643493b43628a6fd79aa61ab6572360b3008b93409b997c7644cd2735bc47ce"
+        },
+        {
+          "kind": "function",
+          "name": "evidence_at",
+          "sha256": "4e12f38bdf739d41a73133dfd05f2a1224339595ef319065bb3fef7d45adf63d"
+        },
+        {
+          "kind": "function",
+          "name": "evidence_config",
+          "sha256": "3cf9a0e4fa95f9a8ef4dd3bd712f9e7850256e173a03b619b6c47417ed560efe"
+        },
+        {
+          "kind": "function",
+          "name": "evidence_count",
+          "sha256": "54a2394ecb4095012c03c1ad39f2ce752f79c2a398033d1b8eb8b0982681c466"
+        },
+        {
+          "kind": "function",
+          "name": "execute_rotation",
+          "sha256": "875059f83acb3b4f64e67d3445d23e337e565a436a86d1a8179364f6884bcb5f"
+        },
+        {
+          "kind": "function",
+          "name": "expire_dispute",
+          "sha256": "596714db67dbec4b15bc15e8af83e1e5bf5fdadcbce5c5fa6d4664f534e7ce83"
+        },
+        {
+          "kind": "function",
+          "name": "expire_market",
+          "sha256": "34991e98b28d7c274de4191375d2791665e97061b60bffda0e0248328c897058"
+        },
+        {
+          "kind": "function",
+          "name": "finalize_signers",
+          "sha256": "08c78a7862cda33e837a4bb7d8030cd4624f3cd8f6968babac2f7b8175d85e8a"
+        },
+        {
+          "kind": "function",
+          "name": "get_committee",
+          "sha256": "e3b02100a6e15a0515cb3b820b8a8cfadf83adec6d94268db539dea592f27fdb"
+        },
+        {
+          "kind": "function",
+          "name": "guardian_options",
+          "sha256": "c8ab40992957c8ef384d8b3225e3054f0075b7524a5d86dd5d34735c75e13c1d"
+        },
+        {
+          "kind": "function",
+          "name": "guardian_void_market",
+          "sha256": "e70a1ff727b38de616a8d30d998036a33ca83e5065bf57fbdc40a274fbb41632"
+        },
+        {
+          "kind": "function",
+          "name": "market_core",
+          "sha256": "c498ec8d80d8c64487a65f1d063a850f311cc2ad64931ab3e2c8293a795e2922"
+        },
+        {
+          "kind": "function",
+          "name": "open_fallback",
+          "sha256": "6845d58469b2414435002482e9480e88fb0ce3d3cb72a64da47f64dd557a6442"
+        },
+        {
+          "kind": "function",
+          "name": "pending_admin",
+          "sha256": "ae66dedfa0e865a8a65ad9975786ec1c0d452d6307d24a04c7b44398002d1fd1"
+        },
+        {
+          "kind": "function",
+          "name": "preview_price",
+          "sha256": "0a31ac8d99e1e33d41498b906eab7d5b5fd223f82d2424ac089e0667d0306391"
+        },
+        {
+          "kind": "function",
+          "name": "propose_admin",
+          "sha256": "e324e42a41e9c7f0b68dc814aba21a270dce93c4368e0dfeb73415a807577db3"
+        },
+        {
+          "kind": "function",
+          "name": "propose_rotation",
+          "sha256": "8850dff1c6cb2228dd3d9823876b1728a694accd581dc401ed534b51a13eeb74"
+        },
+        {
+          "kind": "function",
+          "name": "register_committee_spec",
+          "sha256": "6c9845a545999fbba99ea0a154068a44e2ef62718be3f4eafe6d31dd43a2075f"
+        },
+        {
+          "kind": "function",
+          "name": "register_disputable_spec",
+          "sha256": "8d87ddce8920e75e0383e1b478946ed0b83d0ccd94b11260f49edf9dde9254a9"
+        },
+        {
+          "kind": "function",
+          "name": "register_hybrid_spec",
+          "sha256": "04c30cdb9796f9cbafdc1add1187af75751648198d73f599ac96c53cde0d933a"
+        },
+        {
+          "kind": "function",
+          "name": "register_price_spec",
+          "sha256": "9f4ca8ed50e60437a8086bccf0ec493605c8a094fd75c5b7e693728e69609033"
+        },
+        {
+          "kind": "function",
+          "name": "register_scaled_price_spec",
+          "sha256": "333274470434d03cdf5b36d875e2895cdb2b263e8324631cfc04ec64cf6454a0"
+        },
+        {
+          "kind": "function",
+          "name": "register_signer_spec",
+          "sha256": "cc9e66d063387e4cf40d9ecc27da767a5414229a30bd1fa3294a2b8f85572be7"
+        },
+        {
+          "kind": "function",
+          "name": "register_spec_v2",
+          "sha256": "9f2c7c5dc8a2dc4402b54b3c58b081fd6da4ecb85c2484f07d75d3c7f9987c32"
+        },
+        {
+          "kind": "function",
+          "name": "register_twap_spec",
+          "sha256": "579034e18934243ce88fdab2aa55e7081928f5d7bf998cff42ef7a6f0f34c755"
+        },
+        {
+          "kind": "function",
+          "name": "register_weighted_key_spec",
+          "sha256": "6791cf18d15d080ad9ece49cb40b9f74bb37ef21b3bd4d47fb02f907dc674b7c"
+        },
+        {
+          "kind": "function",
+          "name": "resolution_deadline",
+          "sha256": "9cef278276054a6511980c27421993bf1c6c4304a7e2b9c586f7029a313d1c27"
+        },
+        {
+          "kind": "function",
+          "name": "resolve_price",
+          "sha256": "3817970f0104aaaadc02fba742403c15c2157418c3d070893630a1e3c1002901"
+        },
+        {
+          "kind": "function",
+          "name": "resolve_twap",
+          "sha256": "f40c68225b8d23caa0deeefa20d5a0442fe71fbaddaa1d62a1ef2f86776b261f"
+        },
+        {
+          "kind": "function",
+          "name": "set_evidence_config",
+          "sha256": "9071cbd501fdf76a4c1b18facddd1e7df7ad3068f6023892b96a097e18462a9d"
+        },
+        {
+          "kind": "function",
+          "name": "settle_dispute",
+          "sha256": "364914c8434e988edb37c8ebd22c0c8b81f3460031e2223f3164c02c228f67a0"
+        },
+        {
+          "kind": "function",
+          "name": "snapshot",
+          "sha256": "afd1d04c06de44065690e609e6fb4e6815e9c3994587f6ca6c5594397085a093"
+        },
+        {
+          "kind": "function",
+          "name": "snapshot_price",
+          "sha256": "fc5ac3a9a418a598013198a253b220a72811bee95543c9e79b9d07b207da39fb"
+        },
+        {
+          "kind": "function",
+          "name": "spec_kind",
+          "sha256": "b4404c0edd231b2aa658133ccf73a8bebfee2f515e9318046c42952155b0fe6f"
+        },
+        {
+          "kind": "function",
+          "name": "state",
+          "sha256": "053d18c03287d73c3f300984095ea1a532170562bb987d29cfe5b2a50009ce98"
+        },
+        {
+          "kind": "function",
+          "name": "submit_signatures",
+          "sha256": "361f0eb7cbc95f52e857ba42f930ef9d1a5fed3317a3445343d7fbc2af89cc07"
+        },
+        {
+          "kind": "function",
+          "name": "trade_status",
+          "sha256": "fe4fe2867a736b61d5e6ddcf516a6d9566a8c91f83a578b9d9e72dd1a2781d61"
+        },
+        {
+          "kind": "struct",
+          "name": "AttestationEvidence",
+          "sha256": "45e423fc7b2c77e790c41a9a43145f2309be132c1e1d49fe7bda266947e2075e"
+        },
+        {
+          "kind": "struct",
+          "name": "Committee",
+          "sha256": "e2afee7c4e654d27e09e9bca08efc98cb7f9e54006c5e0be5f0aa5af92337306"
+        },
+        {
+          "kind": "struct",
+          "name": "CommitteeRef",
+          "sha256": "f019a4df29ce3a789b35b411331a2e7a5fb540d9de936f1b62452fbdeab70006"
+        },
+        {
+          "kind": "struct",
+          "name": "DisputableSignerConfig",
+          "sha256": "9f4bae0d37091f0bb641edde7aa91eae68fa40b45bb16ded60841e24d57b7c5c"
+        },
+        {
+          "kind": "struct",
+          "name": "HybridConfig",
+          "sha256": "78258574c4f4c2cda29381f2371e939c9f0aed909adeab1e536b780d97d8651e"
+        },
+        {
+          "kind": "struct",
+          "name": "PendingAdmin",
+          "sha256": "ce2fee87bac2845b8b280108a70bc0aaa0ab4af12851c031b168a3395ea0396e"
+        },
+        {
+          "kind": "struct",
+          "name": "PriceConfig",
+          "sha256": "d8c6c5b943c95c6cc20166fc7888c5916324963e50975390f20b95e1fa71421a"
+        },
+        {
+          "kind": "struct",
+          "name": "PriceData",
+          "sha256": "91b7f65d56c4704a51811c1eaf74bfb7a64b0321b761009762ad73cff05818fe"
+        },
+        {
+          "kind": "struct",
+          "name": "PriceSnapshot",
+          "sha256": "d8720e73f677f6d61a0dd6aa73c445659a22b06229fcabe12e7201712500fef5"
+        },
+        {
+          "kind": "struct",
+          "name": "ResolutionSpecV2",
+          "sha256": "7bf87824e57ac2b2514b770d1597a1ede981f75d86d963c59d959dda43cb3407"
+        },
+        {
+          "kind": "struct",
+          "name": "ScaledPriceConfig",
+          "sha256": "9311a2a8ef2ecac4bef3326ca10663f26e272bd746205d85cb06cc5fb6ee1ca3"
+        },
+        {
+          "kind": "struct",
+          "name": "SignerConfig",
+          "sha256": "093cf853646ed9c64c3755c1b50dd10df2bdbc0e6c1d9787d2070a12ba14cc40"
+        },
+        {
+          "kind": "struct",
+          "name": "TradeStatus",
+          "sha256": "1a5f951afe8248bb1637301a8a2bdb965e56d72a358c668939f40fcac9b2011d"
+        },
+        {
+          "kind": "struct",
+          "name": "TwapConfig",
+          "sha256": "e0568954b86c894c3d78ac19fda82c1944c52a2baff8263f9159764cff1f82b9"
+        },
+        {
+          "kind": "struct",
+          "name": "WeightedKey",
+          "sha256": "fc92c7f73fdd979e46a28915334d1a13b6e5f3e271a15161a0166674b80a18e0"
+        },
+        {
+          "kind": "struct",
+          "name": "WeightedKeyConfig",
+          "sha256": "2c48e77babf249415aa28ff7ee82a618b7c8db4444eec60baeb3e8cf03596ccb"
+        },
+        {
+          "kind": "union",
+          "name": "AttestedOutcome",
+          "sha256": "5df308da2212b5b0b716177ae3253e48ac3582af541f88f163ab85612a29d3f6"
+        },
+        {
+          "kind": "union",
+          "name": "Escalation",
+          "sha256": "e8fc4399cb9635272c81b57710a4cad59cd6c43afc3cf0137e4f3d1ce72d1ddd"
+        },
+        {
+          "kind": "union",
+          "name": "EvidencePolicy",
+          "sha256": "9478e5c9373c41d303d8dd32c9a58a4f7f6bdc9c2852aeac1e26f6d549d50a4b"
+        },
+        {
+          "kind": "union",
+          "name": "ExpiryMode",
+          "sha256": "485e21ab05519f2e514b7260fe9271f7283749223a38313b730bf74d38d4e3ac"
+        },
+        {
+          "kind": "union",
+          "name": "GuardianActionKind",
+          "sha256": "2fb72610bcc9afaf8fab5617c1dd349a6f0409b71583b6360518704e124ece29"
+        },
+        {
+          "kind": "union",
+          "name": "GuardianReason",
+          "sha256": "6ecd2851dfee23af4a4a8a07e7edab2f7ae426199643f28c3c1df594ea2ec283"
+        },
+        {
+          "kind": "union",
+          "name": "OracleAsset",
+          "sha256": "60c4066089ab9567a017be443298408fd61f62df143adba4b156fdd3debf9f81"
+        },
+        {
+          "kind": "union",
+          "name": "Outcome",
+          "sha256": "f48fd29535a11cc7b94a3d3b0b4eb69bab0dd5becf4e7e4545c137e9ed1ef00f"
+        },
+        {
+          "kind": "union",
+          "name": "PriceDirection",
+          "sha256": "a1054365fe3478a22eb1bc4b10a67f1972a6a6c3832155a1bb35569aab3d857f"
+        },
+        {
+          "kind": "union",
+          "name": "ResolutionSpec",
+          "sha256": "c50c6d81087a2149cccbec9d5274978939f2fd53cdc3d701e88f5f0f1dd57143"
+        },
+        {
+          "kind": "union",
           "name": "ResolutionState",
-          "sha256": "0c56cc2468a2968fd8aea40f62f18eb09cf87bd7dc1eca0c35018bcadf76c9a7"
+          "sha256": "b7472c35ba1c90cfda683eb40a9b1bd61e9c9793fb889b2bddf8d263da5b93e3"
+        },
+        {
+          "kind": "union",
+          "name": "SpecKind",
+          "sha256": "36fa41c77ce8540580234ce6559e3bd09691fc09fc6db2dd13816c0b4b9211ea"
+        },
+        {
+          "kind": "union",
+          "name": "Verdict",
+          "sha256": "d9ebbd94e7c5c7ec7fe54a65eced9bd2a54aabc78e3bb9a2cfefe38e482572ca"
         }
       ]
     },
     "reasoningRegistry": {
       "binding": "reasoning-registry.ts",
       "contractId": "CAFEED35XICK4OXIEXQDS6KTTBUA2LDNW3EXEUGTNMN54DY5ANETCH6M",
-      "specSha256": "47db3ae4334bee5c3531993bea00c5bc4b58c76f0c734ddc15f7b49f9b699b62",
+      "specSha256": "f20cac7cfec7d3e91f595946487e61ea6709962f8e6b1f6aad58d2c72d6bbd1d",
       "expectedWasmHash": null,
       "entries": [
         {
           "kind": "error",
           "name": "Error",
-          "sha256": "3c416b0a8bcfb0ac2fe0e811db5d2e81c61d2f7e309662f34caac1d53a855480"
+          "sha256": "bc11df0f16e0081d28e0fd7c1a2f717e983abd164c002fdb7019b3f4f38253a6"
+        },
+        {
+          "kind": "event",
+          "name": "AdminTransferCancelled",
+          "sha256": "1c582c802d283137bca3ead164b92bd2abab5c4ce508228623d16164bc334c3a"
+        },
+        {
+          "kind": "event",
+          "name": "AdminTransferProposed",
+          "sha256": "4b192858830b8ff5b76ae3e72bd453d74b38a9347dc534c6507e8655922b3d26"
+        },
+        {
+          "kind": "event",
+          "name": "AdminTransferred",
+          "sha256": "9961930626a5f142712561e5c93e0be473db3008dcde48db7a14f1d98af6dc5e"
         },
         {
           "kind": "event",
           "name": "AgentRegistered",
           "sha256": "e46e23c4f4cd39c6c0bc4d7fcdd1f638a8b1e61dbcbd1cf23be56fe28c958c37"
+        },
+        {
+          "kind": "event",
+          "name": "ConsumerRegistered",
+          "sha256": "80c0d6a1f4d1a5624731c8916b00daf97447a553771feb187e41b4bb98fa917b"
+        },
+        {
+          "kind": "event",
+          "name": "ConsumerUnregistered",
+          "sha256": "2b20a508d729dc3e3d314ff4121c22e2384329b2656f42373346a5a6c8cfa49f"
+        },
+        {
+          "kind": "event",
+          "name": "TraceChained",
+          "sha256": "620063dc5679e3be30e5e51b0fcafd06e7ed69d0c232629af0c750036f13140d"
+        },
+        {
+          "kind": "event",
+          "name": "TraceConsumed",
+          "sha256": "d5a6e6055a8cbb9a46986ab55be67a412468b09773a04dbe18d2d06fbb7d5b33"
         },
         {
           "kind": "event",
@@ -425,8 +2310,58 @@
         },
         {
           "kind": "function",
+          "name": "accept_admin",
+          "sha256": "8696d4f7a8c60185d9f32475214a8e18524e1ddf5f477e808c2b601a01b216a0"
+        },
+        {
+          "kind": "function",
+          "name": "admin",
+          "sha256": "5063ad2b063ca69155432532c2062ec526976fa9790e91f78eae8b9d38f369d5"
+        },
+        {
+          "kind": "function",
+          "name": "agent_chain_head",
+          "sha256": "156ffa2e6101a823e480d1ec0ea88e8bc87c4657b1245bb8c0e71fa2c6746f77"
+        },
+        {
+          "kind": "function",
+          "name": "agent_trace_at",
+          "sha256": "c3fe9ebe1663f3ef420ba7b5d285647f32f9fe112ab5ff74a460f1f8d9e6fd2d"
+        },
+        {
+          "kind": "function",
+          "name": "cancel_admin_transfer",
+          "sha256": "afcba60cf6cc7ce612503880429e760cf8f18e3aeeb66d36462145d027cb0d3b"
+        },
+        {
+          "kind": "function",
+          "name": "consume_trace",
+          "sha256": "136102a68177dc731c6bdeb097f8b3297f2ae901b3676af487a2d153b4506a2b"
+        },
+        {
+          "kind": "function",
           "name": "get_trace",
           "sha256": "12e967106a9d8e61cf463eb74f65474ab8591af0f4d98b1c6208223c31c83f46"
+        },
+        {
+          "kind": "function",
+          "name": "get_trace_ledger",
+          "sha256": "cacf293c2d94e42cc618d609809b7ff29c2417744c6c64c26538406c65937f37"
+        },
+        {
+          "kind": "function",
+          "name": "get_trace_link",
+          "sha256": "a5f1f11c4c00ff6777ba4cc7998c619612d8b17a047399d9c71a0a9f1fa6f522"
+        },
+        {
+          "kind": "function",
+          "name": "is_consumed",
+          "sha256": "2e3a3c8be74d1936108db01bfdbfc9959da70b2ce48493b97244b87565514022"
+        },
+        {
+          "kind": "function",
+          "name": "is_consumer",
+          "sha256": "416d58e52d8fe19d68e2a6060907ab810807b6d36ac1c2e41b98cd6663cf87a9"
         },
         {
           "kind": "function",
@@ -445,6 +2380,21 @@
         },
         {
           "kind": "function",
+          "name": "pending_admin",
+          "sha256": "ae66dedfa0e865a8a65ad9975786ec1c0d452d6307d24a04c7b44398002d1fd1"
+        },
+        {
+          "kind": "function",
+          "name": "propose_admin",
+          "sha256": "e324e42a41e9c7f0b68dc814aba21a270dce93c4368e0dfeb73415a807577db3"
+        },
+        {
+          "kind": "function",
+          "name": "publish_chained_trace",
+          "sha256": "2bbc62f0e2bd21618a17a09b83e5d4de996abfe1fce44ff66c9833e47683e74c"
+        },
+        {
+          "kind": "function",
           "name": "publish_trace",
           "sha256": "285d7a740a097c4aa7bbd37b02dd85ce2766d7d46926bcd12c704b8c583920cf"
         },
@@ -452,6 +2402,11 @@
           "kind": "function",
           "name": "register_agent",
           "sha256": "1876bf8fe3fb02ce94dd8a09d19cef82302c721ccb732484e4bf8d2fd8a20245"
+        },
+        {
+          "kind": "function",
+          "name": "register_consumer",
+          "sha256": "562b2a7dc95dd6c67f3df4c8553f48425fc65f59c85fd6227ff9f9cafded436f"
         },
         {
           "kind": "function",
@@ -465,8 +2420,33 @@
         },
         {
           "kind": "function",
+          "name": "unregister_consumer",
+          "sha256": "c4483c9a15832008e4de1a0cd4abb0656fdd63ec8bc30b79d2e4ce10c9d055d0"
+        },
+        {
+          "kind": "function",
+          "name": "verify_commitment",
+          "sha256": "ae2dda49a8b536aeb32db35e98f1700118f47a3761587f5fae872ae0c3d4c00b"
+        },
+        {
+          "kind": "function",
           "name": "verify_trace",
           "sha256": "197226c97a7f5a3b4da6205f6cb8d641184e09d73263ef3cf6354ae317636d00"
+        },
+        {
+          "kind": "struct",
+          "name": "ChainHead",
+          "sha256": "5c61f7d2fb4fc24d4ea586d59be58fe3303b1bb35b8a2b5aa043b21d02af790a"
+        },
+        {
+          "kind": "struct",
+          "name": "ChainLink",
+          "sha256": "2c10861de025e0edd4aad21b0f17684ff0073deaba2c40cc08541abcdebafd4a"
+        },
+        {
+          "kind": "struct",
+          "name": "PendingAdmin",
+          "sha256": "ce2fee87bac2845b8b280108a70bc0aaa0ab4af12851c031b168a3395ea0396e"
         },
         {
           "kind": "struct",
@@ -476,7 +2456,7 @@
         {
           "kind": "union",
           "name": "DataKey",
-          "sha256": "b38f565e62e41e23a8d3d1d0d667fa5c6257a85301aa2b33e9a7b0492018721b"
+          "sha256": "312bf98f0fb906fa8eb96744cd9b10ed4f7c4df48be63f674190a15572749467"
         }
       ]
     }

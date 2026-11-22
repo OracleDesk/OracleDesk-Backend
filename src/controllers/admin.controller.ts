@@ -23,11 +23,15 @@ import { logger } from '../lib/logger';
 import { config } from '../config';
 import { secret } from '../config/secrets';
 import { chainWritesStatus, health } from '../services/health.service';
+import { socketStreamClusterStats } from '../lib/socket-stream';
 import { indexerStatus } from '../services/indexer.service';
+import { Keypair } from '@stellar/stellar-sdk';
 import { agentSigner } from '../services/stellar/clients';
-import { effectiveMode, specCompatReport } from '../services/stellar/spec-compat';
+import { acknowledgeSpecDrift, getSpecCompatHistory } from '../services/stellar/spec-monitor';
 import { getFeeOracle } from '../services/stellar/fees';
+import { getChainCache } from '../lib/chain-cache';
 import { getLlmUsage } from '../lib/llm-budget';
+import { getBulkheadStats } from '../lib/resilience';
 import { getCronStatus } from '../cron/registry';
 import { MAX_SILENCE_MINUTES, acknowledgeIncident, listIncidents, silenceIncident } from '../services/ops-alerts/incidents';
 import { getReplicationSummary } from '../jobs/ipfs-replication.job';
@@ -53,6 +57,7 @@ import {
   buildGuardianTx,
   listDisputes,
 } from '../services/dispute-monitor.service';
+import { getPriceMarketsHealthOverview } from '../services/price-feed-monitor.service';
 import {
   addSignature,
   cancelOperation,
@@ -287,14 +292,24 @@ export async function triggerTraceAuditRun(req: Request, res: Response): Promise
 }
 
 /**
- * GET /admin/chain/spec-compat (#34)
- * The last contract spec compatibility report from the boot gate: per
- * contract, the deployed wasm hash against the pinned one and every spec
- * difference with its breaking/compatible classification. `report` is null
- * when the gate has not run (SPEC_COMPAT_ENFORCE=off).
+ * GET /admin/chain/spec-compat (#34, #322)
+ * Returns the enforcement mode, boot report, current report, and paginated
+ * runtime check history (`spec_compat_runs`).
  */
-export async function getSpecCompat(_req: Request, res: Response): Promise<void> {
-  sendSuccess(res, { mode: effectiveMode(), report: specCompatReport() });
+export async function getSpecCompat(req: Request, res: Response): Promise<void> {
+  const { page, limit, skip } = parsePagination(req.query as any);
+  const { mode, report, boot, current, history, total } = await getSpecCompatHistory({ skip, take: limit });
+  sendSuccess(res, { mode, report, boot, current, history }, 200, buildPaginationMeta(page, limit, total) as any);
+}
+
+/**
+ * POST /admin/chain/spec-compat/ack (#322)
+ * Acknowledges the current breaking spec drift report and clears `spec_drift`
+ * holds once a compatibility check passes.
+ */
+export async function ackSpecCompat(req: Request, res: Response): Promise<void> {
+  const result = await acknowledgeSpecDrift(actor(req));
+  sendSuccess(res, result);
 }
 
 /**
@@ -321,15 +336,19 @@ export async function getSystemStatus(_req: Request, res: Response): Promise<voi
       mode: config.CHAIN_EXECUTION_MODE,
       agentPublicKey: agentSigner().publicKey ?? null,
       preflight: 'not_implemented',
+      cache: getChainCache().stats(),
     },
     // Outbox backlog, handler streaks, signer/channel balances (#220). Public keys only.
     chainWrites: await chainWritesStatus().catch(() => null),
+    // Cluster-wide Socket.io Redis Streams adapter lag & gaps (#293).
+    socketStream: config.EVENT_BUS_ENABLED ? await socketStreamClusterStats().catch(() => null) : null,
     llm: {
       anthropicConfigured: secret('ANTHROPIC_API_KEY') !== '',
       geminiConfigured: secret('GEMINI_API_KEY') !== '',
       // Shared across instances (Redis); null when the guard store is down.
       usage: await getLlmUsage().catch(() => null),
     },
+    bulkheads: getBulkheadStats(),
     process: {
       uptimeSeconds: process.uptime(),
       memory: process.memoryUsage(),
@@ -433,45 +452,180 @@ export async function ackMoneyAuditFinding(req: Request, res: Response): Promise
 
 /**
  * GET /admin/fees
- * Returns aggregate fee statistics per operation class per day, plus the current fee oracle snapshot (#39).
+ * Returns actual charged vs estimated fee statistics per operation class and day,
+ * per-payer breakdown (agent, channels, fee payer), and the fee oracle snapshot (#39, #308).
+ * Legacy `source = 'ESTIMATE'` rows are excluded from charged totals and counted separately.
  */
-export async function getChainFeesReport(req: Request, res: Response): Promise<void> {
+export async function getChainFeesReport(_req: Request, res: Response): Promise<void> {
   const oracle = getFeeOracle();
   const snapshot = oracle.getSnapshot();
 
-  const rows = await prisma.$queryRaw<Array<{
-    op_class: string;
-    day: Date;
-    count: number | bigint;
-    total_charged: string | bigint;
-    p50_charged: string | number;
-    p95_charged: string | number;
-  }>>`
-    SELECT
-      op_class,
-      DATE_TRUNC('day', created_at) AS day,
-      COUNT(*)::int AS count,
-      COALESCE(SUM(fee_charged), 0)::text AS total_charged,
-      COALESCE(percentile_cont(0.50) WITHIN GROUP (ORDER BY fee_charged), 0)::numeric::text AS p50_charged,
-      COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY fee_charged), 0)::numeric::text AS p95_charged
-    FROM chain_fees
-    WHERE fee_charged IS NOT NULL
-    GROUP BY op_class, DATE_TRUNC('day', created_at)
-    ORDER BY day DESC, op_class ASC
-  `;
+  const [rows, payerRows, estimateRows] = await Promise.all([
+    prisma.$queryRaw<Array<{
+      op_class: string;
+      day: Date;
+      count: number | bigint;
+      estimated_total: string | bigint;
+      total_charged: string | bigint;
+      refunded_total: string | bigint;
+      rent_total: string | bigint;
+      p50_charged: string | number;
+      p95_charged: string | number;
+      failed_count: number | bigint;
+      failed_charged: string | bigint;
+      known_resource_charged: string | bigint;
+      known_resource_estimated: string | bigint;
+    }>>`
+      SELECT
+        op_class,
+        DATE_TRUNC('day', created_at) AS day,
+        COUNT(*)::int AS count,
+        COALESCE(SUM(total_fee), 0)::text AS estimated_total,
+        COALESCE(SUM(fee_charged), 0)::text AS total_charged,
+        COALESCE(SUM(
+          CASE
+            WHEN non_refundable_charged IS NOT NULL AND refundable_charged IS NOT NULL
+            THEN resource_fee - (non_refundable_charged + refundable_charged)
+            ELSE 0
+          END
+        ), 0)::text AS refunded_total,
+        COALESCE(SUM(COALESCE(rent_charged, 0)), 0)::text AS rent_total,
+        COALESCE(percentile_cont(0.50) WITHIN GROUP (ORDER BY fee_charged), 0)::numeric::text AS p50_charged,
+        COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY fee_charged), 0)::numeric::text AS p95_charged,
+        COUNT(*) FILTER (WHERE success = false)::int AS failed_count,
+        COALESCE(SUM(fee_charged) FILTER (WHERE success = false), 0)::text AS failed_charged,
+        COALESCE(SUM(
+          CASE
+            WHEN non_refundable_charged IS NOT NULL AND refundable_charged IS NOT NULL
+            THEN non_refundable_charged + refundable_charged
+            ELSE 0
+          END
+        ), 0)::text AS known_resource_charged,
+        COALESCE(SUM(
+          CASE
+            WHEN non_refundable_charged IS NOT NULL AND refundable_charged IS NOT NULL
+            THEN resource_fee
+            ELSE 0
+          END
+        ), 0)::text AS known_resource_estimated
+      FROM chain_fees
+      WHERE source = 'RECEIPT' AND fee_charged IS NOT NULL
+      GROUP BY op_class, DATE_TRUNC('day', created_at)
+      ORDER BY day DESC, op_class ASC
+    `,
+    prisma.$queryRaw<Array<{
+      payer: string | null;
+      count: number | bigint;
+      fee_bumped_count: number | bigint;
+      estimated_total: string | bigint;
+      charged_total: string | bigint;
+      refunded_total: string | bigint;
+      rent_total: string | bigint;
+      failed_count: number | bigint;
+      failed_charged: string | bigint;
+    }>>`
+      SELECT
+        payer,
+        COUNT(*)::int AS count,
+        COUNT(*) FILTER (WHERE fee_bumped = true)::int AS fee_bumped_count,
+        COALESCE(SUM(total_fee), 0)::text AS estimated_total,
+        COALESCE(SUM(fee_charged), 0)::text AS charged_total,
+        COALESCE(SUM(
+          CASE
+            WHEN non_refundable_charged IS NOT NULL AND refundable_charged IS NOT NULL
+            THEN resource_fee - (non_refundable_charged + refundable_charged)
+            ELSE 0
+          END
+        ), 0)::text AS refunded_total,
+        COALESCE(SUM(COALESCE(rent_charged, 0)), 0)::text AS rent_total,
+        COUNT(*) FILTER (WHERE success = false)::int AS failed_count,
+        COALESCE(SUM(fee_charged) FILTER (WHERE success = false), 0)::text AS failed_charged
+      FROM chain_fees
+      WHERE source = 'RECEIPT' AND fee_charged IS NOT NULL
+      GROUP BY payer
+      ORDER BY SUM(fee_charged) DESC
+    `,
+    prisma.$queryRaw<Array<{ count: number | bigint }>>`
+      SELECT COUNT(*)::int AS count
+      FROM chain_fees
+      WHERE source = 'ESTIMATE'
+    `,
+  ]);
 
-  const report = rows.map((r) => ({
-    opClass: r.op_class,
-    day: r.day,
-    count: Number(r.count),
-    totalCharged: r.total_charged.toString(),
-    p50Charged: r.p50_charged.toString(),
-    p95Charged: r.p95_charged.toString(),
+  let agentAddress: string | null = null;
+  try {
+    agentAddress = (agentSigner().publicKey as string | undefined) ?? null;
+  } catch {
+    agentAddress = null;
+  }
+  let feePayerAddress: string | null = null;
+  if (config.FEE_PAYER_SECRET) {
+    try {
+      feePayerAddress = Keypair.fromSecret(config.FEE_PAYER_SECRET).publicKey();
+    } catch {
+      feePayerAddress = null;
+    }
+  }
+  const channelAddresses = new Set<string>();
+  try {
+    for (const ch of getChannelPool().getChannels()) {
+      channelAddresses.add(ch.publicKey);
+    }
+  } catch {
+    // Channel pool unavailable
+  }
+
+  const classifyPayer = (addr: string | null): 'agent' | 'channel' | 'fee_payer' | 'unknown' => {
+    if (!addr) return 'unknown';
+    if (feePayerAddress && addr === feePayerAddress) return 'fee_payer';
+    if (agentAddress && addr === agentAddress) return 'agent';
+    if (channelAddresses.has(addr)) return 'channel';
+    return 'unknown';
+  };
+
+  const report = rows.map((r) => {
+    const knownCharged = BigInt(r.known_resource_charged.toString());
+    const knownEstimated = BigInt(r.known_resource_estimated.toString());
+    const chargedToSimulatedRatio =
+      knownEstimated > 0n ? Number(knownCharged) / Number(knownEstimated) : null;
+    const chargedStr = r.total_charged.toString();
+    return {
+      opClass: r.op_class,
+      day: r.day,
+      count: Number(r.count),
+      estimatedTotal: r.estimated_total.toString(),
+      chargedTotal: chargedStr,
+      totalCharged: chargedStr,
+      refundedTotal: r.refunded_total.toString(),
+      rentTotal: r.rent_total.toString(),
+      p50Charged: r.p50_charged.toString(),
+      p95Charged: r.p95_charged.toString(),
+      failedCount: Number(r.failed_count),
+      failedCharged: r.failed_charged.toString(),
+      chargedToSimulatedRatio,
+    };
+  });
+
+  const byPayer = payerRows.map((p) => ({
+    payer: p.payer,
+    role: classifyPayer(p.payer),
+    count: Number(p.count),
+    feeBumpedCount: Number(p.fee_bumped_count),
+    estimatedTotal: p.estimated_total.toString(),
+    chargedTotal: p.charged_total.toString(),
+    refundedTotal: p.refunded_total.toString(),
+    rentTotal: p.rent_total.toString(),
+    failedCount: Number(p.failed_count),
+    failedCharged: p.failed_charged.toString(),
   }));
+
+  const estimateRowCount = Number(estimateRows[0]?.count ?? 0);
 
   sendSuccess(res, {
     oracle: snapshot,
     report,
+    byPayer,
+    estimateRowCount,
   });
 }
 
@@ -602,4 +756,14 @@ export async function rerunChainTransactionHandler(req: Request, res: Response):
 export async function abandonChainTransaction(req: Request, res: Response): Promise<void> {
   const id = outboxId(req);
   sendSuccess(res, await abandon(id, actor(req), outboxReason(req)));
+}
+
+/** GET /admin/execution-quality — implementation shortfall, slippage failures & recommended bounds (#295). */
+export async function getExecutionQuality(req: Request, res: Response): Promise<void> {
+  const { getExecutionQualitySummary } = await import('../services/execution-quality.service');
+  const rawDays = req.query.windowDays;
+  const windowDays = typeof rawDays === 'string' && /^[1-9]\d*$/.test(rawDays)
+    ? Math.min(365, Number(rawDays))
+    : 30;
+  sendSuccess(res, await getExecutionQualitySummary({ windowDays }));
 }

@@ -48,8 +48,8 @@ export function errorMiddleware(
       { code: err.code, path: req.path, details: err.details, requestId: currentContext()?.requestId },
       err.message,
     );
-    // #50: degraded dependencies tell clients when to retry.
-    const retryAfter = err.details?.retryAfterSecs;
+    // #50 / #300: degraded dependencies tell clients when to retry.
+    const retryAfter = err.details?.retryAfterSecs ?? err.details?.retryAfter;
     if (typeof retryAfter === 'number' && Number.isFinite(retryAfter) && retryAfter >= 0) {
       res.setHeader('Retry-After', String(Math.ceil(retryAfter)));
     }

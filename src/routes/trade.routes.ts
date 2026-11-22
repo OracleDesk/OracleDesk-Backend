@@ -5,6 +5,7 @@ import {
   getCopyTradeHistory,
   getCopyTrade,
   getCopyTradeSummary,
+  quoteCopyTrade,
 } from '../controllers/trade.controller';
 import { requireAuth } from '../middlewares/auth.middleware';
 import { idempotent } from '../middlewares/idempotency.middleware';
@@ -12,7 +13,8 @@ import { idempotent } from '../middlewares/idempotency.middleware';
 const router = Router();
 
 // #123: required on /copy (each duplicate creates another PENDING CopyTrade).
-router.post('/copy',          requireAuth, idempotent({ required: true }), initiateCopyTrade);
+router.get('/copy/quote',         requireAuth, quoteCopyTrade);
+router.post('/copy',              requireAuth, idempotent({ required: true }), initiateCopyTrade);
 router.patch('/copy/:id/confirm', requireAuth, idempotent(), confirmCopyTrade);
 router.get('/copy/summary', requireAuth, getCopyTradeSummary);
 router.get('/copy', requireAuth, getCopyTradeHistory);

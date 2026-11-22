@@ -104,13 +104,34 @@ export async function checkRedisPolicy(): Promise<void> {
 }
 
 /**
+ * Options for a dedicated blocking connection. ioredis applies
+ * `commandTimeout` to every command, including XREAD BLOCK: a 500 ms timeout
+ * rejects an idle read before Redis answers. Blocking connections therefore
+ * disable commandTimeout and use `blockingTimeout` (block time + grace) as the
+ * safety net, so a lost reply still cannot wedge the loop forever (#293).
+ */
+export function blockingRedisOptions(blockMs: number, blockingTimeoutMs: number): {
+  commandTimeout: 0;
+  blockingTimeout: number;
+} {
+  return {
+    commandTimeout: 0,
+    blockingTimeout: Math.max(blockingTimeoutMs, blockMs + 100),
+  };
+}
+
+/**
  * A new dedicated connection for blocking commands (XREAD BLOCK). A blocking
  * read on the shared client would stall every other command queued behind it,
  * such as the SEP-10 challenge GETDEL. The caller closes it with
  * releaseBlockingRedis(); closeRedis() closes any still open.
  */
-export function getBlockingRedis(): Redis {
-  const connection = getRedis().duplicate();
+export function getBlockingRedis(
+  opts: { blockMs?: number; blockingTimeoutMs?: number } = {},
+): Redis {
+  const blockMs = opts.blockMs ?? 1000;
+  const blockingTimeoutMs = opts.blockingTimeoutMs ?? 5000;
+  const connection = getRedis().duplicate(blockingRedisOptions(blockMs, blockingTimeoutMs));
   connection.on('error', (err) => logger.error({ err: err.message }, 'Redis (blocking) error'));
   blocking.add(connection);
   return connection;

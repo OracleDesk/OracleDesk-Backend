@@ -116,6 +116,22 @@ export function sign(secret: string, body: string): string {
   return `sha256=${crypto.createHmac('sha256', secret).update(body).digest('hex')}`;
 }
 
+function webhookEventType(alert: Alert): string {
+  switch (alert.kind) {
+    case 'price_feed':
+      return 'oracledesk.price_feed_alert';
+    case 'price_verify':
+      return 'oracledesk.price_verify_alert';
+    case 'fee_budget':
+      return 'oracledesk.fee_budget_alert';
+    case 'trace_verdict':
+      return 'oracledesk.trace_verdict_alert';
+    case 'dispute':
+    default:
+      return 'oracledesk.dispute_alert';
+  }
+}
+
 export function webhookSink(url: string, secret = config.ALERT_WEBHOOK_SECRET): AlertSink {
   return {
     name: `webhook-${urlTag(url)}`,
@@ -130,6 +146,46 @@ export function webhookSink(url: string, secret = config.ALERT_WEBHOOK_SECRET): 
 }
 
 const EMOJI: Record<AlertLevel, string> = { INFO: ':information_source:', WARN: ':warning:', CRITICAL: ':rotating_light:' };
+
+function formatSlackLines(alert: Alert): string[] {
+  if (alert.kind === 'price_feed') {
+    const minsToClose = Math.max(0, Math.floor(alert.secsToClose / 60));
+    return [
+      `${EMOJI[alert.level]} *${alert.level}* ${alert.title}`,
+      `Market ${alert.onChainMarketId ?? alert.marketId} · feed ${alert.feed.asset} (${alert.feed.reflector}) · severity ${alert.severity} · closes in ${minsToClose} min`,
+      alert.reasons.length > 0 ? `Reasons: ${alert.reasons.join(', ')}` : undefined,
+      alert.detail,
+    ].filter((line): line is string => Boolean(line));
+  }
+  if (alert.kind === 'price_verify') {
+    return [
+      `${EMOJI[alert.level]} *${alert.level}* ${alert.title}`,
+      `Market ${alert.onChainMarketId} · event ${alert.eventId} · verdict ${alert.verdict}`,
+      alert.detail,
+    ].filter((line): line is string => Boolean(line));
+  }
+  if (alert.kind === 'fee_budget') {
+    return [
+      `${EMOJI[alert.level]} *${alert.level}* ${alert.title}`,
+      `Class ${alert.opClass} · p95 charged resource ${alert.p95ChargedResource} / budget ${alert.budget} (${Math.round(alert.utilizationRatio * 100)}%)`,
+      alert.detail,
+    ].filter((line): line is string => Boolean(line));
+  }
+  if (alert.kind === 'trace_verdict') {
+    return [
+      `${EMOJI[alert.level]} *${alert.level}* ${alert.title}`,
+      `Trace ${alert.onChainTraceId} (${alert.traceId}) · agent ${alert.agent} · verdict ${alert.verdict}${alert.reason ? ` (${alert.reason})` : ''}${alert.agentPaused ? ' · agents paused' : ''}`,
+      alert.detail,
+    ].filter((line): line is string => Boolean(line));
+  }
+  const remaining = alert.windowRemainingSecs === null ? 'unknown' : `${Math.max(0, Math.floor(alert.windowRemainingSecs / 60))} min`;
+  return [
+    `${EMOJI[alert.level]} *${alert.level}* ${alert.title}`,
+    `Market ${alert.onChainMarketId} · proposed ${alert.proposedOutcome} · verdict ${alert.verdict} · window left ${remaining}`,
+    alert.detail,
+    `Cancel transaction: ${alert.links.cancelTx}`,
+  ].filter((line): line is string => Boolean(line));
+}
 
 export function slackSink(url: string): AlertSink {
   return {
@@ -189,6 +245,15 @@ export interface AlertServiceOptions {
   sleep?: (ms: number) => Promise<void>;
 }
 
+const alertDeliveryDb = () =>
+  (prisma as unknown as {
+    alertDelivery: {
+      findMany(args: unknown): Promise<Array<{ sink: string }>>;
+      findUnique(args: unknown): Promise<{ status: string; attempts: number } | null>;
+      upsert(args: unknown): Promise<unknown>;
+    };
+  }).alertDelivery;
+
 export class AlertService {
   private readonly sinks: AlertSink[];
   private readonly attempts: number;
@@ -206,11 +271,11 @@ export class AlertService {
     return this.sinks.map((s) => s.name);
   }
 
-  /** True when `level` for `reviewId` was already delivered by every sink. */
-  async delivered(reviewId: string, level: AlertLevel): Promise<boolean> {
+  /** True when `level` for `subjectId` was already delivered by every sink. */
+  async delivered(subjectId: string, level: AlertLevel): Promise<boolean> {
     if (this.sinks.length === 0) return false;
-    const rows = await prisma.alertDelivery.findMany({ where: { reviewId, level, status: 'SENT' } });
-    const sent = new Set(rows.map((r: { sink: string }) => r.sink));
+    const rows = await alertDeliveryDb().findMany({ where: { subjectId, level, status: 'SENT' } });
+    const sent = new Set(rows.map((r) => r.sink));
     return this.sinks.every((s) => sent.has(s.name));
   }
 
@@ -220,7 +285,7 @@ export class AlertService {
    */
   async send(reviewId: string, alert: DisputeAlert): Promise<string[]> {
     if (this.sinks.length === 0) {
-      logger.warn({ reviewId, level: alert.level, verdict: alert.verdict }, 'Dispute alert not delivered: no alert sinks configured');
+      logger.warn({ subjectId, kind, level: alert.level, title: alert.title }, 'Alert not delivered: no alert sinks configured');
       return [];
     }
     return this.deliver(

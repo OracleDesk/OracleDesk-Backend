@@ -56,7 +56,6 @@ export const KEY_LIFECYCLE = {
   X402_FACILITATOR_TIMEOUT_MS: reserved('x402 facilitator settlement is not wired'),
   X402_KEY_RELEASE_SECRET: reserved('x402 key release is not wired'),
   TRACE_CONFIDENTIAL: reserved('confidential traces are not implemented'),
-  SOCKET_LIVE_LEDGER_LAG: deprecated('no socket handler reads it', 'v1.2.0'),
   QUESTION_DOC_VERSION: deprecated('the question document version is fixed in code', 'v1.2.0'),
   TRADER_MAX_PRICE_DRIFT_BPS: deprecated('the trader no longer reads a drift bound', 'v1.2.0'),
   SAGA_RECOVERY_SCAN: deprecated('the saga uses discoverLandedMarket (#41) instead of its own scan', 'v1.2.0'),

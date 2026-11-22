@@ -8,9 +8,13 @@ import {
   SaturatedError,
   TimeoutError,
   deadline,
+  defaultPoliciesFor,
+  parseClassPolicyOverrides,
   sleep,
   withTimeout,
 } from '../src/lib/resilience';
+import { currentCallerClass, runWithContext, withCallerClass } from '../src/lib/context';
+import { setOutsideBulkheadHook, wrapRpcServer } from '../src/services/stellar/clients';
 
 setupTestEnv();
 
@@ -273,5 +277,122 @@ test('GET /portfolio returns 200 with availableCapitalRaw null when RPC read tim
   } finally {
     (readClients as any).treasury = origTreasury;
     server.close();
+  }
+});
+
+test('weighted fair bulkhead reserves capacity for critical and sheds background/public first (#300)', async () => {
+  const policies = {
+    critical: { weight: 8, reserved: 2, maxQueue: 8, maxWaitMs: 15_000 },
+    agent: { weight: 4, reserved: 1, maxQueue: 8, maxWaitMs: 15_000 },
+    interactive: { weight: 3, reserved: 0, maxQueue: 4, maxWaitMs: 10_000 },
+    public: { weight: 2, reserved: 0, maxQueue: 2, maxWaitMs: 5_000 },
+    background: { weight: 1, reserved: 0, maxQueue: 1, maxWaitMs: 30_000 },
+  };
+  const bh = new Bulkhead('rpc-read', 4, policies, { shedAfterMs: 50 });
+
+  // Public can only take 4 - (2 + 1) = 1 shared slot; the 2nd public call queues.
+  let releasePub1!: () => void;
+  const pub1 = withCallerClass('public', () => bh.run(() => new Promise<void>((r) => { releasePub1 = r; })));
+  assert.equal(bh.stats().byClass.public.active, 1);
+
+  let releasePub2!: () => void;
+  const pub2 = withCallerClass('public', () => bh.run(() => new Promise<void>((r) => { releasePub2 = r; })));
+  assert.equal(bh.stats().byClass.public.queued, 1);
+
+  // Critical enters immediately under its own reserved capacity even while public is queued.
+  let critEntered = false;
+  let releaseCrit1!: () => void;
+  const crit1 = withCallerClass('critical', () =>
+    bh.run(async () => {
+      critEntered = true;
+      await new Promise<void>((r) => { releaseCrit1 = r; });
+    }),
+  );
+  assert.equal(critEntered, true);
+  assert.equal(bh.stats().byClass.critical.active, 1);
+
+  // Fill remaining slots (1 more critical + 1 agent) -> bulkhead at maxConcurrent (4).
+  let releaseCrit2!: () => void;
+  let releaseAgent!: () => void;
+  const crit2 = withCallerClass('critical', () => bh.run(() => new Promise<void>((r) => { releaseCrit2 = r; })));
+  const agent1 = withCallerClass('agent', () => bh.run(() => new Promise<void>((r) => { releaseAgent = r; })));
+  assert.equal(bh.stats().active, 4);
+
+  // Enqueue a background call; overflowing background queue yields 503 with class & retryAfter.
+  const bg1 = withCallerClass('background', () => bh.run(async () => 'bg1'));
+  await assert.rejects(
+    () => withCallerClass('background', () => bh.run(async () => 'bg2')),
+    (err: any) => {
+      assert.equal(err.code, 'UPSTREAM_SATURATED');
+      assert.equal(err.statusCode, 503);
+      assert.equal(err.details?.class, 'background');
+      assert.ok(typeof err.details?.retryAfter === 'number' && err.details.retryAfter >= 1);
+      return true;
+    },
+  );
+
+  // Sustained saturation past shedAfterMs proactively drops queued background and public entries.
+  await new Promise((r) => setTimeout(r, 80));
+  await assert.rejects(() => bg1, (err: any) => err instanceof SaturatedError && err.details?.class === 'background');
+  await assert.rejects(() => pub2, (err: any) => err instanceof SaturatedError && err.details?.class === 'public');
+  assert.equal(bh.stats().byClass.background.shed, 1);
+  assert.equal(bh.stats().byClass.public.shed, 1);
+
+  releasePub1();
+  releaseCrit1();
+  releaseCrit2();
+  releaseAgent();
+  await Promise.all([pub1, crit1, crit2, agent1]);
+});
+
+test('withCallerClass never lowers critical and defaults derive from context kind (#300)', () => {
+  assert.equal(currentCallerClass(), 'background');
+  runWithContext({ requestId: 'req_1', kind: 'http' }, () => {
+    assert.equal(currentCallerClass(), 'public');
+  });
+  runWithContext({ requestId: 'req_2', kind: 'http', userId: 'u_1' }, () => {
+    assert.equal(currentCallerClass(), 'interactive');
+  });
+  withCallerClass('critical', () => {
+    assert.equal(currentCallerClass(), 'critical');
+    withCallerClass('public', () => {
+      assert.equal(currentCallerClass(), 'critical');
+    });
+  });
+});
+
+test('parseClassPolicyOverrides validates JSON overrides via zod (#300)', () => {
+  const flat = parseClassPolicyOverrides('{"critical":{"weight":12,"reserved":5}}');
+  assert.equal(flat['rpc-read']?.critical?.weight, 12);
+  const byDep = parseClassPolicyOverrides('{"rpc-confirm":{"agent":{"weight":6}}}');
+  assert.equal(byDep['rpc-confirm']?.agent?.weight, 6);
+  assert.throws(() => parseClassPolicyOverrides('{"unknown-class":{"weight":2}}'));
+  assert.throws(() => parseClassPolicyOverrides('{"rpc-read":{"critical":{"weight":-1}}}'));
+  assert.ok(defaultPoliciesFor('rpc-read', 16, 32).critical.reserved === 4);
+});
+
+test('dev-only RPC guard fires outside bulkhead and never fires inside bulkhead (#300)', async () => {
+  const warnings: Array<{ method: string; source: string }> = [];
+  const prev = setOutsideBulkheadHook((method, source) => warnings.push({ method, source }));
+  const fakeRpc = wrapRpcServer(
+    {
+      async getLatestLedger() {
+        return { sequence: 42 };
+      },
+    },
+    'test-rpc',
+  );
+
+  try {
+    // Outside bulkhead -> triggers guard.
+    await fakeRpc.getLatestLedger();
+    assert.deepEqual(warnings, [{ method: 'getLatestLedger', source: 'test-rpc' }]);
+
+    // Inside bulkhead (agent path) -> never triggers guard.
+    warnings.length = 0;
+    await withCallerClass('agent', () => withTimeout('rpc-read', () => fakeRpc.getLatestLedger()));
+    assert.deepEqual(warnings, []);
+  } finally {
+    setOutsideBulkheadHook(prev);
   }
 });

@@ -1,11 +1,6 @@
-import cron from 'node-cron';
-import { config } from '../config';
 import { logger } from '../lib/logger';
 import { escalateOpenReviews, pollProposals } from '../services/dispute-monitor.service';
-import { recordCronRun } from './registry';
-
-let escalating = false;
-let polling = false;
+import { scheduleJob } from './registry';
 
 /**
  * Dispute monitor crons (#92).
@@ -15,41 +10,14 @@ let polling = false;
  *    whose proposal is gone.
  */
 export function startDisputeCron(): void {
-  if (!config.DISPUTE_MONITOR_ENABLED) {
-    logger.info('Dispute monitor is disabled by config (DISPUTE_MONITOR_ENABLED=false)');
-    return;
-  }
-
-  cron.schedule('*/5 * * * *', async () => {
-    if (escalating) return;
-    escalating = true;
-    const startedAt = new Date();
-    try {
-      await escalateOpenReviews();
-      recordCronRun('dispute-escalation', 'success', startedAt, new Date());
-    } catch (err) {
-      recordCronRun('dispute-escalation', 'failure', startedAt, new Date(), err);
-      logger.error({ err: err instanceof Error ? err.message : err }, 'Dispute cron: escalation failed');
-    } finally {
-      escalating = false;
-    }
+  scheduleJob('dispute-escalation', async () => {
+    const escalated = await escalateOpenReviews();
+    return { outcome: 'SUCCESS', counters: { escalated } };
   });
 
-  cron.schedule('*/30 * * * *', async () => {
-    if (polling) return;
-    polling = true;
-    const startedAt = new Date();
-    try {
-      const result = await pollProposals();
-      recordCronRun('dispute-polling', 'success', startedAt, new Date());
-      if (result.created > 0 || result.closed > 0) logger.info(result, 'Dispute cron: polling pass');
-    } catch (err) {
-      recordCronRun('dispute-polling', 'failure', startedAt, new Date(), err);
-      logger.error({ err: err instanceof Error ? err.message : err }, 'Dispute cron: polling failed');
-    } finally {
-      polling = false;
-    }
+  scheduleJob('dispute-polling', async () => {
+    const result = await pollProposals();
+    if (result.created > 0 || result.closed > 0) logger.info(result, 'Dispute cron: polling pass');
+    return { outcome: 'SUCCESS', counters: { created: result.created, closed: result.closed } };
   });
-
-  logger.info('Dispute monitor cron started');
 }
