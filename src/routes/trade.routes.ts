@@ -7,6 +7,7 @@ import {
   getCopyTradeSummary,
   quoteCopyTrade,
 } from '../controllers/trade.controller';
+ 
 import { requireAuth } from '../middlewares/auth.middleware';
 import { idempotent } from '../middlewares/idempotency.middleware';
 
