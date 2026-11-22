@@ -1,0 +1,8 @@
+{
+  "caseId": "fc-02-fed-cut",
+  "kind": "forecast",
+  "promptKey": "synthetic-baseline-v1",
+  "provider": "synthetic",
+  "model": "synthetic-baseline",
+  "output": "{\"base_rate\":0.25,\"adjustments\":[{\"signal_id\":\"s1\",\"delta\":-0.12,\"why\":\"Fed officials explicitly signaled a gradual 25bps path.\"}],\"p\":0.15,\"p_low_50\":0.10,\"p_high_50\":0.22,\"rationale\":\"Sticky services inflation and Fed guidance argue strongly against a 50bps cut.\"}"
+}

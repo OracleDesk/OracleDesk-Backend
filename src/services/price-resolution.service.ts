@@ -35,10 +35,26 @@ import type { PriceConfig } from '../generated/resolver';
 
 export type OracleAsset = ReflectorFeedAsset;
 
+export interface PriceData {
+  price: bigint;
+  timestamp: bigint;
+}
+
+export interface ReflectorReadOptions {
+  /** When true, bypasses the 1 h in-process caches (used by the feed monitor). */
+  fresh?: boolean;
+}
+
 export interface ReflectorReader {
-  decimals(contract: string): Promise<number>;
-  supports(contract: string, asset: OracleAsset): Promise<boolean>;
-  lastPrice(contract: string, asset: OracleAsset): Promise<{ price: bigint; timestamp: bigint } | null>;
+  decimals(contract: string, opts?: ReflectorReadOptions): Promise<number>;
+  supports(contract: string, asset: OracleAsset, opts?: ReflectorReadOptions): Promise<boolean>;
+  lastPrice(contract: string, asset: OracleAsset): Promise<PriceData | null>;
+  /** Feed update cadence in seconds (SEP-40 `resolution()`). */
+  resolution(contract: string, opts?: ReflectorReadOptions): Promise<number>;
+  /** Historical price record at `ts` (SEP-40 `price(asset, timestamp)`). */
+  price(contract: string, asset: OracleAsset, ts: bigint): Promise<PriceData | null>;
+  /** Latest ledger sequence and close time (unix seconds) from RPC. */
+  latestLedger(): Promise<{ sequence: number; closeTime: bigint }>;
 }
 
 // ─── Threshold conversion ────────────────────────────────────────────────────
@@ -128,6 +144,14 @@ export function buildPriceSpec(
 const CACHE_TTL_MS = 60 * 60 * 1000;
 const decimalsCache = new Map<string, { at: number; value: number }>();
 const assetsCache = new Map<string, { at: number; value: string[] }>();
+const resolutionCache = new Map<string, { at: number; value: number }>();
+
+/** Visible for tests: clear in-process Reflector metadata caches. */
+export function clearReflectorCaches(): void {
+  decimalsCache.clear();
+  assetsCache.clear();
+  resolutionCache.clear();
+}
 
 function assetScVal(asset: OracleAsset): xdr.ScVal {
   if (asset.kind === 'stellar') {
@@ -184,16 +208,16 @@ function nativePriceData(scVal: xdr.ScVal | null): { price: bigint; timestamp: b
  */
 export function reflectorReader(): ReflectorReader {
   return {
-    async decimals(contract) {
-      const cached = decimalsCache.get(contract);
+    async decimals(contract, opts) {
+      const cached = !opts?.fresh ? decimalsCache.get(contract) : undefined;
       if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.value;
       const raw = await simulate(contract, 'decimals', []);
       const value = Number(scValToNative(raw as xdr.ScVal));
       decimalsCache.set(contract, { at: Date.now(), value });
       return value;
     },
-    async supports(contract, asset) {
-      const cached = assetsCache.get(contract);
+    async supports(contract, asset, opts) {
+      const cached = !opts?.fresh ? assetsCache.get(contract) : undefined;
       if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.value.includes(symbolOf(asset));
       const raw = await simulate(contract, 'assets', []);
       let symbols: string[] = [];
@@ -208,6 +232,42 @@ export function reflectorReader(): ReflectorReader {
     },
     async lastPrice(contract, asset) {
       return nativePriceData(await simulate(contract, 'lastprice', [assetScVal(asset)]));
+    },
+    async resolution(contract, opts) {
+      const cached = !opts?.fresh ? resolutionCache.get(contract) : undefined;
+      if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.value;
+      const raw = await simulate(contract, 'resolution', []);
+      const value = Number(scValToNative(raw as xdr.ScVal));
+      resolutionCache.set(contract, { at: Date.now(), value });
+      return value;
+    },
+    async price(contract, asset, ts) {
+      const tsScVal = xdr.ScVal.scvU64(xdr.Uint64.fromString(ts.toString()));
+      return nativePriceData(await simulate(contract, 'price', [assetScVal(asset), tsScVal]));
+    },
+    async latestLedger() {
+      const latest = (await rpcServer.getLatestLedger()) as { sequence?: number | string; closeTime?: number | string };
+      const sequence = Number(latest?.sequence ?? 0);
+      const rawCloseTime = latest?.closeTime;
+      if (rawCloseTime !== undefined && rawCloseTime !== null && Number.isFinite(Number(rawCloseTime)) && Number(rawCloseTime) > 0) {
+        return { sequence, closeTime: BigInt(rawCloseTime) };
+      }
+      // Some RPC builds omit closeTime on getLatestLedger; try getLedgers for the sequence, then wall clock.
+      try {
+        const getLedgers = (rpcServer as unknown as {
+          getLedgers?: (req: { startLedger: number; pagination: { limit: number } }) => Promise<{ ledgers?: Array<{ ledgerCloseTime?: string | number }> }>;
+        }).getLedgers;
+        if (sequence > 0 && typeof getLedgers === 'function') {
+          const res = await getLedgers.call(rpcServer, { startLedger: sequence, pagination: { limit: 1 } });
+          const ct = res?.ledgers?.[0]?.ledgerCloseTime;
+          if (ct !== undefined && ct !== null && Number(ct) > 0) {
+            return { sequence, closeTime: BigInt(ct) };
+          }
+        }
+      } catch {
+        // fall through to wall clock
+      }
+      return { sequence, closeTime: BigInt(Math.floor(Date.now() / 1000)) };
     },
   };
 }
@@ -231,7 +291,7 @@ export async function checkFeed(
   network: string,
   symbol: string,
   reader: ReflectorReader,
-  now: Date = new Date(),
+  now?: Date,
   feedOverride?: ReflectorFeed | null,
 ): Promise<FeedCheck> {
   const feed = feedOverride ?? feedFor(network, symbol);
@@ -239,7 +299,16 @@ export async function checkFeed(
   if (!(await reader.supports(feed.reflector, feed.asset))) return { ok: false, reason: 'FEED_UNSUPPORTED' };
   const last = await reader.lastPrice(feed.reflector, feed.asset);
   if (!last) return { ok: false, reason: 'NO_DATA' };
-  const age = BigInt(Math.floor(now.getTime() / 1000)) - last.timestamp;
+  let referenceTs: bigint;
+  if (now) {
+    referenceTs = BigInt(Math.floor(now.getTime() / 1000));
+  } else if (typeof reader.latestLedger === 'function') {
+    const ledger = await reader.latestLedger();
+    referenceTs = ledger.closeTime;
+  } else {
+    referenceTs = BigInt(Math.floor(Date.now() / 1000));
+  }
+  const age = referenceTs - last.timestamp;
   if (age < 0n || age > BigInt(feed.maxStaleness)) return { ok: false, reason: 'FEED_STALE' };
   return { ok: true };
 }
@@ -254,6 +323,14 @@ export interface PriceResolutionBlock {
   decimals: number;
   direction: PriceDirectionName;
   reflector: string;
+  /** Feed decimals observed when the market was planned (#309). */
+  decimalsAtCreation?: number;
+  /** Feed resolution() (seconds) observed when the market was planned (#309). */
+  resolutionAtCreation?: number | null;
+  /** Citation URL from REFLECTOR_FEEDS_JSON (#309). */
+  feedSource?: string;
+  /** True when creation-time feed facts were lazily backfilled by the monitor (#309). */
+  inferred?: boolean;
 }
 
 export interface PricePlan {
@@ -288,7 +365,6 @@ export async function planPriceMarket(
 ): Promise<PricePlan> {
   if (input.category.toUpperCase() !== 'CRYPTO') return NOT_A_CANDIDATE;
   const reader = input.reader ?? reflectorReader();
-  const now = input.now ?? new Date();
 
   const fallback = async (reason: string): Promise<PricePlan> => {
     await writeAgentLog({
@@ -308,7 +384,7 @@ export async function planPriceMarket(
   const feed = input.feed ?? feedFor(input.network, proposal.asset);
   if (!feed) return fallback('NOT_REGISTERED');
 
-  const check = await checkFeed(input.network, proposal.asset, reader, now, feed);
+  const check = await checkFeed(input.network, proposal.asset, reader, input.now, feed);
   if (!check.ok) return fallback(check.reason ?? 'FEED_UNUSABLE');
 
   let decimals: number;
@@ -318,6 +394,15 @@ export async function planPriceMarket(
     spec = buildPriceSpec(proposal, feed, decimals);
   } catch {
     return fallback('THRESHOLD_PRECISION');
+  }
+
+  let resolutionAtCreation: number | null = null;
+  if (typeof reader.resolution === 'function') {
+    try {
+      resolutionAtCreation = await reader.resolution(feed.reflector);
+    } catch {
+      resolutionAtCreation = null;
+    }
   }
 
   return {
@@ -336,6 +421,9 @@ export async function planPriceMarket(
       decimals,
       direction: proposal.direction,
       reflector: feed.reflector,
+      decimalsAtCreation: decimals,
+      resolutionAtCreation,
+      feedSource: feed.source,
     },
   };
 }
@@ -412,18 +500,29 @@ function backoffMs(attempt: number): number {
   return Math.min(config.CHAIN_RETRY_MAX_MS, config.CHAIN_RETRY_BASE_MS * 2 ** Math.min(attempt, 10));
 }
 
+export interface ResolutionTickMarket {
+  id: string;
+  onChainMarketId: bigint | null;
+  expiryTimestamp: Date;
+  createdAt: Date;
+  resolutionSpec?: unknown;
+}
+
 export interface ResolutionTickDeps {
   resolve?: typeof resolvePrice;
   state?: typeof resolverState;
+  /** Optional close-time snapshot hook run when now >= expiryTimestamp before resolve_price (#309). */
+  captureSnapshot?: (market: ResolutionTickMarket) => Promise<void>;
   now?: Date;
-  markets?: Array<{ id: string; onChainMarketId: bigint | null; expiryTimestamp: Date; createdAt: Date }>;
+  markets?: ResolutionTickMarket[];
 }
 
 /**
  * One pass of the 5-minute resolution cron. For each closed, price-mode market
- * that the resolver still has Unconfigured/pending, simulate `resolve_price`;
- * on the retryable codes back off up to PRICE_RESOLUTION_MAX_WAIT_SECS, then log
- * an ERROR `PRICE_RESOLUTION_STUCK` so a guardian can void the market.
+ * that the resolver still has Unconfigured/pending, capture a close-time
+ * Reflector snapshot (#309), then call `resolve_price`; on the retryable codes
+ * back off up to PRICE_RESOLUTION_MAX_WAIT_SECS, then log an ERROR
+ * `PRICE_RESOLUTION_STUCK` so a guardian can void the market.
  */
 export async function runPriceResolutionTick(deps: ResolutionTickDeps = {}): Promise<{ resolved: bigint[]; escalated: bigint[] }> {
   const resolve = deps.resolve ?? resolvePrice;
@@ -437,6 +536,12 @@ export async function runPriceResolutionTick(deps: ResolutionTickDeps = {}): Pro
     if (market.onChainMarketId === null) continue;
     const current = await state(market.onChainMarketId);
     if (current.tag === 'Finalized') continue;
+
+    if (deps.captureSnapshot && now.getTime() >= market.expiryTimestamp.getTime()) {
+      await deps.captureSnapshot(market).catch((err) => {
+        logger.warn({ marketId: market.id, err: err instanceof Error ? err.message : String(err) }, 'close snapshot capture failed; continuing resolution');
+      });
+    }
 
     const elapsedSecs = Math.floor((now.getTime() - market.expiryTimestamp.getTime()) / 1000);
     let attempt = 0;

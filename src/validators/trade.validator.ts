@@ -8,6 +8,13 @@ export const copyTradeSchema = z.object({
   }),
 });
 
+export const copyTradeQuoteSchema = z.object({
+  query: z.object({
+    traceId:   z.string().uuid('Invalid trace ID'),
+    amountRaw: z.string().regex(/^[1-9]\d*$/, 'amountRaw must be a positive integer in 7-decimal USDC base units'),
+  }),
+});
+
 export const confirmCopyTradeSchema = z.object({
   txHash: z.string().regex(/^[0-9a-fA-F]{64}$/, 'txHash must be a 64-character hex Stellar transaction hash'),
 });

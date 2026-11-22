@@ -1,7 +1,7 @@
 /**
- * Daily, chain-only transparency report (#159).
+ * Daily, chain-only transparency report (#159, #299).
  *
- * The report is a deterministic JSON document (schema v1) computed from chain
+ * The report is a deterministic JSON document (schema v2) computed from chain
  * reads and `chain_events`. Prisma float models are never used.
  * Amounts are decimal strings in base units. The document is pinned, its
  * sha256 is published through the reasoning registry under the documented
@@ -14,6 +14,7 @@ import { config } from '../config';
 import { CONTRACTS } from '../config/contracts';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
+import { withTimeout } from '../lib/resilience';
 import { priceYesBps, collateralOutForShares, settleValue, type Settlement } from '../generated/fpmm';
 import type { Market as OnChainMarket, Position } from '../generated/market-core';
 import { agentSigner, rpcServer } from './stellar/clients';
@@ -24,15 +25,31 @@ import {
   treasuryAvailableCapital,
   treasuryConfig,
   treasuryDailyUsage,
+  treasuryMarketValuation,
+  treasuryOpenMarkets,
+  usdcBalance,
 } from './chain.service';
+import {
+  readTreasuryAccounting,
+  type AccountingFlag,
+  type TreasuryAccounting,
+} from './treasury-accounting.service';
 import { pinAndPublishDocument, publishPinnedDocument } from './trace-publish.service';
+import {
+  DEFAULT_METHOD_DOC,
+  createLiveReportChainReader,
+  type ReportChainReader,
+  type ReportContracts,
+} from './report-chain-reader';
 
 dayjs.extend(utc);
 
 /** u64::MAX: reports are not about one market, so they use a sentinel. */
 export const REPORT_MARKET_ID = 18446744073709551615n;
 export const REPORT_KIND = 'oracledesk.transparency-report';
-export const REPORT_SCHEMA_VERSION = 1;
+export const REPORT_SCHEMA_VERSION = 2;
+
+export type ReconciliationFlag = AccountingFlag | 'NAV_DIFF_EXCEEDS_TOLERANCE';
 
 export interface ReportMarket {
   marketId: string;
@@ -48,7 +65,30 @@ export interface ReportMarket {
   archived?: boolean;
 }
 
-export interface TransparencyReportV1 {
+export interface ReportChainBlock {
+  navRaw: string;
+  liquidRaw: string;
+  yieldPrincipalRaw: string;
+  yieldValueShares: string | null;
+  queueReservedRaw: string;
+  netExposureRaw: string;
+  ledger: number;
+}
+
+export interface ReportReconciliationMarket {
+  marketId: string;
+  chainFloorRaw: string;
+  recomputedFloorRaw: string;
+  diffRaw: string;
+}
+
+export interface ReportReconciliationBlock {
+  navDiffRaw: string;
+  perMarket: ReportReconciliationMarket[];
+  flags: ReconciliationFlag[];
+}
+
+export interface TransparencyReportV2 {
   kind: typeof REPORT_KIND;
   schemaVersion: typeof REPORT_SCHEMA_VERSION;
   network: string;
@@ -63,6 +103,8 @@ export interface TransparencyReportV1 {
     riskConfig: { maxTradeRaw: string; maxMarketRaw: string; maxDailyRaw: string };
     dailyUsage: { amountRaw: string; dayStart: number };
   };
+  chain: ReportChainBlock;
+  reconciliation: ReportReconciliationBlock;
   markets: ReportMarket[];
   totals: { positionsMarkRaw: string; positionsLiquidationRaw: string; navRaw: string };
   period_flows: {
@@ -76,9 +118,12 @@ export interface TransparencyReportV1 {
     tradeCount: number;
   };
   traces: { total: number; byAction: Record<string, number> };
-  method: { version: '1'; doc: string };
+  method: { version: '2'; doc: string };
   previous: { onChainTraceId: string; traceHash: string } | null;
 }
+
+/** Backwards-compatible alias. */
+export type TransparencyReportV1 = TransparencyReportV2;
 
 function statusLabel(status: OnChainMarket['status']): ReportMarket['status'] {
   if (status.tag === 'Open') return 'Open';
@@ -92,6 +137,8 @@ function settlementKind(label: ReportMarket['status']): Settlement | null {
   if (label === 'Void') return 'void';
   return null;
 }
+
+const minBig = (a: bigint, b: bigint) => (a < b ? a : b);
 
 export function markValueRaw(yes: bigint, no: bigint, yesBps: number): string {
   const p = BigInt(yesBps);
@@ -121,6 +168,32 @@ export interface RawMarketSnapshot {
   market: OnChainMarket;
   position: Position;
   archived?: boolean;
+}
+
+/**
+ * Outcome-independent floor valuation for a market position (ADR 0005, #299):
+ * - Open market: `min(yes, no)` for shares held, plus `min(reserve_yes, reserve_no)`
+ *   for unclaimed LP pools created by the treasury.
+ * - Final market: `settleValue(kind, yes, no)` plus unclaimed LP settlement.
+ */
+export function marketFloorRaw(snapshot: RawMarketSnapshot, treasuryAddress: string): bigint {
+  const label = statusLabel(snapshot.market.status);
+  const yes = BigInt(snapshot.position.yes);
+  const no = BigInt(snapshot.position.no);
+  const resYes = BigInt(snapshot.market.reserve_yes);
+  const resNo = BigInt(snapshot.market.reserve_no);
+  const kind = settlementKind(label);
+  const isUnclaimedLp = !snapshot.market.lp_claimed && snapshot.market.creator === treasuryAddress;
+
+  if (kind) {
+    const posFloor = settleValue(kind, yes, no);
+    const lpFloor = isUnclaimedLp ? settleValue(kind, resYes, resNo) : 0n;
+    return posFloor + lpFloor;
+  }
+
+  const posFloor = minBig(yes, no);
+  const lpFloor = isUnclaimedLp ? minBig(resYes, resNo) : 0n;
+  return posFloor + lpFloor;
 }
 
 /** Pure valuation step, shared by the builder and tests. */
@@ -169,19 +242,36 @@ export function totalsFor(markets: ReportMarket[], usdcBalanceRaw: string) {
 export interface ReportInputs {
   date: string;
   network: string;
-  contracts: TransparencyReportV1['contracts'];
+  contracts: TransparencyReportV2['contracts'];
   agent: string;
   anchor: { ledger: number; closedAt: string };
   consistency: 'exact' | 'best_effort';
-  treasury: TransparencyReportV1['treasury'];
+  treasury: TransparencyReportV2['treasury'];
+  chain?: ReportChainBlock;
+  reconciliation?: ReportReconciliationBlock;
   markets: ReportMarket[];
-  periodFlows: TransparencyReportV1['period_flows'];
-  traces: TransparencyReportV1['traces'];
-  previous: TransparencyReportV1['previous'];
+  periodFlows: TransparencyReportV2['period_flows'];
+  traces: TransparencyReportV2['traces'];
+  previous: TransparencyReportV2['previous'];
   methodDoc: string;
 }
 
-export function buildReportDocument(input: ReportInputs): TransparencyReportV1 {
+export function buildReportDocument(input: ReportInputs): TransparencyReportV2 {
+  const chain: ReportChainBlock = input.chain ?? {
+    navRaw: input.treasury.usdcBalanceRaw,
+    liquidRaw: input.treasury.usdcBalanceRaw,
+    yieldPrincipalRaw: '0',
+    yieldValueShares: null,
+    queueReservedRaw: '0',
+    netExposureRaw: '0',
+    ledger: input.anchor.ledger,
+  };
+  const reconciliation: ReportReconciliationBlock = input.reconciliation ?? {
+    navDiffRaw: '0',
+    perMarket: [],
+    flags: [],
+  };
+
   return {
     kind: REPORT_KIND,
     schemaVersion: REPORT_SCHEMA_VERSION,
@@ -192,24 +282,34 @@ export function buildReportDocument(input: ReportInputs): TransparencyReportV1 {
     anchor: input.anchor,
     consistency: input.consistency,
     treasury: input.treasury,
+    chain,
+    reconciliation,
     markets: input.markets,
     totals: totalsFor(input.markets, input.treasury.usdcBalanceRaw),
     period_flows: input.periodFlows,
     traces: input.traces,
-    method: { version: '1', doc: input.methodDoc },
+    method: { version: '2', doc: input.methodDoc },
     previous: input.previous,
   };
 }
 
 export interface ReportDeps {
+  reader?: ReportChainReader;
+  network?: string;
+  contracts?: ReportContracts;
+  useTraceCache?: boolean;
   now?: () => Date;
   latestLedger?: () => Promise<number>;
+  ledgerClosedAt?: (ledger: number) => Promise<string>;
   marketCount?: () => Promise<bigint>;
+  openMarkets?: () => Promise<bigint[] | null>;
   getMarket?: (id: bigint) => Promise<OnChainMarket>;
   getPosition?: (id: bigint, holder: string) => Promise<Position>;
+  marketValuation?: (id: bigint) => Promise<bigint>;
   treasuryConfig?: () => Promise<{ agent: string; max_daily: bigint; max_market: bigint; max_trade: bigint }>;
   dailyUsage?: () => Promise<{ amount: bigint; day_start: bigint }>;
   availableCapital?: () => Promise<bigint>;
+  usdcBalance?: (holder: string) => Promise<bigint>;
   traceCount?: () => Promise<bigint>;
   getTrace?: (id: bigint) => Promise<{ agent: string; action: string }>;
   chainEvents?: (from: Date, to: Date) => Promise<Array<{ contractName: string; eventName: string; ledger: number; ledgerClosedAt: Date; params: unknown }>>;
@@ -229,7 +329,7 @@ async function treasuryInstanceEntries(): Promise<Array<{ lastModifiedLedgerSeq:
       key: xdr.ScVal.scvLedgerKeyContractInstance(),
       durability: xdr.ContractDataDurability.persistent(),
     });
-    const res = await rpcServer.getLedgerEntries(key);
+    const res = await withTimeout('rpc-read', () => rpcServer.getLedgerEntries(key));
     return (res.entries ?? []).map((entry) => ({ lastModifiedLedgerSeq: (entry as any).lastModifiedLedgerSeq ?? 0 }));
   } catch {
     return [];
@@ -241,37 +341,39 @@ function eventParams(event: { params: unknown }): Record<string, unknown> {
 }
 
 export async function buildReportForDate(date: string, deps: ReportDeps = {}): Promise<TransparencyReportV1> {
-  const getLatest = deps.latestLedger ?? (async () => (await rpcServer.getLatestLedger()).sequence);
-  const count = deps.marketCount ?? marketCount;
-  const market = deps.getMarket ?? getOnChainMarket;
-  const position = deps.getPosition ?? getPosition;
-  const risk = deps.treasuryConfig ?? treasuryConfig;
-  const usage = deps.dailyUsage ?? treasuryDailyUsage;
-  const available = deps.availableCapital ?? treasuryAvailableCapital;
-  const entries = deps.ledgerEntries ?? treasuryInstanceEntries;
-  const readTraceCount = deps.traceCount ?? (async () => (await import('./stellar/clients')).readClients.reasoningRegistry().trace_count().then((tx) => tx.result as bigint));
-  const getTrace = deps.getTrace ?? (async (id: bigint) => {
-    const { getOnChainTrace } = await import('./chain.service');
-    return getOnChainTrace(id);
-  });
-  const chainEvents = deps.chainEvents ?? (async (from, to) => prisma.chainEvent.findMany({
-    where: { ledgerClosedAt: { gte: from, lte: to } },
-    orderBy: { ledger: 'asc' },
-  }));
-  const indexerCursor = deps.indexerCursor ?? (async () => {
-    const cursor = await prisma.indexerCursor.findFirst({ orderBy: { updatedAt: 'desc' } });
-    return cursor?.lastLedger ?? null;
-  });
-  const previousReport = deps.previousReport ?? (async (d) => {
-    const prev = await prisma.transparencyReport.findFirst({
-      where: { date: { lt: d }, onChainTraceId: { not: null } },
-      orderBy: { date: 'desc' },
-    });
-    return prev ? { onChainTraceId: prev.onChainTraceId, hash: prev.hash } : null;
-  });
+  const reader = deps.reader ?? createLiveReportChainReader();
+  const getLatest = deps.latestLedger ?? (() => reader.latestLedger());
+  const getLedgerClosedAt = deps.ledgerClosedAt ?? (
+    deps.reader
+      ? (ledger: number) => reader.ledgerClosedAt(ledger)
+      : deps.latestLedger
+        ? async () => (deps.now ? deps.now() : new Date()).toISOString()
+        : (ledger: number) => reader.ledgerClosedAt(ledger)
+  );
+  const count = deps.marketCount ?? (() => reader.marketCount());
+  const market = deps.getMarket ?? ((id: bigint) => reader.getMarket(id));
+  const position = deps.getPosition ?? ((id: bigint, holder: string) => reader.getPosition(id, holder));
+  const risk = deps.treasuryConfig ?? (() => reader.treasuryConfig());
+  const usage = deps.dailyUsage ?? (() => reader.dailyUsage());
+  const available = deps.availableCapital ?? (() => reader.availableCapital());
+  const readUsdcBalance = deps.usdcBalance ?? (
+    deps.reader
+      ? (holder: string) => reader.usdcBalance(holder)
+      : deps.availableCapital
+        ? async () => available()
+        : (holder: string) => reader.usdcBalance(holder)
+  );
+  const entries = deps.ledgerEntries ?? (() => reader.ledgerEntries());
+  const readTraceCount = deps.traceCount ?? (() => reader.traceCount());
+  const getTrace = deps.getTrace ?? ((id: bigint) => reader.getTrace(id));
+  const chainEvents = deps.chainEvents ?? ((from: Date, to: Date) => reader.chainEvents(from, to));
+  const indexerCursor = deps.indexerCursor ?? (() => reader.indexerCursor());
+  const previousReport = deps.previousReport ?? ((d: string) => reader.previousReport(d));
+  const useTraceCache = deps.useTraceCache ?? (deps.reader ? reader.useTraceCache : !deps.getTrace);
 
   const [riskCfg, daily, capital] = await Promise.all([risk(), usage(), available()]);
   const treasuryAddress = (riskCfg as { agent: string }).agent;
+  const usdcBalance = await readUsdcBalance(treasuryAddress);
 
   let consistency: 'exact' | 'best_effort' = 'exact';
   let anchor = 0;
@@ -280,16 +382,24 @@ export async function buildReportForDate(date: string, deps: ReportDeps = {}): P
   for (let attempt = 1; attempt <= SNAPSHOT_ATTEMPTS; attempt++) {
     const l0 = await getLatest();
     const touched = await entries();
-    const total = await count();
+
+    // Prefer the treasury's open-market index (#299) to avoid an O(market_count) scan;
+    // fall back to enumerating 0..market_count only when the index is unavailable.
+    const openIds = await readOpenMarkets().catch(() => null);
+    let candidateIds: bigint[];
+    if (openIds !== null) {
+      candidateIds = openIds;
+    } else {
+      const total = await count();
+      candidateIds = [];
+      for (let i = 0n; i < total; i++) candidateIds.push(i);
+    }
+
     const next: RawMarketSnapshot[] = [];
     for (let i = 0n; i < total; i++) {
-      try {
-        const [m, p] = await Promise.all([market(i), position(i, treasuryAddress)]);
-        const held = BigInt(p.yes) > 0n || BigInt(p.no) > 0n;
-        if (m.creator === treasuryAddress || held) next.push({ marketId: i, market: m, position: p });
-      } catch (err) {
-        logger.warn({ err, marketId: i.toString() }, 'Transparency report: market read failed; skipped');
-      }
+      const [m, p] = await Promise.all([market(i), position(i, treasuryAddress)]);
+      const held = BigInt(p.yes) > 0n || BigInt(p.no) > 0n;
+      if (m.creator === treasuryAddress || held) next.push({ marketId: i, market: m, position: p });
     }
     const l1 = await getLatest();
     snapshots = next;
@@ -302,7 +412,61 @@ export async function buildReportForDate(date: string, deps: ReportDeps = {}): P
     if (attempt === SNAPSHOT_ATTEMPTS) consistency = 'best_effort';
   }
 
+  const anchorClosedAt = await getLedgerClosedAt(anchor);
   const markets = snapshots.map((snapshot) => valueMarket(snapshot, treasuryAddress));
+
+  // Per-market floor reconciliation (#299): compare chain market_valuation(id)
+  // against the independently recomputed outcome-independent floor.
+  const perMarket: ReportReconciliationMarket[] = await Promise.all(
+    snapshots.map(async (snapshot) => {
+      const recomputedFloor = marketFloorRaw(snapshot, treasuryAddress);
+      const chainFloor = await readMarketValuation(snapshot.marketId).catch(() => recomputedFloor);
+      return {
+        marketId: snapshot.marketId.toString(),
+        chainFloorRaw: chainFloor.toString(),
+        recomputedFloorRaw: recomputedFloor.toString(),
+        diffRaw: (chainFloor - recomputedFloor).toString(),
+      };
+    }),
+  );
+
+  const chainBlock: ReportChainBlock = accountingResult
+    ? {
+        navRaw: accountingResult.navRaw.toString(),
+        liquidRaw: accountingResult.liquidRaw.toString(),
+        yieldPrincipalRaw: accountingResult.yieldPrincipalRaw.toString(),
+        yieldValueShares: accountingResult.yieldValueShares !== null ? accountingResult.yieldValueShares.toString() : null,
+        queueReservedRaw: accountingResult.queueReservedRaw.toString(),
+        netExposureRaw: accountingResult.netExposureRaw.toString(),
+        ledger: accountingResult.ledger || anchor,
+      }
+    : {
+        navRaw: (usdcBalanceRawBig + perMarket.reduce((sum, m) => sum + BigInt(m.recomputedFloorRaw), 0n)).toString(),
+        liquidRaw: usdcBalanceRawBig.toString(),
+        yieldPrincipalRaw: '0',
+        yieldValueShares: null,
+        queueReservedRaw: '0',
+        netExposureRaw: '0',
+        ledger: anchor,
+      };
+
+  const recomputedFloorTotal = perMarket.reduce((sum, m) => sum + BigInt(m.recomputedFloorRaw), 0n);
+  const recomputedFloorNav = usdcBalanceRawBig + recomputedFloorTotal - BigInt(chainBlock.queueReservedRaw);
+  const navDiff = BigInt(chainBlock.navRaw) - recomputedFloorNav;
+  const absNavDiff = navDiff < 0n ? -navDiff : navDiff;
+  const navTolerance = BigInt(deps.navToleranceRaw ?? config.REPORT_NAV_TOLERANCE_RAW);
+
+  const reconFlags: ReconciliationFlag[] = [...(accountingResult?.flags ?? [])];
+  if (absNavDiff > navTolerance) {
+    consistency = 'best_effort';
+    reconFlags.push('NAV_DIFF_EXCEEDS_TOLERANCE');
+  }
+
+  const reconciliation: ReportReconciliationBlock = {
+    navDiffRaw: navDiff.toString(),
+    perMarket,
+    flags: reconFlags,
+  };
 
   const start = dayjs.utc(date).startOf('day').toDate();
   const end = dayjs.utc(date).endOf('day').toDate();
@@ -340,50 +504,63 @@ export async function buildReportForDate(date: string, deps: ReportDeps = {}): P
   const gaps: Array<[number, number]> = complete ? [] : [[(cursor ?? fromLedger) + 1, toLedger]];
 
   const totalTraces = Number(await readTraceCount());
-  const byAction: Record<string, number> = {};
+  const byActionUnsorted: Record<string, number> = {};
   let agentTraceTotal = 0;
   for (let i = 0; i < totalTraces; i++) {
-    let cached = await prisma.registryTraceCache.findUnique({ where: { traceId: BigInt(i) } }).catch(() => null);
-    if (!cached) {
+    let traceAgent = '';
+    let traceAction = '';
+    if (useTraceCache) {
+      let cached = await prisma.registryTraceCache.findUnique({ where: { traceId: BigInt(i) } }).catch(() => null);
+      if (!cached) {
+        const trace = await getTrace(BigInt(i)).catch(() => null);
+        if (trace) {
+          await prisma.registryTraceCache.create({
+            data: {
+              traceId: BigInt(i),
+              agent: (trace as { agent?: string }).agent ?? '',
+              marketId: BigInt((trace as { market_id?: bigint }).market_id ?? 0n),
+              action: (trace as { action?: string }).action ?? '',
+              traceHash: Buffer.from((trace as { trace_hash?: Buffer }).trace_hash ?? Buffer.alloc(0)).toString('hex'),
+              ipfsCid: (trace as { ipfs_cid?: string }).ipfs_cid ?? '',
+              publishedAt: BigInt((trace as { published_at?: bigint }).published_at ?? 0n),
+            },
+          }).catch(() => undefined);
+          cached = await prisma.registryTraceCache.findUnique({ where: { traceId: BigInt(i) } }).catch(() => null);
+        }
+      }
+      if (cached) {
+        traceAgent = cached.agent;
+        traceAction = cached.action;
+      }
+    } else {
       const trace = await getTrace(BigInt(i)).catch(() => null);
       if (trace) {
-        await prisma.registryTraceCache.create({
-          data: {
-            traceId: BigInt(i),
-            agent: (trace as { agent?: string }).agent ?? '',
-            marketId: BigInt((trace as { market_id?: bigint }).market_id ?? 0n),
-            action: (trace as { action?: string }).action ?? '',
-            traceHash: Buffer.from((trace as { trace_hash?: Buffer }).trace_hash ?? Buffer.alloc(0)).toString('hex'),
-            ipfsCid: (trace as { ipfs_cid?: string }).ipfs_cid ?? '',
-            publishedAt: BigInt((trace as { published_at?: bigint }).published_at ?? 0n),
-          },
-        }).catch(() => undefined);
-        cached = await prisma.registryTraceCache.findUnique({ where: { traceId: BigInt(i) } }).catch(() => null);
+        traceAgent = trace.agent ?? '';
+        traceAction = trace.action ?? '';
       }
     }
-    if (cached && cached.agent === treasuryAddress) {
+    if (traceAgent === treasuryAddress) {
       agentTraceTotal++;
-      byAction[cached.action] = (byAction[cached.action] ?? 0) + 1;
+      byActionUnsorted[traceAction] = (byActionUnsorted[traceAction] ?? 0) + 1;
     }
+  }
+  const byAction: Record<string, number> = {};
+  for (const key of Object.keys(byActionUnsorted).sort()) {
+    byAction[key] = byActionUnsorted[key];
   }
 
   const previousRow = await previousReport(date);
-  const methodDoc = deps.methodDoc ?? process.env.REPORT_METHOD_DOC ?? 'https://github.com/OracleDesk/oracledesk-backend/blob/main/docs/transparency-reports.md';
+  const methodDoc = deps.methodDoc ?? reader.methodDoc ?? DEFAULT_METHOD_DOC;
 
   return buildReportDocument({
     date,
-    network: config.STELLAR_NETWORK_PASSPHRASE,
-    contracts: {
-      treasury: CONTRACTS.treasury,
-      marketCore: CONTRACTS.marketCore,
-      usdc: CONTRACTS.usdc,
-      reasoningRegistry: CONTRACTS.reasoningRegistry,
-    },
+    network: deps.network ?? reader.network,
+    contracts: deps.contracts ?? reader.contracts,
     agent: treasuryAddress,
-    anchor: { ledger: anchor, closedAt: new Date().toISOString() },
+    anchor: { ledger: anchor, closedAt: anchorClosedAt },
     consistency,
     treasury: {
-      usdcBalanceRaw: capital.toString(),
+      usdcBalanceRaw: usdcBalance.toString(),
       availableCapitalRaw: capital.toString(),
       riskConfig: {
         maxTradeRaw: BigInt((riskCfg as { max_trade: bigint }).max_trade).toString(),
@@ -392,6 +569,8 @@ export async function buildReportForDate(date: string, deps: ReportDeps = {}): P
       },
       dailyUsage: { amountRaw: BigInt((daily as { amount: bigint }).amount).toString(), dayStart: Number((daily as { day_start: bigint }).day_start) },
     },
+    chain: chainBlock,
+    reconciliation,
     markets,
     periodFlows: {
       coverage: { fromLedger, toLedger, complete, gaps },

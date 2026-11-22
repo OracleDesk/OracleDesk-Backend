@@ -1,3 +1,4 @@
+import type { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { writeAgentLog } from '../lib/agent-log';
@@ -229,35 +230,61 @@ export async function linkLandedMarket(
   marketId: string,
   onChainMarketId: bigint,
   txHash?: string | null,
+  externalTx?: Prisma.TransactionClient,
 ): Promise<boolean> {
-  try {
-    await prisma.$transaction(async (tx) => {
-      await tx.market.update({
-        where: { id: marketId },
-        data: {
-          onChainMarketId,
-          creationTxHash: txHash ?? undefined,
-          status: 'ACTIVE',
-        },
-      });
-
-      await tx.marketCreationAttempt.upsert({
-        where: { marketId },
-        create: {
+  const apply = async (tx: Prisma.TransactionClient): Promise<boolean> => {
+    const conflict = await tx.market.findFirst({
+      where: { onChainMarketId, id: { not: marketId } },
+      select: { id: true },
+    });
+    if (conflict) {
+      logger.error({ marketId, onChainMarketId: onChainMarketId.toString(), conflictId: conflict.id }, 'CREATION_ID_CONFLICT: on-chain market id already linked');
+      await writeAgentLog(
+        {
+          agentType: 'MARKET_MAKER',
+          level: 'ERROR',
+          action: 'CREATION_ID_CONFLICT',
           marketId,
-          onChainMarketId,
-          txHash: txHash ?? null,
-          status: 'LANDED',
+          data: { onChainMarketId: onChainMarketId.toString(), conflictId: conflict.id },
         },
-        update: {
-          onChainMarketId,
-          txHash: txHash ?? undefined,
-          status: 'LANDED',
-          claimLeaseExpiresAt: new Date(),
-        },
-      });
+        tx,
+      ).catch(() => undefined);
+      return false;
+    }
+
+    await tx.market.update({
+      where: { id: marketId },
+      data: {
+        onChainMarketId,
+        creationTxHash: txHash ?? undefined,
+        status: 'ACTIVE',
+      },
+    });
+
+    await tx.marketCreationAttempt.upsert({
+      where: { marketId },
+      create: {
+        marketId,
+        onChainMarketId,
+        txHash: txHash ?? null,
+        status: 'LANDED',
+      },
+      update: {
+        onChainMarketId,
+        txHash: txHash ?? undefined,
+        status: 'LANDED',
+        claimLeaseExpiresAt: new Date(),
+      },
     });
     return true;
+  };
+
+  if (externalTx) {
+    return apply(externalTx);
+  }
+
+  try {
+    return await prisma.$transaction(apply);
   } catch (err: any) {
     // Unique violation on onChainMarketId (P2002)
     if (err?.code === 'P2002' || err?.message?.includes('Unique constraint')) {

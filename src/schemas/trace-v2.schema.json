@@ -461,6 +461,159 @@
           }
         }
       }
+    },
+    "hedgePredicates": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "maxItems": 10,
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "version",
+              "kind",
+              "seriesId",
+              "comparator",
+              "threshold",
+              "unit",
+              "action",
+              "description"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32
+              },
+              "version": {
+                "const": 1
+              },
+              "kind": {
+                "const": "fred_series"
+              },
+              "seriesId": {
+                "type": "string",
+                "enum": [
+                  "FEDFUNDS",
+                  "CPIAUCSL",
+                  "UNRATE",
+                  "T10Y2Y"
+                ]
+              },
+              "comparator": {
+                "type": "string",
+                "enum": [
+                  "gt",
+                  "gte",
+                  "lt",
+                  "lte"
+                ]
+              },
+              "threshold": {
+                "type": "number"
+              },
+              "unit": {
+                "type": "string",
+                "enum": [
+                  "percent",
+                  "index",
+                  "spread"
+                ]
+              },
+              "action": {
+                "type": "string",
+                "enum": [
+                  "EXIT",
+                  "REFORECAST"
+                ]
+              },
+              "description": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "version",
+              "kind",
+              "entities",
+              "comparator",
+              "threshold",
+              "windowHours",
+              "unit",
+              "action",
+              "description"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32
+              },
+              "version": {
+                "const": 1
+              },
+              "kind": {
+                "const": "news_entity_count"
+              },
+              "entities": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 5,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 64
+                }
+              },
+              "comparator": {
+                "type": "string",
+                "enum": [
+                  "gt",
+                  "gte",
+                  "lt",
+                  "lte"
+                ]
+              },
+              "threshold": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000
+              },
+              "windowHours": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 720
+              },
+              "unit": {
+                "const": "articles"
+              },
+              "action": {
+                "type": "string",
+                "enum": [
+                  "EXIT",
+                  "REFORECAST"
+                ]
+              },
+              "description": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500
+              }
+            }
+          }
+        ]
+      }
     }
   }
 }

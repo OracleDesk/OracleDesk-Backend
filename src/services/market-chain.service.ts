@@ -26,7 +26,7 @@ import {
   type WriteResult,
 } from './chain.service';
 import { ChainError, ChainPendingError } from './stellar/errors';
-import { registerHandler, type ChainTransactionRow, type CompletionOutcome } from './stellar/outbox';
+import { registerHandler, type ChainTransactionRow, type CompletionContext, type CompletionOutcome } from './stellar/outbox';
 import { MIN_SEED_RAW, initialYesBps, decideSeed, type SeedDecision, type SeedPolicyConfig } from './seed-policy.service';
 import { agentSigner } from './stellar/clients';
 import { pinJson } from './ipfs.service';
@@ -44,45 +44,39 @@ import {
 export { MIN_SEED_RAW, initialYesBps };
 
 /**
- * Completion handler for `market.create` outbox rows (#35): links the landed
- * on-chain market id to the database market, whether confirmation arrived
- * inline or from the recovery worker after a crash. It never overwrites an
- * existing, different onChainMarketId — that would re-point live positions.
+ * Completion handler for `market.create` outbox rows (#35, #290): links the
+ * landed on-chain market id to the database market inside the outbox
+ * transaction using `ctx.tx` (never global `prisma`).
  */
-export async function handleMarketCreateOutcome(row: ChainTransactionRow, outcome: CompletionOutcome): Promise<void> {
+export async function handleMarketCreateOutcome(
+  row: ChainTransactionRow,
+  outcome: CompletionOutcome,
+  ctx: CompletionContext,
+): Promise<void> {
   const marketId = row.refId;
   if (!marketId) return;
 
   if (outcome.status !== 'SUCCESS') {
-    // One log per outbox row (#229): a crash between this handler and
-    // markHandled re-runs it, and concurrent recoverers can both pick the
-    // unhandled row. The advisory lock serialises them; the lookup skips a
-    // log an earlier run already wrote.
-    await prisma
-      .$transaction(async (tx) => {
-        await tx.$queryRaw`SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtext(${`market.create:${row.id}`}))`;
-        const existing = await tx.agentLog.findFirst({
-          where: { action: 'MARKET_CREATION_FAILED', marketId, data: { path: ['outboxId'], equals: row.id } },
-          select: { id: true },
-        });
-        if (existing) return;
-        await writeAgentLog(
-          {
-            agentType: 'MARKET_MAKER',
-            level: 'ERROR',
-            action: 'MARKET_CREATION_FAILED',
-            marketId,
-            data: { outboxId: row.id, status: outcome.status, error: outcome.error ?? null, txHash: outcome.txHash ?? null },
-          },
-          tx,
-        );
-      })
-      .catch((err) => logger.warn({ err, outboxId: row.id }, 'market.create: could not record the failure log'));
+    const existing = await ctx.tx.agentLog.findFirst({
+      where: { action: 'MARKET_CREATION_FAILED', marketId, data: { path: ['outboxId'], equals: row.id } },
+      select: { id: true },
+    });
+    if (existing) return;
+    await writeAgentLog(
+      {
+        agentType: 'MARKET_MAKER',
+        level: 'ERROR',
+        action: 'MARKET_CREATION_FAILED',
+        marketId,
+        data: { outboxId: row.id, status: outcome.status, error: outcome.error ?? null, txHash: outcome.txHash ?? null },
+      },
+      ctx.tx,
+    );
     return;
   }
 
   const onChainMarketId = BigInt(String(outcome.value ?? '0'));
-  const existing = await prisma.market.findUnique({ where: { id: marketId }, select: { onChainMarketId: true } });
+  const existing = await ctx.tx.market.findUnique({ where: { id: marketId }, select: { onChainMarketId: true } });
   if (!existing) return;
   if (existing.onChainMarketId != null) {
     if (existing.onChainMarketId !== onChainMarketId) {
@@ -93,7 +87,7 @@ export async function handleMarketCreateOutcome(row: ChainTransactionRow, outcom
     }
     return;
   }
-  await linkLandedMarket(marketId, onChainMarketId, outcome.txHash ?? null);
+  await linkLandedMarket(marketId, onChainMarketId, outcome.txHash ?? null, ctx.tx);
 }
 
 registerHandler('market.create', handleMarketCreateOutcome);

@@ -1,0 +1,365 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://api.oracledesk.io/api/v1/schemas/report/v2.json",
+  "title": "OracleDesk Transparency Report v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "schemaVersion",
+    "network",
+    "contracts",
+    "agent",
+    "period",
+    "anchor",
+    "consistency",
+    "treasury",
+    "chain",
+    "reconciliation",
+    "markets",
+    "totals",
+    "period_flows",
+    "traces",
+    "method",
+    "previous"
+  ],
+  "properties": {
+    "kind": {
+      "const": "oracledesk.transparency-report"
+    },
+    "schemaVersion": {
+      "const": 2
+    },
+    "network": {
+      "type": "string"
+    },
+    "contracts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "treasury",
+        "marketCore",
+        "usdc",
+        "reasoningRegistry"
+      ],
+      "properties": {
+        "treasury": {
+          "type": "string"
+        },
+        "marketCore": {
+          "type": "string"
+        },
+        "usdc": {
+          "type": "string"
+        },
+        "reasoningRegistry": {
+          "type": "string"
+        }
+      }
+    },
+    "agent": {
+      "type": "string"
+    },
+    "period": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "from",
+        "to"
+      ],
+      "properties": {
+        "from": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "to": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "anchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ledger",
+        "closedAt"
+      ],
+      "properties": {
+        "ledger": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "closedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "consistency": {
+      "type": "string",
+      "enum": [
+        "exact",
+        "best_effort"
+      ]
+    },
+    "treasury": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "usdcBalanceRaw",
+        "availableCapitalRaw",
+        "riskConfig",
+        "dailyUsage"
+      ],
+      "properties": {
+        "usdcBalanceRaw": {
+          "type": "string",
+          "pattern": "^-?\\d+$"
+        },
+        "availableCapitalRaw": {
+          "type": "string",
+          "pattern": "^-?\\d+$"
+        },
+        "riskConfig": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "maxTradeRaw",
+            "maxMarketRaw",
+            "maxDailyRaw"
+          ],
+          "properties": {
+            "maxTradeRaw": {
+              "type": "string",
+              "pattern": "^\\d+$"
+            },
+            "maxMarketRaw": {
+              "type": "string",
+              "pattern": "^\\d+$"
+            },
+            "maxDailyRaw": {
+              "type": "string",
+              "pattern": "^\\d+$"
+            }
+          }
+        },
+        "dailyUsage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "amountRaw",
+            "dayStart"
+          ],
+          "properties": {
+            "amountRaw": {
+              "type": "string",
+              "pattern": "^\\d+$"
+            },
+            "dayStart": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    },
+    "chain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "navRaw",
+        "liquidRaw",
+        "yieldPrincipalRaw",
+        "yieldValueShares",
+        "queueReservedRaw",
+        "netExposureRaw",
+        "ledger"
+      ],
+      "properties": {
+        "navRaw": {
+          "type": "string",
+          "pattern": "^-?\\d+$"
+        },
+        "liquidRaw": {
+          "type": "string",
+          "pattern": "^-?\\d+$"
+        },
+        "yieldPrincipalRaw": {
+          "type": "string",
+          "pattern": "^-?\\d+$"
+        },
+        "yieldValueShares": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^-?\\d+$"
+        },
+        "queueReservedRaw": {
+          "type": "string",
+          "pattern": "^-?\\d+$"
+        },
+        "netExposureRaw": {
+          "type": "string",
+          "pattern": "^-?\\d+$"
+        },
+        "ledger": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "reconciliation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "navDiffRaw",
+        "perMarket",
+        "flags"
+      ],
+      "properties": {
+        "navDiffRaw": {
+          "type": "string",
+          "pattern": "^-?\\d+$"
+        },
+        "perMarket": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "marketId",
+              "chainFloorRaw",
+              "recomputedFloorRaw",
+              "diffRaw"
+            ],
+            "properties": {
+              "marketId": {
+                "type": "string",
+                "pattern": "^\\d+$"
+              },
+              "chainFloorRaw": {
+                "type": "string",
+                "pattern": "^-?\\d+$"
+              },
+              "recomputedFloorRaw": {
+                "type": "string",
+                "pattern": "^-?\\d+$"
+              },
+              "diffRaw": {
+                "type": "string",
+                "pattern": "^-?\\d+$"
+              }
+            }
+          }
+        },
+        "flags": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "NAV_EXCLUDES_YIELD",
+              "YIELD_VALUE_IN_SHARES",
+              "YIELD_READ_FAILED",
+              "AVAILABLE_MIXES_UNITS",
+              "NAV_DIFF_EXCEEDS_TOLERANCE"
+            ]
+          }
+        }
+      }
+    },
+    "markets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "totals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "positionsMarkRaw",
+        "positionsLiquidationRaw",
+        "navRaw"
+      ],
+      "properties": {
+        "positionsMarkRaw": {
+          "type": "string",
+          "pattern": "^-?\\d+$"
+        },
+        "positionsLiquidationRaw": {
+          "type": "string",
+          "pattern": "^-?\\d+$"
+        },
+        "navRaw": {
+          "type": "string",
+          "pattern": "^-?\\d+$"
+        }
+      }
+    },
+    "period_flows": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "traces": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "total",
+        "byAction"
+      ],
+      "properties": {
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "byAction": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "method": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "doc"
+      ],
+      "properties": {
+        "version": {
+          "const": "2"
+        },
+        "doc": {
+          "type": "string"
+        }
+      }
+    },
+    "previous": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "onChainTraceId",
+        "traceHash"
+      ],
+      "properties": {
+        "onChainTraceId": {
+          "type": "string",
+          "pattern": "^\\d+$"
+        },
+        "traceHash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    }
+  }
+}

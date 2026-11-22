@@ -1,7 +1,3 @@
-import cron from 'node-cron';
-import { config } from '../config';
-import { logger } from '../lib/logger';
-import { newId, runWithContext } from '../lib/context';
 import { confirmPendingPaymentIntents } from '../services/payment-intent.service';
 import { expireAllowanceReservations } from '../services/x402-allowance.service';
 import { recordCronRun } from './registry';
@@ -39,6 +35,4 @@ export function startPaymentIntentCron(): void {
       }
     });
   });
-
-  logger.info({ cron: config.PAYMENT_INTENT_CONFIRM_CRON }, 'Payment intent confirmer scheduled');
 }

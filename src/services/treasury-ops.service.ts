@@ -40,13 +40,42 @@ import {
   treasuryDailyUsage,
 } from './chain.service';
 import type { RiskConfig } from '../generated/treasury';
+import {
+  buildTreasuryProposalsModel,
+  classifyAndDiffAgentPolicy,
+  classifyAndDiffConfig,
+  classifyAndDiffCreationPolicy,
+  classifyAndDiffPricePolicy,
+  encodeProposalScArgs,
+  type AgentPolicyInput,
+  type ChangeClassification,
+  type CreationPolicyInput,
+  type DrawdownConfigInput,
+  type FieldDiff,
+  type GlobalConfigInput,
+  type PendingStorageEntries,
+  type PricePolicyInput,
+  type TreasuryProposal,
+} from './treasury-timelock.service';
 
 export type AdminOp =
   | { kind: 'treasury.set_paused'; paused: boolean }
   | { kind: 'treasury.withdraw'; to: string; amountRaw: string }
   | { kind: 'treasury.deposit'; from: string; amountRaw: string }
   | { kind: 'treasury.collect_market_fees'; onChainMarketId: string }
-  | { kind: 'market_core.set_paused'; paused: boolean };
+  | { kind: 'market_core.set_paused'; paused: boolean }
+  | { kind: 'treasury.propose_config'; config: GlobalConfigInput }
+  | { kind: 'treasury.execute_config' }
+  | { kind: 'treasury.cancel_config' }
+  | { kind: 'treasury.set_price_policy'; policy: PricePolicyInput }
+  | { kind: 'treasury.execute_price_policy' }
+  | { kind: 'treasury.cancel_price_policy' }
+  | { kind: 'treasury.set_agent'; agent: string; policy: AgentPolicyInput }
+  | { kind: 'treasury.execute_agent'; agent: string }
+  | { kind: 'treasury.cancel_agent'; agent: string }
+  | { kind: 'treasury.remove_agent'; agent: string }
+  | { kind: 'treasury.set_creation_policy'; policy: CreationPolicyInput }
+  | { kind: 'treasury.set_drawdown_config'; config: DrawdownConfigInput };
 
 export interface PreflightCheck {
   name: string;
@@ -80,6 +109,13 @@ export interface TreasuryState {
     dailyUsage: { amountRaw: string; dayStart: number; resetsAt: string; remainingRaw: string };
     paused: boolean | null;
     admin: { address: string; kind: 'account' | 'contract' } | null;
+    configDelaySeconds?: number | null;
+    pricePolicy?: PricePolicyInput | null;
+    creationPolicy?: CreationPolicyInput | null;
+    drawdownConfig?: DrawdownConfigInput | null;
+    agentPolicies?: Record<string, AgentPolicyInput>;
+    proposals?: TreasuryProposal[];
+    ledgerTimeUnix?: number;
   };
   marketCore: { paused: boolean | null; admin: string | null };
   agent: { address: string; xlmBalance: string | null };
@@ -97,6 +133,9 @@ export interface PreparedOperation {
   checks: PreflightCheck[];
   humanSummary: string;
   status: string;
+  classification?: ChangeClassification;
+  diff?: FieldDiff[];
+  permissionless?: boolean;
 }
 
 export interface SignatureRecord {
@@ -232,6 +271,60 @@ export async function getTreasuryState(deps: OpsDeps = {}): Promise<TreasuryStat
   const dayStart = Number(usage?.day_start ?? 0);
   const resetsAt = new Date((dayStart + 86_400) * 1000).toISOString();
 
+  const rawDelay = instance.get('ConfigDelay') ?? instance.get('config_delay');
+  const configDelaySeconds = rawDelay !== undefined && rawDelay !== null ? Number(rawDelay) : null;
+  const pendingEntries: PendingStorageEntries = {
+    pendingConfig: (instance.get('PendingConfig') ?? instance.get('pending_config') ?? null) as PendingStorageEntries['pendingConfig'],
+    pendingPricePolicy: (instance.get('PendingPricePolicy') ?? instance.get('pending_price_policy') ?? null) as PendingStorageEntries['pendingPricePolicy'],
+    pendingAgents: [],
+  };
+  for (const [k, v] of instance.entries()) {
+    if ((k.startsWith('PendingAgent:') || k.startsWith('pending_agent:')) && v && typeof v === 'object') {
+      const agentKey = k.split(':')[1];
+      if (agentKey) pendingEntries.pendingAgents!.push({ agent: agentKey, ...(v as { value: Record<string, unknown>; executable_at: number | bigint }) });
+    }
+  }
+
+  const [proposalEvents, adminOps] = await Promise.all([
+    prisma.chainEvent
+      .findMany({
+        where: {
+          contractName: 'treasury',
+          eventName: {
+            in: [
+              'ConfigProposed', 'ConfigExecuted', 'ConfigCancelled',
+              'PricePolicyProposed', 'PricePolicySet', 'PricePolicyCancelled',
+              'AgentPolicyProposed', 'AgentPolicySet', 'AgentPolicyCancelled',
+            ],
+          },
+        },
+        orderBy: { ledger: 'asc' },
+        take: 100,
+      })
+      .catch(() => []),
+    prisma.adminOperation
+      .findMany({
+        where: { kind: { startsWith: 'treasury.' } },
+        select: { id: true, txHash: true, kind: true },
+        orderBy: { createdAt: 'desc' },
+        take: 100,
+      })
+      .catch(() => []),
+  ]);
+
+  const ledgerTimeUnix = Math.floor(nowMs(deps) / 1000);
+  const proposals = buildTreasuryProposalsModel(
+    pendingEntries,
+    proposalEvents.map((e) => ({
+      eventName: e.eventName,
+      txHash: e.txHash,
+      ledgerClosedAt: e.ledgerClosedAt,
+      params: (e.params as Record<string, unknown>) ?? {},
+    })),
+    adminOps,
+    ledgerTimeUnix,
+  );
+
   return {
     network: config.STELLAR_NETWORK_PASSPHRASE,
     contracts: { treasury: CONTRACTS.treasury, marketCore: CONTRACTS.marketCore, usdc: CONTRACTS.usdc },
@@ -242,6 +335,12 @@ export async function getTreasuryState(deps: OpsDeps = {}): Promise<TreasuryStat
       dailyUsage: { amountRaw: amountRaw.toString(), dayStart, resetsAt, remainingRaw: remaining.toString() },
       paused,
       admin: adminAddress ? { address: adminAddress, kind: adminAccount?.kind ?? 'account' } : null,
+      configDelaySeconds,
+      pricePolicy: (instance.get('PricePolicy') ?? instance.get('price_policy') ?? null) as PricePolicyInput | null,
+      creationPolicy: (instance.get('CreationPolicy') ?? instance.get('creation_policy') ?? null) as CreationPolicyInput | null,
+      drawdownConfig: (instance.get('DrawdownConfig') ?? instance.get('drawdown_config') ?? null) as DrawdownConfigInput | null,
+      proposals,
+      ledgerTimeUnix,
     },
     marketCore: { paused: marketCfg?.paused ?? null, admin: marketCfg?.admin ?? null },
     agent: { address: agentAddress, xlmBalance: agentAccount?.balanceXlm ?? null },
@@ -267,13 +366,41 @@ export function humanSummary(op: AdminOp): string {
       return `Collect accrued fees from market ${op.onChainMarketId} into treasury ${CONTRACTS.treasury}`;
     case 'market_core.set_paused':
       return `${op.paused ? 'Pause' : 'Unpause'} market-core ${CONTRACTS.marketCore}`;
+    case 'treasury.propose_config':
+      return `Propose GlobalConfig update (max_trade=${humanUsdc(op.config.max_trade)}, max_market=${humanUsdc(op.config.max_market)}, max_daily=${humanUsdc(op.config.max_daily)}) on treasury ${CONTRACTS.treasury}`;
+    case 'treasury.execute_config':
+      return `Execute pending GlobalConfig proposal on treasury ${CONTRACTS.treasury}`;
+    case 'treasury.cancel_config':
+      return `Cancel pending GlobalConfig proposal on treasury ${CONTRACTS.treasury}`;
+    case 'treasury.set_price_policy':
+      return `Update PricePolicy (${Object.entries(op.policy).map(([k, v]) => `${k}=${v}`).join(', ')}) on treasury ${CONTRACTS.treasury}`;
+    case 'treasury.execute_price_policy':
+      return `Execute pending PricePolicy proposal on treasury ${CONTRACTS.treasury}`;
+    case 'treasury.cancel_price_policy':
+      return `Cancel pending PricePolicy proposal on treasury ${CONTRACTS.treasury}`;
+    case 'treasury.set_agent':
+      return `Set AgentPolicy for ${op.agent} (max_trade=${humanUsdc(op.policy.max_trade)}, max_market=${humanUsdc(op.policy.max_market)}, max_daily=${humanUsdc(op.policy.max_daily)}) on treasury ${CONTRACTS.treasury}`;
+    case 'treasury.execute_agent':
+      return `Execute pending AgentPolicy proposal for ${op.agent} on treasury ${CONTRACTS.treasury}`;
+    case 'treasury.cancel_agent':
+      return `Cancel pending AgentPolicy proposal for ${op.agent} on treasury ${CONTRACTS.treasury}`;
+    case 'treasury.remove_agent':
+      return `Remove agent ${op.agent} from treasury ${CONTRACTS.treasury}`;
+    case 'treasury.set_creation_policy':
+      return `Tighten CreationPolicy (${Object.entries(op.policy).map(([k, v]) => `${k}=${v}`).join(', ')}) on treasury ${CONTRACTS.treasury}`;
+    case 'treasury.set_drawdown_config':
+      return `Set DrawdownConfig (max_drawdown_bps=${op.config.max_drawdown_bps}, pause_duration_seconds=${op.config.pause_duration_seconds}) on treasury ${CONTRACTS.treasury}`;
   }
+}
+
+function isValidStellarAddress(addr: string): boolean {
+  return StrKey.isValidEd25519PublicKey(addr) || StrKey.isValidContract(addr);
 }
 
 function validateOp(op: AdminOp): void {
   if (op.kind === 'treasury.withdraw') {
     parseUsdc(formatUsdcSafe(op.amountRaw));
-    if (!StrKey.isValidEd25519PublicKey(op.to) && !StrKey.isValidContract(op.to)) {
+    if (!isValidStellarAddress(op.to)) {
       throw new AppError(400, 'INVALID_DESTINATION', 'to must be a G… account or C… contract');
     }
   }
@@ -285,6 +412,33 @@ function validateOp(op: AdminOp): void {
   }
   if (op.kind === 'treasury.collect_market_fees' && parseU64(op.onChainMarketId) === null) {
     throw new AppError(400, 'INVALID_MARKET_ID', 'onChainMarketId must be a u64 decimal string');
+  }
+  if (op.kind === 'treasury.propose_config') {
+    formatUsdcSafe(op.config.max_trade);
+    formatUsdcSafe(op.config.max_market);
+    formatUsdcSafe(op.config.max_daily);
+    if (op.config.collateral && !isValidStellarAddress(op.config.collateral)) {
+      throw new AppError(400, 'INVALID_ADDRESS', 'collateral must be a valid Stellar address');
+    }
+    if (op.config.market_core && !isValidStellarAddress(op.config.market_core)) {
+      throw new AppError(400, 'INVALID_ADDRESS', 'market_core must be a valid Stellar address');
+    }
+  }
+  if (op.kind === 'treasury.set_agent') {
+    if (!isValidStellarAddress(op.agent)) {
+      throw new AppError(400, 'INVALID_AGENT', 'agent must be a G… account or C… contract');
+    }
+    formatUsdcSafe(op.policy.max_trade);
+    formatUsdcSafe(op.policy.max_market);
+    formatUsdcSafe(op.policy.max_daily);
+  }
+  if (op.kind === 'treasury.execute_agent' || op.kind === 'treasury.cancel_agent' || op.kind === 'treasury.remove_agent') {
+    if (!isValidStellarAddress(op.agent)) {
+      throw new AppError(400, 'INVALID_AGENT', 'agent must be a G… account or C… contract');
+    }
+  }
+  if (op.kind === 'treasury.set_creation_policy' && op.policy.min_liquidity !== undefined) {
+    formatUsdcSafe(op.policy.min_liquidity);
   }
 }
 
@@ -310,6 +464,27 @@ async function checkTrustline(destination: string): Promise<PreflightCheck> {
 // Soroban invokeHostFunction operations use the account's HIGH threshold.
 export const REQUIRED_THRESHOLD_CATEGORY = 'invokeHostFunction';
 
+function isPermissionlessExecute(op: AdminOp): boolean {
+  return (
+    op.kind === 'treasury.execute_config' ||
+    op.kind === 'treasury.execute_price_policy' ||
+    op.kind === 'treasury.execute_agent'
+  );
+}
+
+function defaultPermissionlessSource(state: TreasuryState, fallback: string): string {
+  try {
+    const feeSecret = secret('STELLAR_FEE_PAYER_SECRET');
+    if (feeSecret) return Keypair.fromSecret(feeSecret).publicKey();
+  } catch {
+    // fall through when secret store is not initialized
+  }
+  if (state.agent.address && StrKey.isValidEd25519PublicKey(state.agent.address)) {
+    return state.agent.address;
+  }
+  return fallback;
+}
+
 export async function prepareOperation(
   op: AdminOp,
   requestedBy: string,
@@ -319,16 +494,79 @@ export async function prepareOperation(
   const state = deps.state ? await deps.state() : await getTreasuryState(deps);
   const admin = state.treasury.admin;
   if (!admin) throw new AppError(503, 'TREASURY_ADMIN_UNAVAILABLE', 'Could not read the on-chain treasury admin');
-  if (admin.kind === 'contract') {
+  const permissionless = isPermissionlessExecute(op);
+  if (!permissionless && admin.kind === 'contract') {
     throw new AppError(501, 'UNSUPPORTED_ADMIN_KIND', 'Contract (C…) admin wallets require auth-entry signing and are not supported by this console');
   }
 
-  const sourceAccount = op.kind === 'treasury.deposit' ? op.from : admin.address;
+  const sourceAccount = permissionless
+    ? defaultPermissionlessSource(state, admin.address)
+    : op.kind === 'treasury.deposit'
+      ? op.from
+      : admin.address;
   const account = deps.account ? await deps.account(sourceAccount) : await readAccount(sourceAccount);
-  const threshold = account.thresholds.high;
-  const required = Math.max(1, threshold, op.kind === 'treasury.withdraw' ? config.TREASURY_WITHDRAW_MIN_SIGNERS : 0);
+  const threshold = permissionless ? 1 : account.thresholds.high;
+  const required = permissionless
+    ? 1
+    : Math.max(1, threshold, op.kind === 'treasury.withdraw' ? config.TREASURY_WITHDRAW_MIN_SIGNERS : 0);
+
+  let classification: ChangeClassification | undefined;
+  let diff: FieldDiff[] | undefined;
+
+  if (op.kind === 'treasury.propose_config') {
+    ({ classification, diff } = classifyAndDiffConfig(state.treasury.config, op.config));
+  } else if (op.kind === 'treasury.set_price_policy') {
+    ({ classification, diff } = classifyAndDiffPricePolicy(state.treasury.pricePolicy ?? null, op.policy));
+  } else if (op.kind === 'treasury.set_agent') {
+    const curAgent = state.treasury.agentPolicies?.[op.agent] ?? null;
+    ({ classification, diff } = classifyAndDiffAgentPolicy(curAgent, op.policy));
+  } else if (op.kind === 'treasury.remove_agent') {
+    classification = 'tighten';
+    diff = [{ field: 'active', current: true, proposed: false, direction: 'tighten' }];
+  } else if (op.kind === 'treasury.set_creation_policy') {
+    ({ classification, diff } = classifyAndDiffCreationPolicy(state.treasury.creationPolicy ?? null, op.policy));
+    if (classification === 'loosen') {
+      throw new AppError(422, 'POLICY_LOOSENING', 'set_creation_policy accepts tightening only', { diff });
+    }
+  }
+
+  const now = nowMs(deps);
+  const ledgerNowUnix = state.treasury.ledgerTimeUnix ?? Math.floor(now / 1000);
+
+  if (permissionless) {
+    const targetKind =
+      op.kind === 'treasury.execute_config'
+        ? 'config'
+        : op.kind === 'treasury.execute_price_policy'
+          ? 'price_policy'
+          : 'agent';
+    const targetAgent = op.kind === 'treasury.execute_agent' ? op.agent : undefined;
+    const pending = (state.treasury.proposals ?? []).find(
+      (p) =>
+        p.kind === targetKind &&
+        (!targetAgent || p.agent === targetAgent) &&
+        (p.status === 'pending' || p.status === 'executable'),
+    );
+    if (!pending) {
+      throw new AppError(404, 'NO_PENDING_PROPOSAL', `No pending ${targetKind} proposal found on-chain`);
+    }
+    if (ledgerNowUnix < pending.executableAtUnix) {
+      throw new AppError(422, 'TIMELOCK_ACTIVE', 'Proposal timelock has not elapsed yet', {
+        executableAt: pending.executableAt,
+        etaSeconds: pending.executableAtUnix - ledgerNowUnix,
+      });
+    }
+  }
 
   const checks: PreflightCheck[] = [];
+  if (classification) {
+    checks.push({
+      name: 'change_classification',
+      ok: true,
+      detail: `classified as ${classification}${classification === 'loosen' ? ' (timelocked)' : ' (immediate)'}`,
+      critical: false,
+    });
+  }
   const available = BigInt(state.treasury.availableCapitalRaw);
   if (op.kind === 'treasury.withdraw') {
     const amount = BigInt(op.amountRaw);
@@ -385,7 +623,6 @@ export async function prepareOperation(
     critical: true,
   });
 
-  const now = nowMs(deps);
   const expiresAt = new Date(now + config.TREASURY_OP_TTL_SECONDS * 1000);
   const row = await prisma.adminOperation.create({
     data: {
@@ -400,7 +637,7 @@ export async function prepareOperation(
       expiresAt,
     },
   });
-  await audit(row.id, 'PREPARED', requestedBy, { kind: op.kind, checks });
+  await audit(row.id, 'PREPARED', requestedBy, { kind: op.kind, checks, classification, diff });
 
   return {
     id: row.id,
@@ -414,17 +651,56 @@ export async function prepareOperation(
     checks,
     humanSummary: humanSummary(op),
     status: 'PREPARED',
+    ...(classification !== undefined ? { classification } : {}),
+    ...(diff !== undefined ? { diff } : {}),
+    ...(permissionless ? { permissionless: true } : {}),
   };
 }
+
+const CONTRACT_METHOD_OPS = new Set<AdminOp['kind']>([
+  'treasury.propose_config',
+  'treasury.execute_config',
+  'treasury.cancel_config',
+  'treasury.set_price_policy',
+  'treasury.execute_price_policy',
+  'treasury.cancel_price_policy',
+  'treasury.set_agent',
+  'treasury.execute_agent',
+  'treasury.cancel_agent',
+  'treasury.remove_agent',
+  'treasury.set_creation_policy',
+  'treasury.set_drawdown_config',
+]);
 
 async function buildUnsigned(
   op: AdminOp,
   sourceAccount: string,
-  adminAddress: string,
+  _adminAddress: string,
 ): Promise<{ xdr: string; hash: string; contractId: string; sourceAccount: string }> {
   const options = { timeoutInSeconds: config.TREASURY_OP_TTL_SECONDS };
   let tx: AssembledTransaction<unknown>;
   let contractId: string;
+
+  if (CONTRACT_METHOD_OPS.has(op.kind)) {
+    contractId = CONTRACTS.treasury;
+    const method = op.kind.replace('treasury.', '');
+    const contract = new Contract(contractId);
+    const acc = await rpcServer.getAccount(sourceAccount);
+    const builtTx = new TransactionBuilder(acc, {
+      fee: '100',
+      networkPassphrase: config.STELLAR_NETWORK_PASSPHRASE,
+    })
+      .addOperation(contract.call(method, ...encodeProposalScArgs(method, op as unknown as Record<string, unknown>)))
+      .setTimeout(options.timeoutInSeconds)
+      .build();
+    const prepared = await rpcServer.prepareTransaction(builtTx);
+    return {
+      xdr: prepared.toXDR(),
+      hash: prepared.hash().toString('hex'),
+      contractId,
+      sourceAccount,
+    };
+  }
 
   if (op.kind === 'market_core.set_paused') {
     contractId = CONTRACTS.marketCore;
@@ -446,7 +722,7 @@ async function buildUnsigned(
     if (op.kind === 'treasury.set_paused') tx = await client.set_paused({ paused: op.paused }, options);
     else if (op.kind === 'treasury.withdraw') tx = await client.withdraw({ to: op.to, amount: BigInt(op.amountRaw) }, options);
     else if (op.kind === 'treasury.deposit') tx = await client.deposit({ from: op.from, amount: BigInt(op.amountRaw) }, options);
-    else tx = await client.collect_market_fees({ market_id: BigInt(op.onChainMarketId) }, options);
+    else tx = await client.collect_market_fees({ market_id: BigInt((op as { onChainMarketId: string }).onChainMarketId) }, options);
   }
 
   const simError = (tx.simulation as { error?: string } | undefined)?.error;

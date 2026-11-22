@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { config } from '../config';
 import { secret } from '../config/secrets';
+import { getReceiptJwks } from '../controllers/receipt.controller';
 import { renderSep7StellarToml } from '../services/sep7.service';
 
 /**
@@ -36,6 +37,8 @@ export function createWellKnownRouter(resolveSecret?: () => string): Router {
       .setHeader('Cache-Control', 'public, max-age=300')
       .send(body);
   });
+
+  router.get('/oracledesk-receipt-keys.json', getReceiptJwks);
 
   return router;
 }

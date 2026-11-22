@@ -32,9 +32,11 @@ export class SocketThrottle {
   private activeTimers = new Map<string, unknown>();
   private lastEmittedAt = new Map<string, number>();
   private lastEmittedLedger = new Map<string, number>();
+  private lagging = false;
 
   private coalescedCount = 0;
   private droppedHistoricalCount = 0;
+  private catchupCount = 0;
   private emittedCounts: Record<string, number> = {};
 
   constructor(sink: Sink, opts: ThrottleOptions) {
@@ -53,6 +55,24 @@ export class SocketThrottle {
     payload: any,
     meta: { live: boolean; ledger: number; marketKey: string | null },
   ): void {
+    // The indexer marks an event live only when it is within
+    // SOCKET_LIVE_LEDGER_LAG of the RPC tip (#291). Every lagging -> live
+    // transition produces exactly one CATCHUP_COMPLETE for the clients.
+    if (!meta.live) {
+      this.lagging = true;
+    } else if (this.lagging) {
+      this.lagging = false;
+      if (event !== 'CATCHUP_COMPLETE') {
+        this.catchupCount++;
+        this.sink.emit(
+          'CATCHUP_COMPLETE',
+          { ledger: meta.ledger, live: true },
+          { volatile: false },
+        );
+        this.incrementEmitted('CATCHUP_COMPLETE');
+      }
+    }
+
     if (!meta.live && this.opts.dropHistorical && event !== 'CATCHUP_COMPLETE') {
       this.droppedHistoricalCount++;
       return;
@@ -166,11 +186,15 @@ export class SocketThrottle {
   public stats(): {
     coalesced: number;
     droppedHistorical: number;
+    catchup: number;
+    lagging: boolean;
     emitted: Record<string, number>;
   } {
     return {
       coalesced: this.coalescedCount,
       droppedHistorical: this.droppedHistoricalCount,
+      catchup: this.catchupCount,
+      lagging: this.lagging,
       emitted: { ...this.emittedCounts },
     };
   }
@@ -180,6 +204,48 @@ export interface SlowConsumerGuardOptions {
   warnBytes: number;
   dropBytes: number;
   checkMs: number;
+}
+
+function packetBytes(packet: unknown): number {
+  if (packet == null) return 0;
+  if (Buffer.isBuffer(packet)) return packet.length;
+  if (typeof packet === 'string') return Buffer.byteLength(packet);
+  if (typeof packet === 'object') {
+    const p = packet as { data?: unknown; length?: unknown };
+    if (typeof p.length === 'number') return p.length;
+    if (typeof p.data === 'string') return Buffer.byteLength(p.data);
+    if (Buffer.isBuffer(p.data)) return p.data.length;
+  }
+  return 0;
+}
+
+/**
+ * Real queued bytes for a socket: engine.io's own writeBuffer plus the
+ * WebSocket (or polling) transport buffer. `bufferedAmount` alone misses
+ * long-polling clients and packets still queued in engine.io (#291).
+ */
+export function socketBufferedBytes(socket: any): number {
+  let bytes = 0;
+  const conn = socket?.conn;
+  const seen = new Set<unknown>();
+  const addBuffer = (buffer: unknown) => {
+    if (!Array.isArray(buffer) || seen.has(buffer)) return;
+    seen.add(buffer);
+    for (const packet of buffer) bytes += packetBytes(packet);
+  };
+  try {
+    const transport = conn?.transport;
+    const raw = transport?.socket;
+    if (typeof raw?.bufferedAmount === 'number') bytes += raw.bufferedAmount;
+    if (typeof raw?.writableLength === 'number') bytes += raw.writableLength;
+    addBuffer(conn?.writeBuffer);
+    addBuffer(transport?.writeBuffer);
+    if (typeof conn?.writableLength === 'number') bytes += conn.writableLength;
+    if (typeof transport?.writableLength === 'number') bytes += transport.writableLength;
+  } catch {
+    /* a transport can disappear between checks */
+  }
+  return bytes;
 }
 
 export function attachSlowConsumerGuard(
@@ -200,16 +266,7 @@ export function attachSlowConsumerGuard(
 
       const sockets = socketMap.values ? Array.from(socketMap.values()) : Object.values(socketMap);
       for (const socket of sockets as any[]) {
-        let bufferedBytes = 0;
-        try {
-          if (socket.conn?.transport?.socket?.bufferedAmount !== undefined) {
-            bufferedBytes = socket.conn.transport.socket.bufferedAmount;
-          } else if (socket.conn?.writeBuffer?.length !== undefined) {
-            bufferedBytes = socket.conn.writeBuffer.length * 1024;
-          }
-        } catch {
-          bufferedBytes = 0;
-        }
+        const bufferedBytes = socketBufferedBytes(socket);
 
         if (bufferedBytes >= opts.dropBytes) {
           logger.warn(

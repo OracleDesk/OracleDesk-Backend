@@ -432,3 +432,44 @@ export async function getOnChainMarketState(req: Request, res: Response): Promis
     cached: result.cached,
   }, 200, await freshnessMeta(result.cached ? 'chain-cache' : 'rpc', result.ledger));
 }
+
+function sendProvenanceResponse(req: Request, res: Response, provenance: Awaited<ReturnType<typeof buildMarketProvenance>>): void {
+  const etag = `"${sha256Hex(`prov|${provenance.inputsDigest}|${provenance.asOfLedger ?? '0'}`)}"`;
+  res.setHeader('ETag', etag);
+  const ifNoneMatch = req.headers['if-none-match'];
+  if (ifNoneMatch && checkETagMatch(ifNoneMatch, etag)) {
+    res.status(304).end();
+    return;
+  }
+  sendSuccess(res, provenance);
+}
+
+/**
+ * GET /markets/:id/provenance (#307)
+ * Full end-to-end evidence chain from proposal to spec, creation tx and traces.
+ */
+export async function getMarketProvenance(req: Request, res: Response): Promise<void> {
+  const id = String(req.params.id);
+  const provenance = await buildMarketProvenance(id, { signal: req.signal });
+  sendProvenanceResponse(req, res, provenance);
+}
+
+/**
+ * GET /markets/on-chain/:onChainMarketId/provenance (#307)
+ * Same as GET /markets/:id/provenance, addressed by the market-core u64 id.
+ */
+export async function getMarketProvenanceByOnChainId(req: Request, res: Response): Promise<void> {
+  const raw = String(req.params.onChainMarketId);
+  const onChainMarketId = parseU64(raw);
+  if (onChainMarketId === null) {
+    sendError(res, 400, 'INVALID_MARKET_ID', 'onChainMarketId must be a decimal u64');
+    return;
+  }
+  const market = await prisma.market.findUnique({ where: { onChainMarketId }, select: { id: true } });
+  if (!market) {
+    sendError(res, 404, 'MARKET_NOT_FOUND', `No backend market for on-chain id ${raw}`);
+    return;
+  }
+  const provenance = await buildMarketProvenance(market.id, { signal: req.signal });
+  sendProvenanceResponse(req, res, provenance);
+}

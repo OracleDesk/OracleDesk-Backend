@@ -234,7 +234,7 @@ export const BANNED_TOPIC_PATTERNS: readonly RegExp[] = Object.freeze([
 ]);
 
 const HANDLE_RE = /(?:^|[\s(])@[A-Za-z0-9_]{2,}/;
-const URLISH_RE = /https?:\/\/|\bwww\.|\b[a-z0-9-]+\.(?:com|org|net|io|xyz|info|example)\b/i;
+export const URLISH_RE = /https?:\/\/|\bwww\.|\b[a-z0-9-]+\.(?:com|org|net|io|xyz|info|example)\b/i;
 const FENCE_RE = /```|`/;
 const CONTROL_RE = /[\p{Cc}\p{Cf}]/u;
 
