@@ -1,7 +1,6 @@
 import http from 'http';
 import { Server } from 'socket.io';
 import { Keypair } from '@stellar/stellar-sdk';
-import { createAdapter } from '@socket.io/redis-streams-adapter';
 import app from './app';
 import { config } from './config';
 import { initSecrets, startSecretRefresh } from './config/secrets';
@@ -15,6 +14,7 @@ import { startReportCron } from './cron/report.cron';
 import { startReconcileCron } from './cron/reconcile.cron';
 import { startMoneyAuditCron } from './cron/money-audit.cron';
 import { startPriceResolutionCron } from './cron/price-resolution.cron';
+import { startLlmCanaryCron } from './cron/llm-canary.cron';
 import { bootstrapAdminRbac, isAdminToken } from './middlewares/auth.middleware';
 import { startTraceAuditCron } from './cron/trace-audit.cron';
 import { startTracePublicationCron } from './cron/trace-publication.cron';
@@ -22,6 +22,7 @@ import { startPaymentIntentCron } from './cron/payment-intent.cron';
 import { startOpsAlertCron } from './cron/ops-alerts.cron';
 import { startEventListener } from './services/indexer.service';
 import { gateDecision, runSpecCompatGate } from './services/stellar/spec-compat';
+import { startSpecMonitor } from './services/stellar/spec-monitor';
 import { startOutboxWorker } from './services/stellar/outbox';
 import { getChannelPool } from './services/stellar/channels';
 import { resumeIncomplete } from './services/market-saga.service';
@@ -40,6 +41,7 @@ import {
   recordSocketRejection,
 } from './lib/socket-limits';
 import { SocketThrottle, attachSlowConsumerGuard } from './lib/socket-throttle';
+import { createSocketStreamAdapter, startSocketStreamMonitor, type SocketStreamMonitor } from './lib/socket-stream';
 import { planForRole, startProbeServer } from './lib/process-role';
 
 let stopEventListener: (() => void) | null = null;
@@ -47,6 +49,8 @@ let stopFanout: (() => Promise<void>) | null = null;
 let stopSecretRefresh: (() => void) | null = null;
 let throttle: SocketThrottle | null = null;
 let stopSlowGuard: (() => void) | null = null;
+let stopStreamMonitor: (() => void) | null = null;
+let closeStreamAdapter: (() => Promise<void>) | null = null;
 let stopOutboxWorker: (() => void) | null = null;
 let stopOpsAlerts: (() => void) | null = null;
 
@@ -137,6 +141,7 @@ async function bootstrap(): Promise<void> {
   if (specCompat && gateDecision(specCompat, specCompat.mode) === 'refuse') {
     process.exit(1);
   }
+  stopSpecMonitor = startSpecMonitor();
 
   // 1c. Transaction outbox recovery (#35): resolve whatever a previous process
   // left in flight before the indexer and crons start issuing new writes, then
@@ -229,8 +234,21 @@ async function bootstrap(): Promise<void> {
     io.use(socketAuthMiddleware());
     attachSessionLifecycle(io);
     setRealtime(io);
+    const activeIo = io;
+    let streamMonitor: SocketStreamMonitor | undefined;
     if (config.EVENT_BUS_ENABLED) {
-      io.adapter(createAdapter(getRedis(), { streamName: 'oracledesk:socket.io', blockTimeInMs: 1000 }));
+      const streamAdapter = createSocketStreamAdapter();
+      streamMonitor = streamAdapter.monitor;
+      closeStreamAdapter = streamAdapter.close;
+      io.adapter(streamAdapter.adapter);
+      stopStreamMonitor = startSocketStreamMonitor(streamAdapter.monitor, {
+        onResync: (snapshot) => {
+          activeIo.emit('RESYNC_REQUIRED', {
+            reason: 'STREAM_GAP',
+            offset: snapshot.offset,
+          });
+        },
+      });
     } else {
       logger.warn('EVENT_BUS_ENABLED=false: in-process event bus; socket events reach this instance only');
     }
@@ -243,8 +261,7 @@ async function bootstrap(): Promise<void> {
     });
     stopSlowGuard = slowGuard.stop;
 
-    // Socket throttle (Issue #96)
-    const activeIo = io;
+    // Socket throttle (Issue #96, #291)
     throttle = new SocketThrottle(
       {
         emit: (event, payload, opts) => {
@@ -266,7 +283,9 @@ async function bootstrap(): Promise<void> {
     );
 
     if (rolePlan.startFanout) {
-      stopFanout = config.EVENT_BUS_ENABLED ? startFanout(bus, io) : startLocalFanout(bus, io);
+      stopFanout = config.EVENT_BUS_ENABLED
+        ? startFanout(bus, io, { throttle, monitor: streamMonitor })
+        : startLocalFanout(bus, io, { throttle, monitor: streamMonitor });
     }
 
     // Make io accessible via app
@@ -318,6 +337,8 @@ async function bootstrap(): Promise<void> {
     startMoneyAuditCron();
     // Price-mode reveal + resolve loop (#90).
     startPriceResolutionCron();
+    // Daily LLM model-drift canary (#296).
+    startLlmCanaryCron();
     // Operational alerts (#226): one evaluator per tick via an advisory lock.
     stopOpsAlerts = startOpsAlertCron();
   }
@@ -334,11 +355,15 @@ async function bootstrap(): Promise<void> {
 
   // ─── Shutdown coordinator registrations (#264) ───────────────────────────
   onShutdown('stop-intake', 'event-listener', async () => { stopEventListener?.(); }, 2_000);
+  onShutdown('stop-producers', 'crons', async () => { stopAllScheduledJobs(); }, 1_000);
+  onShutdown('stop-producers', 'spec-monitor', async () => { stopSpecMonitor?.(); }, 1_000);
   onShutdown('stop-producers', 'outbox-worker', async () => { stopOutboxWorker?.(); }, 3_000);
   onShutdown('stop-producers', 'fanout', async () => { if (stopFanout) await stopFanout(); }, 5_000);
   onShutdown('stop-producers', 'secret-refresh', async () => { stopSecretRefresh?.(); }, 1_000);
   onShutdown('stop-producers', 'ops-alerts', async () => { stopOpsAlerts?.(); }, 1_000);
+  onShutdown('stop-producers', 'socket-stream-monitor', async () => { stopStreamMonitor?.(); }, 1_000);
   onShutdown('release-leases', 'redis-waiters', async () => { await releaseAllWaiters(); }, 2_000);
+  onShutdown('close-transports', 'socket-stream-adapter', async () => { if (closeStreamAdapter) await closeStreamAdapter(); }, 2_000);
   onShutdown('close-transports', 'prisma', async () => { await prisma.$disconnect(); }, 5_000);
   onShutdown('close-transports', 'redis', async () => { await closeRedis(); }, 3_000);
 

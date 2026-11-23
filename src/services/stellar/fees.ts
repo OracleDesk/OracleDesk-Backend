@@ -1,7 +1,9 @@
-import { rpc } from '@stellar/stellar-sdk';
 import { config } from '../../config';
 import { logger } from '../../lib/logger';
+import { prisma as defaultPrisma } from '../../lib/prisma';
+import { AlertService } from '../alerts.service';
 import { rpcServer } from './clients';
+import { withTimeout } from '../../lib/resilience';
 
 export type OperationClass = 'market_create' | 'trade' | 'trace_publish' | 'maintenance';
 
@@ -62,6 +64,22 @@ export const DEFAULT_FEE_POLICIES: Record<OperationClass, FeePolicy> = {
   },
 };
 
+export const BUDGET_WARNING_RATIO = 0.8;
+const DEFAULT_OBSERVED_SAMPLE_SIZE = 100;
+
+export interface ObservedClassMetrics {
+  sampleCount: number;
+  /** Mean ratio `(nonRefundable + refundable) / resourceFee` across the last N receipts. */
+  observedResourceRatio: number | null;
+  /** 95th percentile of `nonRefundable + refundable` across the last N receipts. */
+  p95ChargedResource: bigint | null;
+  /** `p95ChargedResource / budget`, or null if no samples. */
+  budgetUtilization: number | null;
+  /** True when `p95ChargedResource > 0.8 * budget`. */
+  warning: boolean;
+  refreshedAt: Date | null;
+}
+
 export interface FeeOracleSnapshot {
   networkPassphrase: string;
   rpcUrl: string;
@@ -75,10 +93,42 @@ export interface FeeOracleSnapshot {
     cap: string;
     budget: string;
   }>;
+  observed: Record<OperationClass, {
+    sampleCount: number;
+    observedResourceRatio: number | null;
+    p95ChargedResource: string | null;
+    budgetUtilization: number | null;
+    warning: boolean;
+    refreshedAt: Date | null;
+  }>;
 }
 
 export interface FeeStatsSource {
   getFeeStats(): Promise<any>;
+}
+
+interface ChainFeeReceiptRow {
+  resourceFee: bigint;
+  nonRefundableCharged: bigint | null;
+  refundableCharged: bigint | null;
+}
+
+function emptyObserved(): ObservedClassMetrics {
+  return {
+    sampleCount: 0,
+    observedResourceRatio: null,
+    p95ChargedResource: null,
+    budgetUtilization: null,
+    warning: false,
+    refreshedAt: null,
+  };
+}
+
+/** Nearest-rank p95 over a non-empty BigInt array. */
+function p95BigInt(values: bigint[]): bigint {
+  const sorted = [...values].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * 0.95) - 1));
+  return sorted[idx];
 }
 
 export class FeeOracle {
@@ -88,6 +138,7 @@ export class FeeOracle {
   private lastFetchedAt: number | null = null;
   private inFlightPromise: Promise<any> | null = null;
   private feeStatsSource: FeeStatsSource;
+  private observedMetrics: Record<OperationClass, ObservedClassMetrics>;
 
   constructor(
     private networkPassphrase: string = config.STELLAR_NETWORK_PASSPHRASE,
@@ -99,6 +150,12 @@ export class FeeOracle {
     this.cacheKey = `${this.networkPassphrase}:${this.rpcUrl}`;
     this.feeStatsSource = customSource ?? rpcServer;
     this.policies = this.loadPolicies();
+    this.observedMetrics = {
+      market_create: emptyObserved(),
+      trade: emptyObserved(),
+      trace_publish: emptyObserved(),
+      maintenance: emptyObserved(),
+    };
   }
 
   public setSource(source: FeeStatsSource) {
@@ -113,6 +170,124 @@ export class FeeOracle {
 
   public getPolicies(): Record<OperationClass, FeePolicy> {
     return this.policies;
+  }
+
+  /** Cached charged-to-simulated resource ratio from the last N receipts (#308). */
+  public observedResourceRatio(opClass: OperationClass): number | null {
+    return this.observedMetrics[opClass]?.observedResourceRatio ?? null;
+  }
+
+  /** Cached p95 charged resource fee (nonRefundable + refundable) from the last N receipts (#308). */
+  public p95ChargedResource(opClass: OperationClass): bigint | null {
+    return this.observedMetrics[opClass]?.p95ChargedResource ?? null;
+  }
+
+  /**
+   * Recomputes `observedResourceRatio` and `p95ChargedResource` per class from
+   * the last `sampleSize` RECEIPT rows in `chain_fees` (#308).
+   *
+   * When `p95ChargedResource > 0.8 × budget`, logs a warning and raises a WARN
+   * alert via `AlertService`. Never modifies configured budgets automatically.
+   */
+  public async refreshObservedMetrics(opts: {
+    sampleSize?: number;
+    prisma?: typeof defaultPrisma;
+    alerts?: AlertService;
+    now?: Date;
+  } = {}): Promise<Record<OperationClass, ObservedClassMetrics>> {
+    const db = opts.prisma ?? defaultPrisma;
+    const sampleSize = opts.sampleSize ?? DEFAULT_OBSERVED_SAMPLE_SIZE;
+    const now = opts.now ?? new Date();
+    const utcDay = now.toISOString().slice(0, 10);
+    const chainFeeModel = (db as unknown as {
+      chainFee: {
+        findMany(args: unknown): Promise<ChainFeeReceiptRow[]>;
+      };
+    }).chainFee;
+
+    for (const opClass of OPERATION_CLASSES) {
+      const rows = await chainFeeModel.findMany({
+        where: {
+          opClass,
+          source: 'RECEIPT',
+          nonRefundableCharged: { not: null },
+          refundableCharged: { not: null },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: sampleSize,
+        select: {
+          resourceFee: true,
+          nonRefundableCharged: true,
+          refundableCharged: true,
+        },
+      });
+
+      const chargedResources: bigint[] = [];
+      let ratioSum = 0;
+      let ratioCount = 0;
+
+      for (const r of rows) {
+        if (r.nonRefundableCharged === null || r.refundableCharged === null) continue;
+        const charged = BigInt(r.nonRefundableCharged) + BigInt(r.refundableCharged);
+        chargedResources.push(charged);
+        const estimated = BigInt(r.resourceFee);
+        if (estimated > 0n) {
+          ratioSum += Number(charged) / Number(estimated);
+          ratioCount++;
+        }
+      }
+
+      if (chargedResources.length === 0) {
+        this.observedMetrics[opClass] = { ...emptyObserved(), refreshedAt: now };
+        continue;
+      }
+
+      const p95 = p95BigInt(chargedResources);
+      const ratio = ratioCount > 0 ? ratioSum / ratioCount : null;
+      const budget = this.policies[opClass].budget;
+      const budgetUtilization = budget > 0n ? Number(p95) / Number(budget) : null;
+      const warning = budget > 0n && p95 * 10n > budget * 8n;
+
+      this.observedMetrics[opClass] = {
+        sampleCount: chargedResources.length,
+        observedResourceRatio: ratio,
+        p95ChargedResource: p95,
+        budgetUtilization,
+        warning,
+        refreshedAt: now,
+      };
+
+      if (warning) {
+        logger.warn(
+          {
+            opClass,
+            p95ChargedResource: p95.toString(),
+            budget: budget.toString(),
+            budgetUtilization,
+            observedResourceRatio: ratio,
+          },
+          'Fee oracle: p95 charged resource fee exceeds 80% of budget (adjust FEE_POLICY_JSON)',
+        );
+        const alerts = opts.alerts ?? new AlertService();
+        await alerts
+          .send(`fee_budget:${opClass}:${utcDay}`, {
+            kind: 'fee_budget',
+            level: 'WARN',
+            title: `Soroban resource fee p95 approaching budget for ${opClass}`,
+            opClass,
+            p95ChargedResource: p95.toString(),
+            budget: budget.toString(),
+            utilizationRatio: budgetUtilization ?? BUDGET_WARNING_RATIO,
+            observedResourceRatio: ratio,
+            detail: `p95 charged resource fee (${p95.toString()} stroops) exceeds 80% of budget (${budget.toString()} stroops). Tune FEE_POLICY_JSON if needed.`,
+          })
+          .catch((err) => {
+            logger.warn({ opClass, err: err instanceof Error ? err.message : String(err) }, 'Fee oracle: failed to send budget warning alert');
+          });
+      }
+    }
+
+    return { ...this.observedMetrics };
   }
 
   private loadPolicies(): Record<OperationClass, FeePolicy> {
@@ -158,7 +333,7 @@ export class FeeOracle {
 
     this.inFlightPromise = (async () => {
       try {
-        const stats = await this.feeStatsSource.getFeeStats();
+        const stats = await withTimeout('rpc-read', () => this.feeStatsSource.getFeeStats());
         this.lastStats = stats;
         this.lastFetchedAt = Date.now();
         return stats;
@@ -238,6 +413,22 @@ export class FeeOracle {
             budget: v.budget.toString(),
           },
         ]),
+      ) as any,
+      observed: Object.fromEntries(
+        OPERATION_CLASSES.map((cls) => {
+          const obs = this.observedMetrics[cls];
+          return [
+            cls,
+            {
+              sampleCount: obs.sampleCount,
+              observedResourceRatio: obs.observedResourceRatio,
+              p95ChargedResource: obs.p95ChargedResource !== null ? obs.p95ChargedResource.toString() : null,
+              budgetUtilization: obs.budgetUtilization,
+              warning: obs.warning,
+              refreshedAt: obs.refreshedAt,
+            },
+          ];
+        }),
       ) as any,
     };
   }

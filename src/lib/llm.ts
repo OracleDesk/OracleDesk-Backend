@@ -25,7 +25,7 @@ import type OpenAI from 'openai';
 import { AppError } from '../middlewares/error.middleware';
 import { logger } from './logger';
 import { asLlmError, createRouter } from './llm/router';
-import { policies } from './llm/policy';
+import { policies, getEffectiveChain } from './llm/policy';
 import { anthropicProvider, geminiProvider, openaiProvider } from './llm/providers';
 import { getAnthropicClient, setAnthropicClient } from './llm/providers/anthropic';
 import { mapGeminiError } from './llm/providers/gemini';
@@ -350,6 +350,7 @@ export async function callLLMStructured<T>(
     source: 'llm',
     provider: served.provider,
     model: served.model,
+    ...(served.servedModel ? { servedModel: served.servedModel } : {}),
     promptId: prompt.id,
     promptVersion: prompt.version,
     promptHash: prompt.hash,
@@ -392,7 +393,7 @@ export async function callLLMStructured<T>(
     const task = opts.task ?? 'generic_json';
     const ctx = opts.ctx ?? DEFAULT_CALL_CONTEXT;
     const calls = { n: 0 };
-    const chain: ModelSpec[] = policies[task] ?? [];
+    const chain: ModelSpec[] = getEffectiveChain(task, policies);
     const route: LlmRoute = { task, chain: [] };
     const decide = (model: ModelSpec, decision: RouteDecision) =>
       route.chain.push({ provider: model.provider, model: model.model, decision });

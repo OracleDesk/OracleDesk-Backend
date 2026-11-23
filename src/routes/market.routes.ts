@@ -4,12 +4,14 @@ import {
   getMarket,
   getMarketByOnChainId,
   getOnChainMarketState,
+  getMarketProvenance,
+  getMarketProvenanceByOnChainId,
   triggerMarketGeneration,
   getMarketGenerationStatus,
   buildMarketsWhere,
 } from '../controllers/market.controller';
 import { requireAuth, requirePermission } from '../middlewares/auth.middleware';
-import { generateLimiter } from '../middlewares/rate-limit.middleware';
+import { generateLimiter, provenanceLimiter } from '../middlewares/rate-limit.middleware';
 import { idempotent } from '../middlewares/idempotency.middleware';
 import { cachePolicy, validator, noStore } from '../middlewares/cache.middleware';
 import { listMarketsSchema } from '../validators/market.validator';
@@ -73,6 +75,12 @@ router.get(
   listMarkets,
 );
 
+router.get(
+  '/on-chain/:onChainMarketId/provenance',
+  provenanceLimiter,
+  cachePolicy({ kind: 'shared', maxAge: 60, swr: 0 }),
+  getMarketProvenanceByOnChainId,
+);
 router.get('/on-chain/:onChainMarketId', marketDetailPolicy, marketDetailValidator, getMarketByOnChainId);
 router.get(
   '/on-chain/:onChainMarketId/state',
@@ -86,6 +94,12 @@ router.get(
 router.post('/generate', generateLimiter, requireAuth, requirePermission('markets.generate'), idempotent({ required: true }), triggerMarketGeneration);
 router.get('/generation-status/:jobId', requireAuth, noStore(), getMarketGenerationStatus);
 
+router.get(
+  '/:id/provenance',
+  provenanceLimiter,
+  cachePolicy({ kind: 'shared', maxAge: 60, swr: 0 }),
+  getMarketProvenance,
+);
 router.get('/:id', marketDetailPolicy, marketDetailValidator, getMarket);
 
 export default router;

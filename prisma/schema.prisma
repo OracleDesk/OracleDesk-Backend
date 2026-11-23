@@ -138,6 +138,15 @@ enum TraceAuditStatus {
   ARCHIVED
 }
 
+/// Governance verdict returned by reasoning-registry `trace_verdict` (#306).
+enum TraceVerdictKind {
+  VALID
+  HASH_MISMATCH
+  FLAGGED
+  AGENT_REVOKED_AFTER
+  UNKNOWN
+}
+
 enum AgentType {
   MARKET_MAKER
   TRADER
@@ -253,6 +262,7 @@ model Market {
   copyTrades     CopyTrade[]
   agentLogs      AgentLog[]
   creationAttempt MarketCreationAttempt?
+  resolutionSteps MarketResolutionStep[]
 
   @@index([status])
   @@index([category])
@@ -262,6 +272,34 @@ model Market {
   @@index([lastReconciledAt])
   @@index([resolutionSpec], type: Gin)
   @@map("markets")
+}
+
+/// Persisted per-market resolver step state for outbox-tracked writes (#297).
+model MarketResolutionStep {
+  id            String    @id @default(uuid())
+  marketId      String
+  /// PRICE_SPEC | RESOLVE_PRICE | SIGNER_SPEC | ATTEST | FINALIZE_SIGNERS
+  step          String
+  /// PENDING | IN_FLIGHT | LANDED | LANDED_EXTERNALLY | FAILED | ESCALATED
+  status        String    @default("PENDING")
+  attempts      Int       @default(0)
+  nextAttemptAt DateTime?
+  escalatedAt   DateTime?
+  txHash        String?
+  ledger        Int?
+  outcome       String?
+  failureCode   String?
+  /// AGENT | EXTERNAL
+  landedBy      String?
+  lastOutboxId  String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  market Market @relation(fields: [marketId], references: [id], onDelete: Cascade)
+
+  @@unique([marketId, step])
+  @@index([step, status, nextAttemptAt])
+  @@map("market_resolution_steps")
 }
 
 // Background job for market generation process, tracking status and errors
@@ -284,6 +322,7 @@ model MarketGenerationJob {
 model Trade {
   id           String         @id @default(uuid())
   marketId     String
+  traceId      String?
   direction    TradeDirection
   status       TradeStatus    @default(PENDING)
   /// CHECK: trades_amount_nonneg (amount >= 0)
@@ -301,7 +340,8 @@ model Trade {
   createdAt    DateTime       @default(now())
   updatedAt    DateTime       @updatedAt
 
-  market     Market      @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  market     Market          @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  trace      ReasoningTrace? @relation(fields: [traceId], references: [id], onDelete: SetNull)
   position   Position?
   copyTrades CopyTrade[]
 
@@ -316,6 +356,7 @@ model Position {
   id           String         @id @default(uuid())
   marketId     String
   tradeId      String         @unique
+  traceId      String?
   direction    TradeDirection
   status       PositionStatus @default(OPEN)
   /// CHECK: positions_entry_price_range (entryPrice >= 0 AND entryPrice <= 1)
@@ -350,14 +391,40 @@ model Position {
   createdAt    DateTime       @default(now())
   updatedAt    DateTime       @updatedAt
 
-  market      Market  @relation(fields: [marketId], references: [id], onDelete: Cascade)
-  hedgeMarket Market? @relation("MarketHedgePositions", fields: [hedgeMarketId], references: [id], onDelete: SetNull)
-  trade       Trade   @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  market      Market          @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  hedgeMarket Market?         @relation("MarketHedgePositions", fields: [hedgeMarketId], references: [id], onDelete: SetNull)
+  trade       Trade           @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  trace       ReasoningTrace? @relation(fields: [traceId], references: [id], onDelete: SetNull)
   exits       PositionExit[]
 
   @@index([marketId])
   @@index([status])
   @@map("positions")
+}
+
+/// Machine-checkable hedge predicates attached to an open position (#302).
+model PositionPredicate {
+  id               String    @id @default(uuid())
+  positionId       String
+  traceId          String?
+  predicateId      String
+  kind             String
+  action           String
+  predicate        Json
+  /// ACTIVE | TRIGGERED | CANCELLED
+  status           String    @default("ACTIVE")
+  evaluatedAt      DateTime? @db.Timestamptz(3)
+  triggeredAt      DateTime? @db.Timestamptz(3)
+  triggerCycleId   String?
+  evaluationResult Json?
+  createdAt        DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime  @updatedAt @db.Timestamptz(3)
+
+  position Position @relation(fields: [positionId], references: [id], onDelete: Cascade)
+
+  @@unique([positionId, predicateId])
+  @@index([status])
+  @@map("position_predicates")
 }
 
 /// One attempt to sell shares of a position through treasury.agent_sell (#77).
@@ -369,6 +436,11 @@ model PositionExit {
   sharesSoldRaw    Decimal  @default(0) @db.Decimal(39, 0)
   collateralOutRaw Decimal  @db.Decimal(39, 0)
   maxSharesInRaw   Decimal  @db.Decimal(39, 0)
+  feeRaw           Decimal? @db.Decimal(39, 0)
+  reserveYesRaw    Decimal? @db.Decimal(39, 0)
+  reserveNoRaw     Decimal? @db.Decimal(39, 0)
+  fillLedger       Int?
+  fillMismatch     Json?
   /// collateralOut / sharesSold, for display.
   effectivePrice   Float?
   txHash           String?
@@ -385,6 +457,49 @@ model PositionExit {
 
   @@index([positionId])
   @@map("position_exits")
+}
+
+/// Execution quality & implementation shortfall per agent buy/sell (#295).
+model ExecutionReport {
+  id                   String         @id @default(uuid())
+  /// BUY | SELL
+  kind                 String
+  tradeId              String?        @unique
+  positionExitId       String?        @unique
+  marketId             String
+  direction            TradeDirection
+  decisionLedger       Int?
+  decisionMidBps       Int?
+  slippageBoundBps     Int
+  /// Array of { attempt, quotedAt, quoteMidBps?, quotedOutRaw, boundRaw, quotedPriceBps }
+  quotes               Json           @default("[]")
+  quoteCount           Int            @default(0)
+  /// PENDING | CONFIRMED | SLIPPAGE_EXCEEDED | FAILED
+  status               String         @default("PENDING")
+  failureCode          String?
+  landedTxHash         String?
+  fillLedger           Int?
+  ledgerDelay          Int?
+  fillCollateralRaw    Decimal?       @db.Decimal(39, 0)
+  fillSharesRaw        Decimal?       @db.Decimal(39, 0)
+  fillFeeRaw           Decimal?       @db.Decimal(39, 0)
+  fillPriceBps         Int?
+  postReserveYesRaw    Decimal?       @db.Decimal(39, 0)
+  postReserveNoRaw     Decimal?       @db.Decimal(39, 0)
+  /// THIN | MEDIUM | DEEP | UNKNOWN
+  liquidityBucket      String?
+  delayBps             Int?
+  impactBps            Int?
+  feeBps               Int?
+  residualBps          Int?
+  totalShortfallBps    Int?
+  createdAt            DateTime       @default(now()) @db.Timestamptz(3)
+  updatedAt            DateTime       @updatedAt @db.Timestamptz(3)
+
+  @@index([marketId, createdAt])
+  @@index([status, liquidityBucket])
+  @@index([landedTxHash])
+  @@map("execution_reports")
 }
 
 enum AgentControlScope {
@@ -441,6 +556,8 @@ model ReasoningTrace {
   betFraction         Float?
   betSizeUsdc         Float?
   hedgeConditions     Json?             // string[]
+  /// Machine-checkable hedge predicates (#302). Null on older traces.
+  hedgePredicates     Json?
   /// TraceProvenance embedded in the pinned payload (#66). Null for older traces.
   provenance          Json?
   agentWallet         String?
@@ -466,6 +583,8 @@ model ReasoningTrace {
   updatedAt           DateTime          @updatedAt
 
   market        Market         @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  trades        Trade[]
+  positions     Position[]
   copyTrades    CopyTrade[]
   subscriptions Subscription[]
   paymentEvents PaymentEvent[]
@@ -478,6 +597,8 @@ model ReasoningTrace {
   @@index([traceHash])
   @@index([createdAt])
   @@index([marketId, createdAt])
+  @@index([verdict, verdictCheckedAt])
+  @@index([agentWallet])
   /// Retention (#73) keeps signals cited by a trace: `sourcesUsed @> [{"signalId": …}]`.
   @@index([sourcesUsed(ops: JsonbPathOps)], type: Gin)
   @@map("reasoning_traces")
@@ -837,6 +958,62 @@ model PaymentEvent {
 
 }
 
+enum PaymentClaimChannel {
+  LEGACY_UNLOCK
+  PAYMENT_INTENT
+  X402_SETTLEMENT
+  REFUND
+  BACKFILL
+}
+
+model PaymentClaim {
+  id                   String              @id @default(uuid())
+  txHash               String
+  opIndex              Int                 @default(0)
+  eventIndex           Int                 @default(0)
+  channel              PaymentClaimChannel
+  userId               String?
+  amountRaw            String
+  paymentEventId       String?
+  x402SettlementTxHash String?
+  createdAt            DateTime            @default(now()) @db.Timestamptz(3)
+
+  @@unique([txHash, opIndex, eventIndex])
+  @@index([txHash])
+  @@index([userId])
+  @@map("payment_claims")
+}
+
+/// Signed, verifiable purchase receipt (#313)
+model Receipt {
+  id             String             @id @default(uuid())
+  receiptId      String             @unique
+  version        Int                @default(1)
+  userId         String
+  subscriptionId String?            @unique
+  paymentEventId String?            @unique
+  type           SubscriptionType
+  traceId        String?
+  txHash         String
+  ledger         Int
+  payer          String
+  recipient      String
+  amountRaw      String
+  currency       SettlementCurrency @default(USDC)
+  priceVersion   String
+  keyId          String
+  document       Json
+  jws            String
+  redeemedAt     DateTime?          @db.Timestamptz(3)
+  createdAt      DateTime           @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([txHash])
+  @@map("receipts")
+}
+
 // User-defined spending approvals for nanopayment trace access
 model SpendingAllowance {
   id            String             @id @default(uuid())
@@ -1144,6 +1321,8 @@ model ChainTransaction {
   id String @id @default(uuid())
   /// Completion-handler key: market.create | trade.buy | trade.sell | trace.publish | <contract>.<method>.
   kind   String
+  /// Fee operation class: market_create | trade | trace_publish | maintenance (#308).
+  opClass String? @map("op_class")
   /// Domain row the write belongs to (Market.id | Trade.id | PositionExit.id | ReasoningTrace.id).
   refId  String?
   contract String?
@@ -1191,17 +1370,32 @@ model ChainTransaction {
   @@map("chain_transactions")
 }
 
-/// On-chain fees recorded per transaction (#39).
+/// On-chain fees recorded per transaction (#39, #308).
 model ChainFee {
-  txHash       String   @id @map("tx_hash")
-  opClass      String   @map("op_class")
-  inclusionFee BigInt   @map("inclusion_fee")
-  resourceFee  BigInt   @map("resource_fee")
-  totalFee     BigInt   @map("total_fee")
-  feeCharged   BigInt?  @map("fee_charged")
-  createdAt    DateTime @default(now()) @map("created_at")
+  txHash               String   @id @map("tx_hash")
+  opClass              String   @map("op_class")
+  inclusionFee         BigInt   @map("inclusion_fee")
+  resourceFee          BigInt   @map("resource_fee")
+  totalFee             BigInt   @map("total_fee")
+  feeCharged           BigInt?  @map("fee_charged")
+  outboxId             String?  @map("outbox_id")
+  landedHash           String?  @map("landed_hash")
+  payer                String?
+  feeBumped            Boolean  @default(false) @map("fee_bumped")
+  success              Boolean?
+  innerFeeCharged      BigInt?  @map("inner_fee_charged")
+  nonRefundableCharged BigInt?  @map("non_refundable_charged")
+  refundableCharged    BigInt?  @map("refundable_charged")
+  rentCharged          BigInt?  @map("rent_charged")
+  declaredFee          BigInt?  @map("declared_fee")
+  ledger               Int?
+  /// ESTIMATE | RECEIPT
+  source               String   @default("ESTIMATE")
+  createdAt            DateTime @default(now()) @map("created_at")
 
   @@index([opClass, createdAt])
+  @@index([payer, createdAt])
+  @@index([outboxId])
   @@map("chain_fees")
 }
 
@@ -1403,7 +1597,7 @@ model DisputeReview {
   @@map("dispute_reviews")
 }
 
-/// One alert sent (or attempted) for a review, deduplicated by `dedupeKey`.
+/// One alert sent (or attempted) for a subject, deduplicated by `dedupeKey`.
 model AlertDelivery {
   id        String    @id @default(uuid())
   reviewId  String
@@ -1419,6 +1613,7 @@ model AlertDelivery {
   error     String?
 
   @@index([reviewId])
+  @@index([subjectId])
   @@map("alert_deliveries")
 }
 
@@ -1464,4 +1659,65 @@ model IpfsPinRef {
   @@index([ownerKind, ownerId])
   @@index([state])
   @@map("ipfs_pin_refs")
+}
+
+/// Statistical baseline per (task, provider, model, promptVersion) for canary drift detection (#296).
+model LlmCanaryBaseline {
+  id            String   @id @default(uuid())
+  task          String
+  provider      String
+  model         String
+  promptVersion Int
+  sampleCount   Int
+  passCount     Int
+  passRate      Float
+  meanScore     Float
+  scoreStdDev   Float    @default(0)
+  metricsJson   Json     @default("{}")
+  createdAt     DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime @updatedAt @db.Timestamptz(3)
+
+  @@unique([task, provider, model, promptVersion])
+  @@map("llm_canary_baselines")
+}
+
+/// One daily canary evaluation run for a (task, provider, model) chain entry (#296).
+model LlmCanaryRun {
+  id             String   @id @default(uuid())
+  task           String
+  provider       String
+  model          String
+  servedModel    String?
+  promptVersion  Int
+  sampleCount    Int
+  passCount      Int
+  passRate       Float
+  meanScore      Float
+  pValue         Float?
+  drifted        Boolean  @default(false)
+  driftReason    String?
+  budgetSpentUsd Float    @default(0)
+  details        Json     @default("{}")
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([task, model, createdAt])
+  @@map("llm_canary_runs")
+}
+
+/// Time-limited model demotion (by canary auto-demotion or admin override) (#296).
+model LlmModelDemotion {
+  id        String   @id @default(uuid())
+  task      String
+  provider  String
+  model     String
+  reason    String
+  /// canary | admin
+  demotedBy String   @default("canary")
+  expiresAt DateTime @db.Timestamptz(3)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  @@index([task, active, expiresAt])
+  @@map("llm_model_demotions")
 }

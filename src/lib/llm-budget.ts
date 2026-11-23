@@ -1,7 +1,8 @@
 /**
- * Shared LLM guards (#71): rate limiting, circuit breaking and daily budgets
- * that hold across every API instance and worker, because the state lives in
- * Redis (see llm-budget-store.ts for the atomic scripts).
+ * Shared LLM guards (#71, #327): per-purpose-class daily token/cost budgets
+ * (guaranteed shares, hard caps, borrowing), per-provider rate limiting with
+ * protected bucket slices for time-critical dispute reviews, deadline-aware
+ * acquisition, and tier-fair circuit breaking across every instance.
  *
  *   const lease = await acquire('anthropic', ctx, estimate);
  *   ... call the provider ...
@@ -10,9 +11,6 @@
  * `withLease` wraps that pair. Reservations are released in `record`, also on
  * errors and responses without usage metadata; a lease that is never recorded
  * is reclaimed by the next `acquire` once its TTL passes.
- *
- * Budgets are counted per UTC day, independent of checkDailyDrawdown's local
- * midnight. Cost is an estimate from LLM_PRICES, not an invoice.
  */
 import { randomUUID } from 'node:crypto';
 import { config } from '../config';
@@ -21,27 +19,75 @@ import { logger } from './logger';
 import { getRedis } from './redis';
 import { nowMs, sleep as clockSleep } from './clock';
 import {
+  DEFAULT_CLASS_POLICY,
   MemoryGuardStore,
+  PROVIDERS,
+  PURPOSE_CLASSES,
   RedisGuardStore,
+  checkClassAdmission,
   type AcquireResult,
   type BreakerState,
+  type BudgetRejectReason,
   type CallOutcome,
+  type ClassPolicy,
+  type ClassPolicyMap,
+  type ClassUsage,
   type LlmGuardStore,
   type Priority,
   type Provider,
+  type PurposeClass,
   type UsageSnapshot,
 } from './llm-budget-store';
 
-export type { BreakerState, CallOutcome, LlmGuardStore, Priority, Provider, UsageSnapshot };
-export { MemoryGuardStore, RedisGuardStore };
+export type {
+  BreakerState,
+  BudgetRejectReason,
+  CallOutcome,
+  ClassPolicy,
+  ClassPolicyMap,
+  ClassUsage,
+  LlmGuardStore,
+  Priority,
+  Provider,
+  PurposeClass,
+  UsageSnapshot,
+};
+export {
+  DEFAULT_CLASS_POLICY,
+  MemoryGuardStore,
+  PROVIDERS,
+  PURPOSE_CLASSES,
+  RedisGuardStore,
+  checkClassAdmission,
+};
 
 export interface CallContext {
-  /** e.g. market_generation, trace_hedge, admin_generation */
+  /** e.g. dispute_review, market_generation, forecast, trace_hedge, admin_generation */
   purpose: string;
   priority: Priority;
+  /** Optional wall-clock deadline (epoch ms) for deadline-aware waiting (#327). */
+  deadlineMs?: number;
 }
 
 export const DEFAULT_CALL_CONTEXT: CallContext = { purpose: 'unspecified', priority: 'cron' };
+
+export const PURPOSE_CLASS: Record<string, PurposeClass> = {
+  dispute_review: 'dispute',
+  admin_generation: 'admin',
+  admin_trace_hedge: 'admin',
+  eval: 'admin',
+  market_generation: 'generation',
+  forecast: 'forecast',
+  trace_hedge: 'hedge',
+};
+
+/** Maps a CallContext to its PurposeClass; priority 'admin' maps to 'admin' and unknown purposes to 'other'. */
+export function classOf(ctx: CallContext): PurposeClass {
+  const mapped = PURPOSE_CLASS[ctx.purpose];
+  if (mapped) return mapped;
+  if (ctx.priority === 'admin') return 'admin';
+  return 'other';
+}
 
 export interface Usage {
   inputTokens: number;
@@ -53,6 +99,7 @@ export interface Lease {
   id: string;
   provider: Provider;
   ctx: CallContext;
+  purposeClass: PurposeClass;
   day: string;
   estimate: number;
   probe: boolean;
@@ -102,15 +149,50 @@ export function estimateTokens(prompts: { system: string; user: string }, maxTok
 export interface GuardSettings {
   tokenBudget: number;
   costBudgetMicros: number;
+  /** @deprecated Mapped onto classPolicy.admin.guaranteePct (#327). */
   reservePct: number;
+  classPolicy: ClassPolicyMap;
   rpm: Record<Provider, number>;
   failureThreshold: number;
   openMs: number;
   failMode: 'closed' | 'open';
-  /** Max time acquire() waits for the bucket before giving up. */
+  /** Max time routine acquire() waits for the bucket before giving up. */
   maxWaitMs: number;
+  /** Max time a dispute review acquire() may wait up to its window deadline (#327). */
+  disputeMaxWaitMs: number;
   leaseTtlMs: number;
   probeTtlMs: number;
+}
+
+export type GuardSettingsOverride = Partial<Omit<GuardSettings, 'rpm' | 'classPolicy'>> & {
+  rpm?: Partial<Record<Provider, number>>;
+  classPolicy?: Partial<ClassPolicyMap>;
+};
+
+export function resolveClassPolicyFromConfig(
+  rawJson = config.LLM_CLASS_POLICY,
+  adminReservePct = config.LLM_ADMIN_RESERVE_PCT,
+): ClassPolicyMap {
+  const base: ClassPolicyMap = {
+    dispute: { ...DEFAULT_CLASS_POLICY.dispute },
+    admin: { ...DEFAULT_CLASS_POLICY.admin, guaranteePct: adminReservePct },
+    generation: { ...DEFAULT_CLASS_POLICY.generation },
+    forecast: { ...DEFAULT_CLASS_POLICY.forecast },
+    hedge: { ...DEFAULT_CLASS_POLICY.hedge },
+    other: { ...DEFAULT_CLASS_POLICY.other },
+  };
+  if (!rawJson || !rawJson.trim()) return base;
+  try {
+    const parsed = JSON.parse(rawJson) as Partial<ClassPolicyMap>;
+    for (const c of PURPOSE_CLASSES) {
+      if (parsed[c]) {
+        base[c] = { ...base[c], ...parsed[c] };
+      }
+    }
+  } catch {
+    // Validated at config load; keep defaults if malformed in ad-hoc test mutation.
+  }
+  return base;
 }
 
 function defaultSettings(): GuardSettings {
@@ -123,6 +205,7 @@ function defaultSettings(): GuardSettings {
     openMs: config.LLM_BREAKER_OPEN_MS,
     failMode: config.LLM_REDIS_FAIL_MODE,
     maxWaitMs: 30_000,
+    disputeMaxWaitMs: config.LLM_DISPUTE_MAX_WAIT_MS,
     leaseTtlMs: config.TIMEOUT_LLM_MS * 2,
     probeTtlMs: config.TIMEOUT_LLM_MS,
   };
@@ -136,6 +219,7 @@ export function settings(): GuardSettings {
   const base = defaultSettings();
   return { ...base, ...overrides, rpm: { ...base.rpm, ...overrides.rpm } };
 }
+
 /** Test seam. Pass `{}` to restore config-derived settings. */
 export function setLlmGuardSettings(next: GuardSettingsOverride): void {
   overrides = next;
@@ -175,7 +259,63 @@ export function setLlmWait(fn: typeof waitFn | null): void {
   waitFn = fn ?? ((ms, signal) => clockSleep(ms, signal));
 }
 
+// ─── Dispute rejection alerting (#327) ────────────────────────────────────────
+
+type DisputeRejectionAlertFn = (info: {
+  provider: Provider;
+  kind: 'BUDGET_EXCEEDED' | 'RATE_LIMITED';
+  reason: string;
+  purpose: string;
+}) => Promise<void>;
+
+let disputeAlertOverride: DisputeRejectionAlertFn | null = null;
+
+export function setDisputeRejectionAlertForTest(fn: DisputeRejectionAlertFn | null): void {
+  disputeAlertOverride = fn;
+}
+
+function notifyDisputeRejection(info: {
+  provider: Provider;
+  kind: 'BUDGET_EXCEEDED' | 'RATE_LIMITED';
+  reason: string;
+  purpose: string;
+}): void {
+  logger.warn(
+    { provider: info.provider, kind: info.kind, reason: info.reason, purpose: info.purpose, class: 'dispute' },
+    'Dispute review LLM call rejected by guard',
+  );
+  if (disputeAlertOverride) {
+    void disputeAlertOverride(info).catch(() => undefined);
+    return;
+  }
+  import('../services/alerts.service')
+    .then(({ AlertService }) => {
+      const svc = new AlertService();
+      const day = new Date().toISOString().slice(0, 10);
+      return svc.send(`llm-dispute:${day}:${info.provider}:${info.kind}`, {
+        level: 'WARN',
+        title: `Dispute review LLM call rejected (${info.kind})`,
+        marketId: 'llm-budget',
+        onChainMarketId: 'llm-budget',
+        proposedOutcome: 'N/A',
+        verdict: info.kind,
+        windowRemainingSecs: null,
+        links: { market: '/api/v1/admin/status', cancelTx: '/api/v1/admin/disputes' },
+        detail: `Provider: ${info.provider}, reason: ${info.reason}, purpose: ${info.purpose}`,
+      });
+    })
+    .catch(() => undefined);
+}
+
 // ─── acquire / record ─────────────────────────────────────────────────────────
+
+function effectiveWaitLimitMs(ctx: CallContext, purposeClass: PurposeClass, s: GuardSettings, now: number): number {
+  if (purposeClass === 'dispute' && typeof ctx.deadlineMs === 'number' && Number.isFinite(ctx.deadlineMs)) {
+    const untilDeadline = ctx.deadlineMs - now - config.TIMEOUT_LLM_MS;
+    return Math.max(0, Math.min(untilDeadline, s.disputeMaxWaitMs));
+  }
+  return s.maxWaitMs;
+}
 
 export async function acquire(
   provider: Provider,
@@ -184,6 +324,7 @@ export async function acquire(
   opts: { signal?: AbortSignal } = {},
 ): Promise<Lease> {
   const s = settings();
+  const purposeClass = classOf(ctx);
   const leaseId = randomUUID();
   const started = nowMs();
   let local = false;
@@ -196,8 +337,10 @@ export async function acquire(
         provider,
         leaseId,
         priority: ctx.priority,
+        purposeClass,
+        classPolicy: s.classPolicy,
         estimate: estimatedTokens,
-        rpm: s.rpm[provider],
+        rpm: s.rpm[provider] ?? config.LLM_OPENAI_RPM,
         tokenBudget: s.tokenBudget,
         costBudgetMicros: s.costBudgetMicros,
         reservePct: s.reservePct,
@@ -216,23 +359,59 @@ export async function acquire(
     }
 
     if (res.ok) {
-      return { id: leaseId, provider, ctx, day: res.day, estimate: estimatedTokens, probe: res.probe, local };
+      return {
+        id: leaseId,
+        provider,
+        ctx,
+        purposeClass,
+        day: res.day,
+        estimate: estimatedTokens,
+        probe: res.probe,
+        local,
+      };
     }
     if (res.reason === 'BUDGET_EXCEEDED') {
-      throw new LlmBudgetExceeded({ provider, purpose: ctx.purpose, priority: ctx.priority, retryAfterMs: res.retryAfterMs });
+      const budgetReason = res.budgetReason ?? 'CLASS_CAP';
+      if (purposeClass === 'dispute') {
+        notifyDisputeRejection({
+          provider,
+          kind: 'BUDGET_EXCEEDED',
+          reason: budgetReason,
+          purpose: ctx.purpose,
+        });
+      }
+      throw new LlmBudgetExceeded({
+        provider,
+        purpose: ctx.purpose,
+        priority: ctx.priority,
+        class: res.purposeClass ?? purposeClass,
+        reason: budgetReason,
+        retryAfterMs: res.retryAfterMs,
+      });
     }
     if (res.reason === 'CIRCUIT_OPEN') {
       throw new LlmCircuitOpen({ provider, retryAfterMs: res.retryAfterMs });
     }
-    // RATE_LIMITED: wait for a token, with jitter, for at most maxWaitMs.
+    // RATE_LIMITED: wait for a token, with jitter, up to the class/deadline wait limit.
+    const now = nowMs();
+    const waitLimit = effectiveWaitLimitMs(ctx, purposeClass, s, started);
     const wait = res.retryAfterMs + Math.floor(Math.random() * Math.min(250, res.retryAfterMs + 1));
-    if (nowMs() - started + wait > s.maxWaitMs) {
-      throw new AppError(429, 'LLM_RATE_LIMITED', `LLM rate limit for ${provider} not available within ${s.maxWaitMs}ms`, {
+    if (now - started + wait > waitLimit) {
+      if (purposeClass === 'dispute') {
+        notifyDisputeRejection({
+          provider,
+          kind: 'RATE_LIMITED',
+          reason: `wait_exceeded_${waitLimit}ms`,
+          purpose: ctx.purpose,
+        });
+      }
+      throw new AppError(429, 'LLM_RATE_LIMITED', `LLM rate limit for ${provider} not available within ${waitLimit}ms`, {
         provider,
+        class: purposeClass,
         retryAfterMs: res.retryAfterMs,
       });
     }
-    logger.debug({ provider, waitMs: wait }, 'LLM rate limit: waiting for a token');
+    logger.debug({ provider, class: purposeClass, waitMs: wait }, 'LLM rate limit: waiting for a token');
     await waitFn(wait, opts.signal);
   }
 }
@@ -254,6 +433,7 @@ export async function record(
   const costMicros = estimateCostMicros(usage);
   const inputTokens = usage?.inputTokens ?? 0;
   const outputTokens = usage?.outputTokens ?? 0;
+  const purposeClass = lease.purposeClass ?? classOf(lease.ctx);
 
   logger.info(
     {
@@ -261,6 +441,7 @@ export async function record(
       model: usage?.model ?? null,
       purpose: lease.ctx.purpose,
       priority: lease.ctx.priority,
+      class: purposeClass,
       inputTokens,
       outputTokens,
       estimatedCostMicros: costMicros,
@@ -275,6 +456,7 @@ export async function record(
       leaseId: lease.id,
       day: lease.day,
       estimate: lease.estimate,
+      purposeClass,
       probe: lease.probe,
       inputTokens,
       outputTokens,
@@ -306,6 +488,19 @@ export async function withLease<T>(
   fn: (lease: Lease) => Promise<{ value: T; usage: Usage | null }>,
   opts: { signal?: AbortSignal; classify?: (err: unknown) => Classified } = {},
 ): Promise<T> {
+  if (ctx?.isolated) {
+    const syntheticLease: Lease = {
+      id: 'isolated',
+      provider,
+      ctx,
+      day: new Date().toISOString().slice(0, 10),
+      estimate: estimatedTokens,
+      probe: false,
+      local: true,
+    };
+    const res = await fn(syntheticLease);
+    return res.value;
+  }
   const lease = await acquire(provider, ctx ?? DEFAULT_CALL_CONTEXT, estimatedTokens, { signal: opts.signal });
   let result: { value: T; usage: Usage | null };
   try {
@@ -329,10 +524,56 @@ export async function breakerState(provider: Provider): Promise<BreakerState> {
   }
 }
 
-export async function getLlmUsage(): Promise<UsageSnapshot & { tokenBudget: number; costBudgetMicros: number }> {
+export interface ClassUsageView extends ClassUsage {
+  guarantee: number;
+  cap: number;
+  costGuaranteeMicros: number;
+  costCapMicros: number;
+}
+
+export interface LlmUsageReport extends Omit<UsageSnapshot, 'byClass'> {
+  tokenBudget: number;
+  costBudgetMicros: number;
+  total: {
+    tokens: number;
+    costMicros: number;
+    reserved: number;
+    tokenBudget: number;
+    costBudgetMicros: number;
+  };
+  byClass: Record<PurposeClass, ClassUsageView>;
+}
+
+export async function getLlmUsage(): Promise<LlmUsageReport> {
   const s = settings();
   const snap = await getLlmGuardStore().usage();
-  return { ...snap, tokenBudget: s.tokenBudget, costBudgetMicros: s.costBudgetMicros };
+  const byClass = {} as Record<PurposeClass, ClassUsageView>;
+  for (const c of PURPOSE_CLASSES) {
+    const raw = snap.byClass?.[c] ?? { tokens: 0, costMicros: 0, reserved: 0 };
+    const pol = s.classPolicy[c];
+    byClass[c] = {
+      tokens: raw.tokens,
+      costMicros: raw.costMicros,
+      reserved: raw.reserved,
+      guarantee: Math.floor((s.tokenBudget * pol.guaranteePct) / 100),
+      cap: Math.floor((s.tokenBudget * pol.capPct) / 100),
+      costGuaranteeMicros: Math.floor((s.costBudgetMicros * pol.guaranteePct) / 100),
+      costCapMicros: Math.floor((s.costBudgetMicros * pol.capPct) / 100),
+    };
+  }
+  return {
+    ...snap,
+    tokenBudget: s.tokenBudget,
+    costBudgetMicros: s.costBudgetMicros,
+    total: {
+      tokens: snap.tokens,
+      costMicros: snap.costMicros,
+      reserved: snap.reserved,
+      tokenBudget: s.tokenBudget,
+      costBudgetMicros: s.costBudgetMicros,
+    },
+    byClass,
+  };
 }
 
 /** True the first time `name` is claimed today (UTC); used to log once per day. */

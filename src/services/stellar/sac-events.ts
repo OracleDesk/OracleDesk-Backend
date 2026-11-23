@@ -25,6 +25,8 @@ export interface SacTransfer {
   toMuxedId: string | null;
   /** Operation index the event came from, when known. */
   opIndex: number | null;
+  /** Index of the event within its operation (or transaction meta events list). */
+  eventIndex: number;
   /** Asset string topic (`CODE:ISSUER`) when the event carried one. */
   asset: string | null;
 }
@@ -74,7 +76,7 @@ function eventTypeName(ev: any): string | null {
 }
 
 /** Decodes one contract event into a transfer, or null when it is not one. */
-export function decodeSacTransferEvent(ev: unknown, opIndex: number | null): SacTransfer | null {
+export function decodeSacTransferEvent(ev: unknown, opIndex: number | null, eventIndex = 0): SacTransfer | null {
   const event = asContractEvent(ev);
   if (!event) return null;
   try {
@@ -130,6 +132,7 @@ export function decodeSacTransferEvent(ev: unknown, opIndex: number | null): Sac
       amount: decoded.amount,
       toMuxedId: decoded.toMuxedId,
       opIndex,
+      eventIndex,
       asset,
     };
   } catch {
@@ -179,10 +182,10 @@ function decodeAmount(data: xdr.ScVal): { amount: bigint; toMuxedId: string | nu
 /** Events declared directly on a v4 `OperationMetaV2`. */
 function decodeContractEvents(events: unknown[], opIndex: number | null): SacTransfer[] {
   const out: SacTransfer[] = [];
-  for (const ev of events) {
-    const transfer = decodeSacTransferEvent(ev, opIndex);
+  events.forEach((ev, eventIndex) => {
+    const transfer = decodeSacTransferEvent(ev, opIndex, eventIndex);
     if (transfer) out.push(transfer);
-  }
+  });
   return out;
 }
 

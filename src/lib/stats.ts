@@ -103,3 +103,38 @@ export function wilson(successes: number, n: number, z = 1.96): Interval {
   const half = (z * Math.sqrt((p * (1 - p)) / n + z2 / (4 * n * n))) / denom;
   return { lower: Math.max(0, centre - half), upper: Math.min(1, centre + half) };
 }
+
+/** Standard normal CDF using Abramowitz & Stegun erf approximation (error < 1.5e-7). */
+export function normalCdf(z: number): number {
+  const sign = z < 0 ? -1 : 1;
+  const x = Math.abs(z) / Math.SQRT2;
+  const t = 1 / (1 + 0.3275911 * x);
+  const y =
+    1 -
+    (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t) *
+      Math.exp(-x * x);
+  return 0.5 * (1 + sign * y);
+}
+
+/**
+ * Two-sample proportion z-test comparing `current` (k1/n1) against `baseline` (k0/n0).
+ * Returns the z-statistic and two-sided p-value.
+ */
+export function twoProportionTest(
+  k0: number,
+  n0: number,
+  k1: number,
+  n1: number,
+): { z: number; pValue: number; diff: number } {
+  if (n0 <= 0 || n1 <= 0) return { z: 0, pValue: 1, diff: 0 };
+  const p0 = k0 / n0;
+  const p1 = k1 / n1;
+  const diff = p1 - p0;
+  const pooled = (k0 + k1) / (n0 + n1);
+  if (pooled <= 0 || pooled >= 1) return { z: 0, pValue: 1, diff };
+  const se = Math.sqrt(pooled * (1 - pooled) * (1 / n0 + 1 / n1));
+  if (se === 0) return { z: 0, pValue: 1, diff };
+  const z = diff / se;
+  const pValue = Math.min(1, Math.max(0, 2 * (1 - normalCdf(Math.abs(z)))));
+  return { z, pValue, diff };
+}

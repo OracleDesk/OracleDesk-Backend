@@ -1,0 +1,5 @@
+{
+  "maxDeltaBrier": 0.02,
+  "maxDeltaLogLoss": 0.05,
+  "bootstrapIterations": 1000
+}

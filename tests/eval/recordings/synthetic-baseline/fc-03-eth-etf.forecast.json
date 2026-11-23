@@ -1,0 +1,8 @@
+{
+  "caseId": "fc-03-eth-etf",
+  "kind": "forecast",
+  "promptKey": "synthetic-baseline-v1",
+  "provider": "synthetic",
+  "model": "synthetic-baseline",
+  "output": "{\"base_rate\":0.40,\"adjustments\":[{\"signal_id\":\"s1\",\"delta\":0.30,\"why\":\"$420M inflow already recorded in the first three days of the week.\"}],\"p\":0.76,\"p_low_50\":0.68,\"p_high_50\":0.84,\"rationale\":\"Only $80M more needed across remaining two trading days.\"}"
+}

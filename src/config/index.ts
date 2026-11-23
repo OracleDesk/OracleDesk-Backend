@@ -188,6 +188,10 @@ export const envObjectSchema = z
     // JWT_SECRET, AUTH_SIGNING_SECRET or a wallet key. Format documented in
     // docs/contract-requests.md; a missing key in production stops boot.
     ENTITLEMENT_SIGNING_KEY: optionalString,
+    // Dedicated Ed25519 key for signing purchase receipts (#313); never reused.
+    RECEIPT_SIGNING_KEY: optionalString,
+    RECEIPT_PREVIOUS_PUBLIC_KEYS: commaList(z.string()),
+    DAILY_PASS_PRICE_VERSION: z.string().default('v1'),
     // Dedicated Ed25519 key for signing SEP-7 URI requests (#270); never reused.
     URI_REQUEST_SIGNING_SECRET: optionalString,
     // Dedicated Ed25519 key for signing reasoning traces (#273); never reused.
@@ -420,6 +424,10 @@ export const envObjectSchema = z
     // escalating with an ERROR AgentLog for a guardian to void the market.
     PRICE_RESOLUTION_MAX_WAIT_SECS: z.string().default('86400').transform(Number).pipe(z.number().int().min(60)),
     PRICE_RESOLUTION_POLL_MS: z.string().default('300000').transform(Number).pipe(z.number().int().min(1000)),
+    // Reflector feed monitor & post-resolution verifier (#309)
+    PRICE_FEED_MONITOR_CLOSE_WINDOW_SECS: z.string().default('7200').transform(Number).pipe(z.number().int().min(60)),
+    PRICE_FEED_GAP_SLOTS: z.string().default('6').transform(Number).pipe(z.number().int().min(1).max(100)),
+    PRICE_VERIFY_OUTLIER_BPS: z.string().default('500').transform(Number).pipe(z.number().int().min(1).max(100_000)),
 
     // Failure breaker (#79): this many chain-write failures inside the window
     // pause the writing agent until an operator resumes it.
@@ -456,6 +464,15 @@ export const envObjectSchema = z
     // Approximate stream cap (XADD MAXLEN ~). chain_events stays the durable history.
     EVENT_BUS_MAXLEN: z.string().default('100000').transform(Number)
       .pipe(z.number().int().min(1000)),
+    // One XREAD batch and its BLOCK duration. The blocking connection disables
+    // ioredis commandTimeout (a 500 ms timeout rejects every idle BLOCK 1000
+    // read); EVENT_BUS_BLOCKING_TIMEOUT_MS is the safety net above the block.
+    EVENT_BUS_READ_COUNT: z.string().default('100').transform(Number)
+      .pipe(z.number().int().min(1).max(1000)),
+    EVENT_BUS_BLOCK_MS: z.string().default('1000').transform(Number)
+      .pipe(z.number().int().min(100).max(30000)),
+    EVENT_BUS_BLOCKING_TIMEOUT_MS: z.string().default('5000').transform(Number)
+      .pipe(z.number().int().min(200).max(60000)),
     // Identifies this process as fan-out leader candidate and in logs.
     INSTANCE_ID: z.string().default('').transform((v) => v.trim() || `${os.hostname()}-${process.pid}`),
 
@@ -540,6 +557,11 @@ export const envObjectSchema = z
       .string()
       .default('')
       .refine((v) => ['', 'off', 'warn', 'enforce'].includes(v), 'must be off, warn or enforce'),
+    // Runtime spec-compat monitor (#322): periodic interval, debounce gap for
+    // signal-triggered checks, and consecutive unverifiable runs before pause.
+    SPEC_COMPAT_INTERVAL_MS: z.string().default('600000').transform(Number).pipe(z.number().int().min(1000)),
+    SPEC_COMPAT_MIN_GAP_MS: z.string().default('60000').transform(Number).pipe(z.number().int().min(100)),
+    SPEC_COMPAT_UNVERIFIABLE_RUNS: z.string().default('3').transform(Number).pipe(z.number().int().min(1)),
 
     TRUST_INBOUND_REQUEST_ID: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
     INDEXER_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
@@ -566,6 +588,9 @@ export const envObjectSchema = z
     HEALTH_BALANCE_TTL_MS: z.string().default('60000').transform(Number).pipe(z.number().int().min(0)),
     // Time /readyz reports "draining" before the HTTP server stops accepting.
     SHUTDOWN_DRAIN_MS: z.string().default('5000').transform(Number),
+
+    // ── Cron run history retention (#336) ─────────────────────────────────
+    CRON_RUNS_RETENTION_DAYS: z.string().default('14').transform(Number).pipe(z.number().int().min(1)),
 
     // ── Semantic dedup (#69) ──────────────────────────────────────────────
     // none keeps the lexical check. The vector column is vector(768): the
@@ -635,9 +660,25 @@ export const envObjectSchema = z
       .pipe(z.number().int().positive()),
     LLM_DAILY_COST_BUDGET_MICROS: z.string().default('20000000').transform(Number)
       .pipe(z.number().int().positive()),
-    // Share of the budgets held back for admin-triggered work (cron stops first).
+    // Share of the budgets held back for admin-triggered work (deprecated in
+    // favour of LLM_CLASS_POLICY; maps onto admin.guaranteePct, #327).
     LLM_ADMIN_RESERVE_PCT: z.string().default('10').transform(Number)
       .pipe(z.number().min(0).max(100)),
+    // Per-purpose class budget policy JSON (#327): guarantees must sum to <= 100.
+    LLM_CLASS_POLICY: z
+      .string()
+      .default('')
+      .refine((v) => {
+        if (!v.trim()) return true;
+        try {
+          return llmClassPolicySchema.safeParse(JSON.parse(v)).success;
+        } catch {
+          return false;
+        }
+      }, 'must be valid JSON matching ClassPolicy per class with sum(guaranteePct) <= 100'),
+    // Max wait for a time-critical dispute review when rate-limited (#327, default 10 min).
+    LLM_DISPUTE_MAX_WAIT_MS: z.string().default('600000').transform(Number)
+      .pipe(z.number().int().positive()),
     LLM_ANTHROPIC_RPM: z.string().default('12').transform(Number)
       .pipe(z.number().int().positive()),
     LLM_GEMINI_RPM: z.string().default('15').transform(Number)
@@ -673,6 +714,11 @@ export const envObjectSchema = z
     REPORTS_ENABLED: z.enum(['true', 'false']).default('false').transform((v) => v === 'true'),
     REPORT_CRON: z.string().default('10 0 * * *'),
     REPORT_MODE: z.enum(['dry-run', 'live']).default('dry-run'),
+    // Tolerance in 7-decimal base units before a NAV reconciliation diff forces best_effort (#299).
+    REPORT_NAV_TOLERANCE_RAW: z.string().regex(/^\d+$/, 'must be a non-negative integer').default('0'),
+    // On-chain treasury accounting cache TTL and max ledger skew across parallel views (#299).
+    ACCOUNTING_CACHE_MS: z.string().default('15000').transform(Number).pipe(z.number().int().min(100)),
+    ACCOUNTING_MAX_LEDGER_SKEW: z.string().default('1').transform(Number).pipe(z.number().int().min(0)),
 
     // ── Treasury admin console (#156) ─────────────────────────────────────
     // Lifetime of a prepared unsigned transaction.
@@ -694,6 +740,15 @@ export const envObjectSchema = z
     TRADER_MAX_PRICE_DRIFT_BPS: z.string().default('150').transform(Number).pipe(z.number().int().min(0)),
     /** Consecutive stale-price markets that abort the scan cycle with PRICE_SOURCE_DOWN. */
     TRADER_STALE_ABORT_COUNT: z.string().default('3').transform(Number).pipe(z.number().int().min(1)),
+    // ── Market-core TWAP and breakers (#292) ──────────────────────────────
+    /** Window for the manipulation-resistant YES-price TWAP used by risk decisions. */
+    TWAP_WINDOW_SECS: z.string().default('300').transform(Number).pipe(z.number().int().min(30).max(3600)),
+    /** Minimum observations required before a TWAP replaces the spot mark for risk. */
+    TWAP_MIN_OBSERVATIONS: z.string().default('2').transform(Number).pipe(z.number().int().min(1).max(16)),
+    /** Spot/TWAP divergence (bps) above which a spot-only stop is deferred. */
+    TWAP_DIVERGENCE_BPS: z.string().default('500').transform(Number).pipe(z.number().int().min(0).max(5000)),
+    /** Max parts a breaker-limited exit is split into across ledger cycles. */
+    EXIT_BREAKER_MAX_PARTS: z.string().default('4').transform(Number).pipe(z.number().int().min(1).max(20)),
     /** #225 — max ledgers the reserves the trader sizes against may lag the RPC (valuation DEFAULT_MAX_AGE_LEDGERS). */
     TRADER_POOL_MAX_AGE_LEDGERS: z.string().default('120').transform(Number).pipe(z.number().int().min(1)),
     // #147 — development-only local IPFS stub selected explicitly.
@@ -743,6 +798,7 @@ export const envObjectSchema = z
     // ── Resilience & Timeouts ─────────────────────────────────────────────
     TIMEOUT_RPC_READ_MS: z.string().default('8000').transform(Number),
     TIMEOUT_RPC_WRITE_MS: z.string().default('45000').transform(Number),
+    TIMEOUT_RPC_CONFIRM_MS: z.string().default('8000').transform(Number),
     TIMEOUT_RPC_EVENTS_MS: z.string().default('15000').transform(Number),
     TIMEOUT_LLM_MS: z.string().default('60000').transform(Number),
     TIMEOUT_IPFS_PIN_MS: z.string().default('20000').transform(Number),
@@ -754,9 +810,14 @@ export const envObjectSchema = z
     BULKHEAD_IPFS: z.string().default('4').transform(Number),
     BULKHEAD_RPC_READ: z.string().default('16').transform(Number),
     BULKHEAD_RPC_WRITE: z.string().default('4').transform(Number),
+    BULKHEAD_RPC_CONFIRM: z.string().default('8').transform(Number),
     BULKHEAD_RPC_EVENTS: z.string().default('4').transform(Number),
     BULKHEAD_DATASOURCE: z.string().default('8').transform(Number),
     BULKHEAD_QUEUE: z.string().default('32').transform(Number),
+    // Proactive shedding threshold for saturated RPC bulkheads (#300)
+    RPC_SHED_AFTER_MS: z.string().default('2000').transform(Number).pipe(z.number().int().min(0)),
+    // Optional JSON overrides for per-class bulkhead policies (#300)
+    RPC_CLASS_POLICY_JSON: optionalString,
 
     // Request & cycle deadlines
     HTTP_REQUEST_TIMEOUT_MS: z.string().default('30000').transform(Number),
@@ -767,13 +828,16 @@ export const envObjectSchema = z
     ),
     IPFS_MAX_BYTES: z.string().default('2097152').transform(Number),
 
-    // ── Trace Audit (Issue #150) ──────────────────────────────────────────
+    // ── Trace Audit (Issue #150, #306) ────────────────────────────────────
     TRACE_AUDIT_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
     TRACE_AUDIT_CRON: z.string().default('40 */2 * * *'),
     TRACE_AUDIT_RECHECK_HOURS: z.string().default('168').transform(Number),
     TRACE_AUDIT_MAX_RPC: z.string().default('500').transform(Number),
     TRACE_AUDIT_MAX_FETCHES: z.string().default('100').transform(Number),
     TRACE_AUDIT_MAX_BYTES: z.string().default('2097152').transform(Number),
+    TRACE_AUDIT_VERDICT_RPC_SHARE: z.string().default('0.3').transform(Number).pipe(z.number().gt(0).lte(1)),
+    TRACE_VERDICT_CRON: z.string().default('*/10 * * * *'),
+    TRACE_VERDICT_MAX_RPC: z.string().default('100').transform(Number).pipe(z.number().int().min(1)),
 
     // ── Trace publication queue (Issue #131) ──────────────────────────────
     TRACE_PUBLISH_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
@@ -853,17 +917,50 @@ export const envObjectSchema = z
     MONEY_AUDIT_MAX_RPC_CALLS: z.string().default('200').transform(Number)
       .pipe(z.number().int().min(0)),
 
-    // ── Copy Trading (Issue #151) ─────────────────────────────────────────
+    // ── Copy Trading (Issue #151, #294) ───────────────────────────────────
     COPY_TRADE_TTL_MINUTES: z.string().default('30').transform(Number),
     COPY_TRADE_MAX_PENDING: z.string().default('5').transform(Number),
+    COPY_TRADE_MAX_IMPACT_BPS: z.string().optional()
+      .transform((v) => (v == null || v === '' ? null : Number(v)))
+      .pipe(z.number().int().min(1).max(10_000).nullable()),
+    COPY_TRADE_FLOW_WINDOW_MINUTES: z.string().default('60').transform(Number)
+      .pipe(z.number().int().min(1).max(10_080)),
+    COPY_TRADE_POOL_MAX_AGE_LEDGERS: z.string().default('12').transform(Number)
+      .pipe(z.number().int().min(0)),
 
     // ── Socket.io throttling & slow-consumer guard (Issue #96) ─────────────
     SOCKET_PRICE_TICK_MS: z.string().default('1000').transform(Number),
     SOCKET_TRADE_VOLATILE: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
-    SOCKET_LIVE_LEDGER_LAG: z.string().default('12').transform(Number),
+    // A chain event at or above (RPC latest ledger − this) is live; older
+    // events are catch-up and never emitted as live prices (#291).
+    SOCKET_LIVE_LEDGER_LAG: z.string().default('12').transform(Number)
+      .pipe(z.number().int().min(0).max(1000)),
     SOCKET_SLOW_WARN_BYTES: z.string().default('262144').transform(Number),
     SOCKET_SLOW_DROP_BYTES: z.string().default('2097152').transform(Number),
     SOCKET_SLOW_CHECK_MS: z.string().default('2000').transform(Number),
+
+    // ── Redis Streams adapter bounds and observability (#293) ──────────────
+    // Explicit stream cap and batch size, sized against the emit rate and the
+    // tolerated lag instead of the adapter's implicit 10,000 / 100 defaults.
+    SOCKET_STREAM_NAME: z.string().default('oracledesk:socket.io'),
+    SOCKET_ADAPTER_MAXLEN: z.string().default('10000').transform(Number)
+      .pipe(z.number().int().min(100)),
+    SOCKET_ADAPTER_READ_COUNT: z.string().default('100').transform(Number)
+      .pipe(z.number().int().min(1).max(1000)),
+    SOCKET_ADAPTER_BLOCK_MS: z.string().default('1000').transform(Number)
+      .pipe(z.number().int().min(100).max(30000)),
+    SOCKET_ADAPTER_BLOCKING_TIMEOUT_MS: z.string().default('5000').transform(Number)
+      .pipe(z.number().int().min(200).max(60000)),
+    SOCKET_ADAPTER_MONITOR_MS: z.string().default('5000').transform(Number)
+      .pipe(z.number().int().min(500)),
+    // Warn when this instance is this far behind the stream tail.
+    SOCKET_ADAPTER_LAG_WARN_ENTRIES: z.string().default('500').transform(Number)
+      .pipe(z.number().int().min(1)),
+    SOCKET_ADAPTER_LAG_WARN_MS: z.string().default('5000').transform(Number)
+      .pipe(z.number().int().min(100)),
+    // Above this lag, coalescable public traffic is shed (private/admin never).
+    SOCKET_ADAPTER_SHED_LAG_ENTRIES: z.string().default('2000').transform(Number)
+      .pipe(z.number().int().min(1)),
 
     // ── Socket.io hardening & limits (Issue #97) ──────────────────────────
     SOCKET_MAX_CONNECTIONS: z.string().default('5000').transform(Number),
@@ -1265,6 +1362,10 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     // Generated, never printed. Dev/test only: tokens stop verifying on restart.
     data.ENTITLEMENT_SIGNING_KEY = generateEntitlementKey();
     ephemeralSecrets.push('ENTITLEMENT_SIGNING_KEY');
+  }
+  if (!data.RECEIPT_SIGNING_KEY && data.NODE_ENV !== 'production') {
+    data.RECEIPT_SIGNING_KEY = generateEntitlementKey();
+    ephemeralSecrets.push('RECEIPT_SIGNING_KEY');
   }
   if (!data.AUTH_WEB_AUTH_DOMAIN) data.AUTH_WEB_AUTH_DOMAIN = data.AUTH_HOME_DOMAIN;
   if (!data.SEP7_ORIGIN_DOMAIN) data.SEP7_ORIGIN_DOMAIN = data.AUTH_HOME_DOMAIN;

@@ -27,6 +27,7 @@ export type FailureClass =
   // failure, so they are attributed by attributeTradeBoundFailure().
   | 'DEADLINE_EXPIRED'
   | 'LIMIT_PRICE'
+  | 'BREAKER_TRIPPED'
   | 'UNKNOWN';
 
 export type RetryAction = 'resend' | 'rebuild' | 'resync-rebuild' | 'never';
@@ -60,6 +61,7 @@ export const RETRY_POLICY: Record<FailureClass, RetryAction> = {
   // Re-sending can never succeed: the trader must re-decide on a new quote.
   DEADLINE_EXPIRED: 'never',
   LIMIT_PRICE: 'never',
+  BREAKER_TRIPPED: 'never',
   UNKNOWN: 'never',
 };
 
@@ -125,6 +127,10 @@ export function decodeResultCodes(result: xdr.TransactionResult | undefined): De
   return { txCode, opCode };
 }
 
+function isBreakerContractError(name: string | null): boolean {
+  return name === 'PriceImpactTooHigh' || name === 'PriceBandExceeded';
+}
+
 function classifyCodes(
   contract: ContractKey,
   codes: Decoded,
@@ -144,9 +150,21 @@ function classifyCodes(
   }
   if (txCode === 'txFailed' && opCode) {
     const cls = OP_CODE_CLASS[opCode] ?? (contractError ? 'CONTRACT_ERROR' : 'UNKNOWN');
+    if (cls === 'CONTRACT_ERROR' && isBreakerContractError(contractError)) {
+      return { class: 'BREAKER_TRIPPED', txCode, opCode, contractError, txHash, submitted };
+    }
     return { class: cls, txCode, opCode, contractError, txHash, submitted };
   }
-  if (contractError) return { class: 'CONTRACT_ERROR', txCode, opCode, contractError, txHash, submitted };
+  if (contractError) {
+    return {
+      class: isBreakerContractError(contractError) ? 'BREAKER_TRIPPED' : 'CONTRACT_ERROR',
+      txCode,
+      opCode,
+      contractError,
+      txHash,
+      submitted,
+    };
+  }
   return { class: 'UNKNOWN', txCode, opCode, contractError, txHash, submitted };
 }
 
@@ -274,10 +292,13 @@ export function isChainError(err: unknown): err is ChainError {
 /** market-core error codes behind a treasury v2 trade (contracts/market-core). */
 export const MARKET_CORE_DEADLINE_EXPIRED = 19;
 export const MARKET_CORE_LIMIT_PRICE_EXCEEDED = 20;
+export const MARKET_CORE_PRICE_IMPACT_TOO_HIGH = 21;
+export const MARKET_CORE_PRICE_BAND_EXCEEDED = 22;
 
 /**
- * Re-attributes a CONTRACT_ERROR from a bounded (v2) trade (#245), in order:
- *   (a) market-core Error(Contract, #19 / #20) seen in simulation diagnostics,
+ * Re-attributes a CONTRACT_ERROR from a bounded (v2) trade (#245) or
+ * market-core circuit breaker (#292), in order:
+ *   (a) market-core Error(Contract, #19 / #20 / #21 / #22) seen in simulation diagnostics,
  *   (b) the ledger close time at failure is past the trade's deadline,
  *   (c) the local limit re-check against the failing simulation's quote failed.
  * Anything else stays CONTRACT_ERROR. Other classes are returned unchanged.
@@ -292,9 +313,18 @@ export function attributeTradeBoundFailure(
   },
 ): ClassifiedFailure {
   if (failure.class !== 'CONTRACT_ERROR') return failure;
+  if (failure.contractError === 'PriceImpactTooHigh' || failure.contractError === 'PriceBandExceeded') {
+    return { ...failure, class: 'BREAKER_TRIPPED' };
+  }
   const codes = ctx.diagnosticContractCodes ?? [];
   if (codes.includes(MARKET_CORE_DEADLINE_EXPIRED)) return { ...failure, class: 'DEADLINE_EXPIRED' };
   if (codes.includes(MARKET_CORE_LIMIT_PRICE_EXCEEDED)) return { ...failure, class: 'LIMIT_PRICE' };
+  if (codes.includes(MARKET_CORE_PRICE_IMPACT_TOO_HIGH)) {
+    return { ...failure, class: 'BREAKER_TRIPPED', contractError: 'PriceImpactTooHigh' };
+  }
+  if (codes.includes(MARKET_CORE_PRICE_BAND_EXCEEDED)) {
+    return { ...failure, class: 'BREAKER_TRIPPED', contractError: 'PriceBandExceeded' };
+  }
   if (
     ctx.deadline !== undefined &&
     ctx.deadline !== null &&

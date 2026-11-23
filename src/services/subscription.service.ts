@@ -13,7 +13,9 @@ import { config } from '../config';
 import { currentPrice, formatPrice as formatScheduledPrice, priceAt, upcomingChange } from './pricing';
 import { CONTRACTS, PAYMENTS_RECIPIENT } from '../config/contracts';
 import { decimalToBigint, formatUsdc, toDisplayUsdc } from '../lib/amounts';
-import { verifyUsdcTransfer } from './payment-verification.service';
+import { selectClaimableTransfers, verifyUsdcTransfer } from './payment-verification.service';
+import { claimTransferEvents } from './payment-claims.service';
+import { issueReceiptInTx } from './receipt.service';
 import { AppError } from '../middlewares/error.middleware';
 import type { SubscriptionAccess } from '../types';
 import { summarizeProvenance } from '../lib/llm/provenance';
@@ -21,6 +23,7 @@ import { withAdvisoryLocksWait } from '../lib/advisory-lock';
 import { DAY_MS, chargeDayFor, ledgerCloseDate, ledgerDay, utcDayKey, utcDayStart } from '../lib/time';
 import { notifyUser } from '../lib/socket-auth';
 import { discoverTracePrice } from './x402-discovery.service';
+import { formatTraceVerdict } from './trace-audit.service';
 
 /** Daily pass price in 7-decimal USDC base units (DAILY_PASS_PRICE_RAW). */
 export const DAILY_PASS_PRICE_RAW = BigInt(config.DAILY_PASS_PRICE_RAW);
@@ -251,8 +254,8 @@ function isUniqueViolation(err: unknown): boolean {
 
 /** How long a request waits for the current claimant of a txHash. */
 const CLAIM_WAIT_MS = 30_000;
-/** Interactive-transaction budget: it covers one RPC verification plus writes. */
-const CLAIM_TX_TIMEOUT_MS = 60_000;
+/** Interactive-transaction budget: DB-only settlement after unlocked verification (#305). */
+export const CLAIM_LOCKED_TIMEOUT_MS = 10_000;
 
 /** The advisory-lock key that serializes claims for one transaction hash. */
 export function paymentClaimLockKey(txHash: string): string {
@@ -672,6 +675,35 @@ export async function settleVerifiedTransfer(
     },
   });
 
+  if ((tx as any).paymentClaim?.create) {
+    const claimedEvents = selectClaimableTransfers(transfer);
+    await claimTransferEvents(tx, {
+      txHash,
+      channel: paymentIntentId ? 'PAYMENT_INTENT' : 'LEGACY_UNLOCK',
+      userId,
+      paymentEventId: paymentEvent.id,
+      totalAmountRaw: amountRaw,
+      transfers: claimedEvents,
+    });
+  }
+
+  let receiptId: string | undefined;
+  if ((tx as any).receipt?.create) {
+    const issued = await issueReceiptInTx(tx, {
+      userId,
+      subscriptionId: created.id,
+      paymentEventId: paymentEvent.id,
+      type,
+      traceId: traceId ?? null,
+      transfer,
+      startsAt,
+      endsAt,
+      ledgerCloseAt,
+      issuedAt: now,
+    });
+    receiptId = issued.receiptId;
+  }
+
   return {
     subscription: created,
     paymentEventId: paymentEvent.id,
@@ -679,6 +711,7 @@ export async function settleVerifiedTransfer(
     perTraceExceeded: allowance.perTraceExceeded,
     ledgerCloseAt,
     granted,
+    ...(receiptId ? { receiptId } : {}),
   };
 }
 
@@ -706,8 +739,22 @@ export async function recordPayment(params: {
   const early = await existingClaimResult(prisma, txHash, userId);
   if (early) return early;
 
-  // #59 serialises every claim for this hash. #53/#54 additionally serialise
-  // per user so allowance/stacking writes cannot interleave across hashes.
+  // Phase A (unlocked, #305): fetch immutable chain facts and evaluate against
+  // caller expectations before opening any database transaction or taking
+  // advisory locks, so RPC slowness can never pin Postgres pool connections.
+  const facts = await getTxFacts(txHash);
+  const transfer = evaluateTransfer(facts, {
+    txHash,
+    token:     CONTRACTS.usdc,
+    from:      walletAddress,
+    to:        PAYMENTS_RECIPIENT,
+    minAmount: DAILY_PASS_PRICE_RAW,
+    subId,
+    subIdKind,
+  });
+
+  // Phase B (locked, DB-only): #59 serialises every claim for this hash, and
+  // #53/#54 serialise per user so allowance and stacking writes cannot interleave.
   let claim: { acquired: true; value: ClaimResult } | { acquired: false };
   try {
     claim = await withAdvisoryLocksWait<ClaimResult>(
@@ -744,7 +791,7 @@ export async function recordPayment(params: {
 
         return { subscription: settlement.subscription, transfer, replay: false };
       },
-      { waitMs: CLAIM_WAIT_MS, timeoutMs: CLAIM_TX_TIMEOUT_MS },
+      { waitMs: CLAIM_WAIT_MS, timeoutMs: CLAIM_LOCKED_TIMEOUT_MS },
     );
   } catch (err) {
     if (isUniqueViolation(err)) {
@@ -816,9 +863,10 @@ export async function getTracWithAccessControl(
   const audit = trace.lastAuditStatus
     ? { status: trace.lastAuditStatus, checkedAt: trace.lastAuditedAt }
     : null;
+  const verdict = formatTraceVerdict(trace as any);
 
   if (access.hasAccess) {
-    return { ...trace, audit, accessLevel: access.accessType };
+    return { ...trace, audit, verdict, accessLevel: access.accessType };
   }
 
   const dailyPass = await currentPrice();
@@ -843,6 +891,7 @@ export async function getTracWithAccessControl(
     provenance:          { summary: summarizeProvenance(trace.provenance) },
     verified:            trace.verified,
     audit,
+    verdict,
     ipfsCid:             trace.ipfsCid,
     traceHash:           trace.traceHash,
     contentMode:         trace.contentMode,
@@ -850,7 +899,7 @@ export async function getTracWithAccessControl(
     onChainTraceId:      trace.onChainTraceId,
     createdAt:           trace.createdAt,
     accessLevel:         'FREE_PREVIEW',
-    lockedFields:        ['fullSources', 'hedgeConditions', 'betFraction', 'betSizeUsdc', 'provenance.llm', 'provenance.generator'],
+    lockedFields:        ['fullSources', 'hedgeConditions', 'hedgePredicates', 'betFraction', 'betSizeUsdc', 'provenance.llm', 'provenance.generator'],
     unlockPriceRaw:      isDiscovered ? discovered.amountRaw : null,
     unlockPrice:         isDiscovered ? discovered.amountUsdc : null,
     unlockPriceStatus:   discovered.status,

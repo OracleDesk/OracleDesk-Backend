@@ -120,6 +120,20 @@ export function sharedEntities(a: Set<string>, b: Set<string>): string[] {
   return [...a].filter((x) => b.has(x)).sort();
 }
 
+export const KNOWN_GAZETTEER_ENTITY_IDS: ReadonlySet<string> = new Set([
+  ...Object.keys(GAZETTEER),
+  ...Object.keys(CASE_SENSITIVE),
+]);
+
+/**
+ * Returns true when `id` is either a canonical gazetteer entity id or a
+ * well-formed `NAME:<lowercase>` proper-noun entity id emitted by `extractEntities`.
+ */
+export function isKnownEntityId(id: string): boolean {
+  if (KNOWN_GAZETTEER_ENTITY_IDS.has(id)) return true;
+  return /^NAME:[a-z0-9'.-]{3,}$/.test(id);
+}
+
 /** Entities only one of the two questions mentions. */
 export function uniqueEntities(a: Set<string>, b: Set<string>): [string[], string[]] {
   return [[...a].filter((x) => !b.has(x)).sort(), [...b].filter((x) => !a.has(x)).sort()];

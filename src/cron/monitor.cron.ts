@@ -1,11 +1,9 @@
-import cron from 'node-cron';
 import { runTraderCycle } from '../agents/trader.agent';
 import { computeCorrelationSnapshot } from '../services/correlation.service';
 import { expireStaleSubscriptions, notifyExpiringPasses } from '../services/subscription.service';
 import { logger } from '../lib/logger';
 import { config } from '../config';
 import { postgresContentStore } from '../services/content-store.service';
-import { correlation, newId, runWithContext } from '../lib/context';
 import { purgeExpiredIdempotencyKeys } from '../middlewares/idempotency.middleware';
 import { computeAndStoreSnapshots } from '../services/calibration.service';
 import { purgeSignalStore } from '../services/signal-store.service';
@@ -22,53 +20,21 @@ function tick(job: string, fn: () => Promise<void>): Promise<void> {
 }
 
 /**
- * Position Monitor Cron — runs every 15 minutes.
- *
- * Responsibilities:
- * 1. Run the Trader Agent cycle (scan markets, update positions, hedge)
- * 2. Expire stale subscriptions
- *
- * Separate guard flags prevent the Trader Agent from overlapping with itself.
+ * Position Monitor & Maintenance Crons — all scheduled via `scheduleJob` (#336).
  */
 export function startMonitorCron(): void {
   // Correlation snapshot (#80) — every 15 minutes, just before the trader reads it.
-  cron.schedule('2,17,32,47 * * * *', () => tick('correlation-snapshot', async () => {
-    if (correlationSnapshotRunning) {
-      logger.warn({ skippedJob: 'correlation-snapshot' }, 'Monitor cron: correlation snapshot still running — skipping');
-      return;
-    }
-    correlationSnapshotRunning = true;
-    const startedAt = new Date();
-    try {
-      await computeCorrelationSnapshot();
-      recordCronRun('correlation-snapshot', 'success', startedAt, new Date());
-    } catch (err) {
-      recordCronRun('correlation-snapshot', 'failure', startedAt, new Date(), err);
-      logger.error({ err }, 'Monitor cron: correlation snapshot failed');
-    } finally {
-      correlationSnapshotRunning = false;
-    }
-  }));
+  scheduleJob('correlation-snapshot', async () => {
+    const snapshot = await computeCorrelationSnapshot();
+    if (!snapshot) return { outcome: 'SKIPPED_LOCK_HELD' };
+    return { outcome: 'SUCCESS', counters: { pairs: snapshot.pairs } };
+  });
 
   // Trader Agent — every 15 minutes
-  cron.schedule('5,20,35,50 * * * *', () => tick('trader', async () => {
-    if (runningTraderCycleId) {
-      logger.warn({ skippedJob: 'trader', runningCycleId: runningTraderCycleId }, 'Monitor cron: trader cycle still running — skipping');
-      return;
-    }
-
-    runningTraderCycleId = correlation().cycleId ?? 'trader';
-    const startedAt = new Date();
-    try {
-      await runTraderCycle();
-      recordCronRun('trader', 'success', startedAt, new Date());
-    } catch (err) {
-      recordCronRun('trader', 'failure', startedAt, new Date(), err);
-      logger.error({ err }, 'Monitor cron: trader cycle failed');
-    } finally {
-      runningTraderCycleId = null;
-    }
-  }));
+  scheduleJob('trader', async ({ signal }) => {
+    const res = await runTraderCycle({ signal });
+    return { outcome: res.outcome };
+  });
 
   // Calibration snapshots (#68) — daily at 03:10. The computation takes a
   // Postgres advisory lock, so with several instances only one does the work.
@@ -83,19 +49,18 @@ export function startMonitorCron(): void {
     }
   }));
 
-  // Signal store retention (#73) — nightly at 03:41: raw payloads after
-  // SIGNAL_RAW_RETENTION_DAYS, fetch logs after 30 days, and signals last seen
-  // over 30 days ago unless a reasoning trace cites them.
-  cron.schedule('41 3 * * *', () => tick('signal-retention', async () => {
-    const startedAt = new Date();
-    try {
-      await purgeSignalStore();
-      recordCronRun('signal-retention', 'success', startedAt, new Date());
-    } catch (err) {
-      recordCronRun('signal-retention', 'failure', startedAt, new Date(), err);
-      logger.error({ err }, 'Monitor cron: signal store retention failed');
-    }
-  }));
+  // Signal store retention (#73) — nightly at 03:41
+  scheduleJob('signal-retention', async () => {
+    const res = await purgeSignalStore();
+    return {
+      outcome: 'SUCCESS',
+      counters: {
+        rawPayloads: res.rawPayloads,
+        fetches: res.fetches,
+        signals: res.signals,
+      },
+    };
+  });
 
   // IPFS pin garbage collection (#328) — hourly at :25. Runs on every instance;
   // the unpin claim uses FOR UPDATE SKIP LOCKED so instances never share a pin.
@@ -112,54 +77,45 @@ export function startMonitorCron(): void {
   }));
 
   // Subscription expiry — every hour
-  cron.schedule('0 * * * *', async () => {
-    const startedAt = new Date();
-    try {
-      await expireStaleSubscriptions();
-      recordCronRun('subscription-expiry', 'success', startedAt, new Date());
-    } catch (err) {
-      recordCronRun('subscription-expiry', 'failure', startedAt, new Date(), err);
-      logger.error({ err }, 'Monitor cron: subscription expiry failed');
-    }
+  scheduleJob('subscription-expiry', async () => {
+    const expired = await expireStaleSubscriptions();
+    return { outcome: 'SUCCESS', counters: { expired } };
   });
 
   // PASS_EXPIRING socket events (#94) — every 10 minutes, once per pass.
-  cron.schedule('*/10 * * * *', async () => {
-    const startedAt = new Date();
-    try {
-      await notifyExpiringPasses();
-      recordCronRun('pass-expiry-notify', 'success', startedAt, new Date());
-    } catch (err) {
-      recordCronRun('pass-expiry-notify', 'failure', startedAt, new Date(), err);
-      logger.error({ err }, 'Monitor cron: pass expiry notification failed');
-    }
+  scheduleJob('pass-expiry-notify', async () => {
+    const notified = await notifyExpiringPasses();
+    return { outcome: 'SUCCESS', counters: { notified } };
   });
 
   // Expired Idempotency-Key rows (24h TTL, #123) — hourly at :10, in batches of 5 000
-  cron.schedule('10 * * * *', async () => {
-    const startedAt = new Date();
-    try {
-      const deleted = await purgeExpiredIdempotencyKeys();
-      recordCronRun('idempotency-purge', 'success', startedAt, new Date());
-      if (deleted > 0) logger.info({ deleted }, 'Monitor cron: purged expired idempotency keys');
-    } catch (err) {
-      recordCronRun('idempotency-purge', 'failure', startedAt, new Date(), err);
-      logger.error({ err }, 'Monitor cron: idempotency key purge failed');
-    }
+  scheduleJob('idempotency-purge', async () => {
+    const deleted = await purgeExpiredIdempotencyKeys();
+    if (deleted > 0) logger.info({ deleted }, 'Monitor cron: purged expired idempotency keys');
+    return { outcome: 'SUCCESS', counters: { deleted } };
   });
 
   // Copy trade sweep — every 5 minutes
-  cron.schedule('*/5 * * * *', () => tick('copy_trade_sweep', sweepCopyTrades));
+  scheduleJob('copy-trade-sweep', sweepCopyTrades);
 
   // IPFS content eviction (#100) — hourly at :30, bounded batches.
-  cron.schedule('30 * * * *', async () => {
-    try {
-      const result = await postgresContentStore.evict(config.IPFS_CACHE_BUDGET_BYTES);
-      if (result.removed > 0) logger.info(result, 'Monitor cron: evicted IPFS content');
-    } catch (err) {
-      logger.error({ err }, 'Monitor cron: IPFS content eviction failed');
-    }
+  scheduleJob('ipfs-eviction', async () => {
+    const result = await postgresContentStore.evict(config.IPFS_CACHE_BUDGET_BYTES);
+    if (result.removed > 0) logger.info(result, 'Monitor cron: evicted IPFS content');
+    return { outcome: 'SUCCESS', counters: { removed: result.removed } };
   });
+
+  // Fee oracle observed resource ratios & budget warnings (#308) — every 15 minutes.
+  cron.schedule('7,22,37,52 * * * *', () => tick('fee-oracle-observed', async () => {
+    const startedAt = new Date();
+    try {
+      await getFeeOracle().refreshObservedMetrics();
+      recordCronRun('fee-oracle-observed', 'success', startedAt, new Date());
+    } catch (err) {
+      recordCronRun('fee-oracle-observed', 'failure', startedAt, new Date(), err);
+      logger.error({ err }, 'Monitor cron: fee oracle observed metrics refresh failed');
+    }
+  }));
 
   logger.info('Monitor cron started');
 }
@@ -230,6 +186,7 @@ async function sweepCopyTrades(): Promise<void> {
             continue;
           }
         }
+      }
 
         // Otherwise verify via RPC
         const outcome = (ct as any).outcome === 'YES' ? 'Yes' : 'No';
@@ -271,9 +228,10 @@ async function sweepCopyTrades(): Promise<void> {
         }
       }
     }
-  } catch (err) {
-    logger.error({ err }, 'Copy trade sweep failed');
-  } finally {
-    sweepRunning = false;
   }
+
+  return {
+    outcome: 'SUCCESS',
+    counters: { checked: confirming.length, confirmed, pending, failed },
+  };
 }

@@ -150,7 +150,9 @@ Chain-write probes (#220): `outbox`, `signers` and `channels` are also listed. E
 
 `GET /health` → `{ status: "healthy", uptime: number }`. Deprecated: it sends `Deprecation: true` and `Link: </readyz>; rel="successor-version"`.
 
-`GET /api/v1/admin/status` (admin JWT) → probe details with latencies, indexer cursor vs RPC latest ledger and lag, last success/failure per cron job (in memory, reset on restart), chain execution mode, agent public key, LLM provider configuration and Gemini breaker state, and process info.
+`GET /api/v1/admin/status` (admin JWT) → probe details with latencies, indexer cursor vs RPC latest ledger and lag, last success/failure per cron job (in memory, reset on restart), chain execution mode, agent public key, LLM provider configuration and Gemini breaker state, per-dependency and per-class RPC/outbound bulkhead metrics (`bulkheads`), and process info.
+
+When an outbound dependency bulkhead rejects or sheds a request, the API returns `503 UPSTREAM_SATURATED` with a `Retry-After` header (seconds) and `error.details`: `{ dependency, class, retryAfter }`.
 
 `chainWrites` (#220): `{ writer, outbox, handlers, balances, channels }`. `outbox` is the row count per status (terminal statuses count only rows whose handler has not run) plus `inFlight`, `oldestInFlightMs`, `pastMaxTime` and `oldestUnhandledMs`. `handlers` is `{ scope: "instance", kinds: { <kind>: { count, lastErrorClass, since } } }` (error class only, never the message). `balances` is the cached snapshot `{ stale, takenAt, accounts: [{ publicKey, role: agent|feePayer|channel, stroops, minStroops, runwayHours, estimated?, checkedAt, error? }] }` with stroops as decimal strings; `runwayHours` is `(stroops − minStroops) / (24 h spend / 24)` and `null` with no spend history; `estimated` means part of the spend is `total_fee` (no `fee_charged`) or a bump's bid fee. `channels` is `{ total, healthy, leased, accounts: [{ publicKey, healthy, stroops, checkedAt }] }`. Public keys only, never secrets.
 
@@ -474,6 +476,28 @@ string; `404 MARKET_NOT_FOUND`.
 `502 CHAIN_ERROR` with `details.contractError: "MarketNotFound"` for an
 unknown id.
 
+#### Market provenance (`GET /markets/:id/provenance`, `GET /markets/on-chain/:onChainMarketId/provenance`)
+
+Public, read-only, rate-limited (`30 req/min/IP`), ledger-aware cached (`shared`, `max-age=60`, ETag derived from `inputsDigest + asOfLedger`) endpoint that audits the complete evidence chain for one market without exposing any locked premium trace content or `previewSources` (#307).
+
+Each link returns `{ name, status, reason?, expected?, observed?, evidence?, verifyCommand? }` where `status` is one of `VERIFIED`, `MISMATCH`, `PENDING`, `UNAVAILABLE`, or `NOT_APPLICABLE`.
+
+Links returned in order:
+1. `proposal` — checks `Market.generationProvenance` (`provider`, `model`, `promptVersion`); `NOT_APPLICABLE` (`PRE_PROVENANCE_MARKET`) for pre-#66 markets.
+2. `question_document` — fetches bytes at `metaUri` via the verified content store/gateway and compares `sha256(bytes)` with `Market.questionHash`. Verify command: `curl -s <IPFS_GATEWAY_URL>/<cid> | sha256sum`.
+3. `question_commitment` — reads `market_core.get_market` and compares `question_hash` and `meta_uri` with the database row. Verify command: `stellar contract invoke --network testnet --id <marketCore> -- get_market --market_id <id>`.
+4. `resolution_commitment` — recomputes `sha256(XDR(ResolutionSpec))` from `Market.resolutionSpec` and compares with both `Market.resolutionHash` and on-chain `resolution_hash` (`PENDING` if the spec is not yet revealed). Independently recompute from the spec JSON with:
+   ```bash
+   echo '<ResolutionSpecJson>' | npx tsx scripts/hash-resolution-spec.ts
+   ```
+5. `resolver_registration` — calls `resolver.state(market_id)`; `PENDING` when `Unconfigured`, `VERIFIED` otherwise.
+6. `creation_transaction` — queries `getTransaction` for `creationTxHash`, `creationInnerTxHash`, and `MarketCreationAttempt.txHash` (handling fee bumps) and verifies a `MarketCreated` event for `onChainMarketId`. Past RPC retention, falls back to the indexed `chain_events` row (`evidence.source = "indexed"`), or reports `UNAVAILABLE` (`OUTSIDE_RETENTION`).
+7. `traces[]` — for every `ReasoningTrace` on the market:
+   - `trace_registry`: compares `reasoning_registry.get_trace` (`trace_hash`, `ipfs_cid`, `market_id`, `agent`) against the stored row (`PENDING` with `TracePublication.status` when unpublished).
+   - `trace_content`: hashes the pinned bytes server-side against `trace_hash` (never returning trace content; reports `NOT_APPLICABLE` / `CONFIDENTIAL` for confidential traces whose hashed bytes are not a public envelope).
+
+Cache invalidation occurs automatically on indexed `MarketCreated`, `MarketResolved`, and `TracePublished` events, when `chainSyncedLedger` advances, or after `PROVENANCE_CACHE_TTL_SECONDS` (default 300 s; `UNAVAILABLE` responses use a 30 s TTL).
+
 #### `POST /markets/generate` (auth, admin, rate-limited)
 
 Starts one market-maker cycle in the background. Admin means the JWT's
@@ -606,7 +630,10 @@ The payload's former `llm: { provider, model }` field is replaced by this block.
 #### `GET /traces`
 
 Query: `agentType`, `marketId`, `page`, `limit`. Response: preview traces,
-pagination in `meta`.
+pagination in `meta`. Each item includes `verified` (true **only** when the
+registry governance verdict is `VALID`), `audit: { status, checkedAt } | null`
+(hash integrity), and `verdict: { kind, reason, effectiveFrom, checkedAt }`
+(`VALID | HASH_MISMATCH | FLAGGED | AGENT_REVOKED_AFTER | UNKNOWN`, #306).
 
 #### `GET /traces/:id` (optional auth)
 
@@ -617,8 +644,11 @@ and validated against deployment network and USDC asset rules. If the x402 servi
 is unavailable or requirements fail validation, `unlockPriceStatus` is `"unknown"`,
 `unlockPriceRaw` is `null`, and no fallback price is invented.
 With a daily pass: the full trace and `accessLevel: "DAILY_PASS"`.
-(Previously the route never read the token, so subscribers always got the
-preview. Fixed.)
+Both preview and full responses include `verdict: { kind, reason, effectiveFrom, checkedAt }`
+(paid unlocks continue to show the unlocked content alongside the verdict banner data).
+Anonymous requests receive `public, max-age=300` only when the trace is published
+and `verdict.kind === "VALID"`; non-`VALID` traces use `private, max-age=0, must-revalidate`
+and include `verdict` and `verdictVersion` in the ETag validator.
 
 #### `POST /traces/verify` (auth)
 
@@ -1113,7 +1143,10 @@ Response:
 
 The direction comes from the trace's edge. The server refuses when there's
 no trace, the edge is zero, the market has no `onChainMarketId`
-(`409 MARKET_NOT_ON_CHAIN`, `422 NO_EDGE`), or the user has reached the open copy trade
+(`409 MARKET_NOT_ON_CHAIN`, `422 NO_EDGE`), the trace's registry verdict is not
+`VALID` (`409 TRACE_NOT_TRUSTED` with `details.verdict`; re-read live with a
+60 s cache whenever the stored check is older than `COPY_TRADE_VERDICT_MAX_AGE_SECS`),
+or the user has reached the open copy trade
 limit (`429 COPY_TRADE_LIMIT_REACHED` when ≥ `COPY_TRADE_MAX_PENDING` open trades exist).
 Unconfirmed trades expire after `COPY_TRADE_TTL_MINUTES` (default 30).
 `min_shares_out` isn't in the payload because it must come from a quote taken right before signing.
@@ -1581,6 +1614,122 @@ wallet. The backend never signs or sends it.
 | 422 | `SIMULATION_FAILED` | `details.contractError` names the resolver error. |
 | 503 | `GUARDIAN_NOT_CONFIGURED` | `RESOLVER_GUARDIAN_ADDRESS` is not set. |
 
+#### `GET /admin/fees` (auth, `admin.read`)
+Returns actual on-chain fee spend against simulated estimates per operation class and day, a per-payer breakdown (agent account, channel accounts, and fee-bump payer), legacy estimate row count, and the fee oracle snapshot with observed charged-to-simulated ratios (#39, #308).
+
+```json
+{
+  "oracle": {
+    "networkPassphrase": "Test SDF Network ; September 2015",
+    "stale": false,
+    "policies": {
+      "trade": { "percentile": "p80", "floor": "10000", "cap": "2000000", "budget": "25000000" }
+    },
+    "observed": {
+      "trade": {
+        "sampleCount": 42,
+        "observedResourceRatio": 0.74,
+        "p95ChargedResource": "1850000",
+        "budgetUtilization": 0.074,
+        "warning": false,
+        "refreshedAt": "2026-10-20T00:07:00.000Z"
+      }
+    }
+  },
+  "report": [
+    {
+      "opClass": "trade",
+      "day": "2026-10-20T00:00:00.000Z",
+      "count": 12,
+      "estimatedTotal": "24000000",
+      "chargedTotal": "18200000",
+      "totalCharged": "18200000",
+      "refundedTotal": "5800000",
+      "rentTotal": "120000",
+      "p50Charged": "1450000",
+      "p95Charged": "2100000",
+      "failedCount": 1,
+      "failedCharged": "950000",
+      "chargedToSimulatedRatio": 0.758
+    }
+  ],
+  "byPayer": [
+    {
+      "payer": "G…",
+      "role": "agent",
+      "count": 10,
+      "feeBumpedCount": 0,
+      "estimatedTotal": "20000000",
+      "chargedTotal": "15000000",
+      "refundedTotal": "5000000",
+      "rentTotal": "100000",
+      "failedCount": 1,
+      "failedCharged": "950000"
+    }
+  ],
+  "estimateRowCount": 0
+}
+```
+
+Field semantics (all fee amounts are in stroops as decimal strings):
+- `declaredFee` (stored per row) / `estimatedTotal` (report): the declared envelope fee (`inclusionFee + simulated minResourceFee`, or outer fee when bumped).
+- `chargedTotal` / `totalCharged`: actual stroops debited on-chain (`TransactionResult.feeCharged`), computed strictly from `source = 'RECEIPT'` rows (legacy `ESTIMATE` rows are excluded and counted in `estimateRowCount`).
+- `refundedTotal`: sum of `declaredResourceFee − (nonRefundableCharged + refundableCharged)` across receipts where `SorobanTransactionMetaExtV1` was present.
+- `rentTotal`: sum of `rentFeeCharged` from `SorobanTransactionMetaExtV1`.
+- `failedCount` / `failedCharged`: count and total stroops charged by transactions that reached a ledger with `FAILED` status.
+- `chargedToSimulatedRatio`: ratio of charged resource fees (`nonRefundable + refundable`) to simulated `resourceFee` estimates.
+
+#### `GET /admin/price-markets/health` (auth, `admin.read`)
+Returns Reflector feed health for every open price-mode market (`ACTIVE` / `RESOLVING`) and post-resolution verification verdicts for closed price-mode markets (#309):
+
+```json
+{
+  "open": [
+    {
+      "marketId": "uuid",
+      "onChainMarketId": "12",
+      "question": "Will the Reflector BTC/USD price be at or above 100,000 at 2026-11-01T00:00:00Z?",
+      "status": "ACTIVE",
+      "expiryTimestamp": "2026-11-01T00:00:00.000Z",
+      "secsToClose": 3400,
+      "latestCheck": {
+        "checkedAt": "2026-10-31T23:03:20.000Z",
+        "ledger": 5123456,
+        "severity": "WARN",
+        "health": {
+          "marketId": "uuid",
+          "supported": true,
+          "lastTs": "1793487300",
+          "ageSecs": 500,
+          "decimalsNow": 14,
+          "decimalsChanged": false,
+          "resolutionNow": 300,
+          "resolutionChanged": false,
+          "gapSlots": 1,
+          "severity": "WARN",
+          "reasons": ["FEED_AGING", "GRID_GAPS"]
+        }
+      }
+    }
+  ],
+  "closed": [
+    {
+      "marketId": "uuid",
+      "onChainMarketId": "11",
+      "status": "RESOLVED",
+      "resolvedOutcome": true,
+      "snapshotCaptured": true,
+      "verification": {
+        "eventId": "0005123000-0000000000",
+        "verdict": "CONSISTENT",
+        "detail": { "distanceToThresholdBps": 240, "deviationFromMedianBps": 12 },
+        "checkedAt": "2026-10-31T00:05:10.000Z"
+      }
+    }
+  ]
+}
+```
+
 ### Treasury admin console (auth, admin)
 
 The backend never holds the treasury admin key. It prepares unsigned,
@@ -1863,9 +2012,9 @@ Every endpoint defines an explicit cache policy and strong ETag derivation. Expr
 | `GET /markets/:id` (resolved/cancelled) | `immutable` | `public, max-age=86400, immutable` | `market.updatedAt`, status, counts |
 | `GET /markets/on-chain/:id` | `shared` / `immutable` | same as `GET /markets/:id` | same as `GET /markets/:id` |
 | `GET /markets/on-chain/:id/state` | `shared` | `public, max-age=5, stale-while-revalidate=10` | Canonical body ETag (live simulation) |
-| `GET /traces` | `shared` | `public, max-age=10, stale-while-revalidate=60` | `max(updatedAt)`, count, pagination |
-| `GET /traces/:id` (anon published) | `shared` | `public, max-age=300` | `trace.updatedAt`, verified, onChainTraceId |
-| `GET /traces/:id` (authenticated) | `personalised` | `private, max-age=0, must-revalidate, Vary: Authorization` | `authClass`, `trace.updatedAt` |
+| `GET /traces` | `shared` | `public, max-age=10, stale-while-revalidate=60` | `max(updatedAt)`, `max(verdictCheckedAt)`, count, pagination |
+| `GET /traces/:id` (anon published, `VALID`) | `shared` | `public, max-age=300` | `trace.updatedAt`, `verified`, `onChainTraceId`, `verdict`, `verdictVersion` |
+| `GET /traces/:id` (authenticated or non-`VALID`) | `personalised` | `private, max-age=0, must-revalidate, Vary: Authorization` | `authClass`, `trace.updatedAt`, `verdict`, `verdictVersion` |
 | `GET /portfolio` | `shared` | `public, max-age=15, stale-while-revalidate=60` | Canonical body ETag |
 | `GET /portfolio/positions` | `shared` | `public, max-age=15, stale-while-revalidate=60` | `max(updatedAt)`, count |
 | `GET /portfolio/stats` | `shared` | `public, max-age=15, stale-while-revalidate=60` | `max(updatedAt)`, counts |

@@ -10,6 +10,14 @@ export interface OpenAILike {
   chat: { completions: { create(body: any, options?: any): Promise<any> } };
 }
 
+export interface OpenAILike {
+  chat: {
+    completions: {
+      create(body: any, options?: any): Promise<any>;
+    };
+  };
+}
+
 const cache = new Map<string, OpenAI>();
 let override: OpenAILike | null = null;
 
@@ -94,18 +102,19 @@ export const openaiProvider: LlmProvider = {
         },
         { signal: req.signal, classify: classifyOpenAIError },
       );
-      const text = completion.choices?.[0]?.message?.content?.trim();
-      if (!text) throw new LlmError('empty', 'openai', 'OpenAI-compatible provider returned an empty response', undefined, []);
-      return {
-        text,
-        usage: {
-          inputTokens: completion.usage?.prompt_tokens,
-          outputTokens: completion.usage?.completion_tokens,
-        },
-      };
     } catch (err) {
       if (err instanceof LlmError || err instanceof AppError) throw err;
       throw mapOpenAIError(err);
     }
+
+    const text = completion.choices?.[0]?.message?.content?.trim();
+    if (!text) throw new LlmError('empty', 'openai', 'OpenAI-compatible provider returned an empty response', undefined, []);
+    return {
+      text,
+      usage: {
+        inputTokens: completion.usage?.prompt_tokens,
+        outputTokens: completion.usage?.completion_tokens,
+      },
+    };
   },
 };

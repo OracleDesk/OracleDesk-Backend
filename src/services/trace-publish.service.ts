@@ -13,7 +13,7 @@ import { verifyTraceHash, sha256Hex } from '../utils/hash.util';
 import { Prisma } from '@prisma/client';
 import { fetchIpfsBytes } from './ipfs.service';
 import { getOnChainTrace, printable } from './chain.service';
-import { registerHandler, type ChainTransactionRow, type CompletionOutcome } from './stellar/outbox';
+import { registerHandler, type ChainTransactionRow, type CompletionContext, type CompletionOutcome } from './stellar/outbox';
 import { processPublication } from '../jobs/trace-publication.worker';
 import type { TraceAction } from '../lib/trace-actions';
 import { fetchVerifiedBytes, pinJson, prepareDocument } from './ipfs.service';
@@ -39,11 +39,15 @@ import crypto from 'node:crypto';
  * exactly like the indexer's TracePublished projection. Failures are left to
  * the publication worker's own retry state machine.
  */
-export async function handleTracePublishOutcome(row: ChainTransactionRow, outcome: CompletionOutcome): Promise<void> {
+export async function handleTracePublishOutcome(
+  row: ChainTransactionRow,
+  outcome: CompletionOutcome,
+  ctx: CompletionContext,
+): Promise<void> {
   const traceId = row.refId;
   if (!traceId || outcome.status !== 'SUCCESS') return;
   const onChainTraceId = BigInt(String(outcome.value ?? '0'));
-  await prisma.reasoningTrace.updateMany({
+  await ctx.tx.reasoningTrace.updateMany({
     where: { id: traceId, onChainTraceId: null },
     data: {
       onChainTraceId,
@@ -52,7 +56,7 @@ export async function handleTracePublishOutcome(row: ChainTransactionRow, outcom
       verified: true,
     },
   });
-  await prisma.tracePublication.updateMany({
+  await ctx.tx.tracePublication.updateMany({
     where: { traceId, status: { in: ['AWAITING_MARKET', 'READY', 'SUBMITTED'] } },
     data: { status: 'CONFIRMED', confirmedAt: new Date(), lastError: null },
   });
@@ -89,23 +93,119 @@ export async function enqueueTracePublication(
   return { id: row.id };
 }
 
+export interface TraceCheckInput {
+  id: string;
+  onChainTraceId: bigint;
+  traceHash: string | null;
+  ipfsCid?: string | null;
+  agentWallet?: string | null;
+  contentMode?: string | null;
+  plaintextHash?: string | null;
+}
+
+export interface CheckTraceDeps {
+  getOnChainTrace?: (traceId: bigint) => Promise<{
+    trace_hash: Buffer | string;
+    ipfs_cid: string;
+    market_id: bigint;
+    agent: string;
+    action?: string;
+    published_at?: bigint;
+  }>;
+  fetchVerifiedBytes?: typeof fetchVerifiedBytes;
+}
+
+export interface TraceRegistryCheckResult {
+  traceId: string;
+  onChainTraceId: string;
+  ipfsCid: string;
+  onChainHash: string;
+  onChainMarketId: bigint;
+  onChainAgent: string;
+  storedHash: string | null;
+  storedCid: string | null;
+  computedHash: string | null;
+  hashMatchesStored: boolean;
+  cidMatchesStored: boolean;
+  bytesVerified: boolean | null;
+  contentSource: 'cache' | 'gateway' | null;
+  contentError?: string;
+}
+
+/**
+ * Pure, read-only verification core (#307): reads the on-chain registry trace
+ * and optionally fetches & hashes the pinned bytes without writing audit columns.
+ */
+export async function checkTraceAgainstRegistry(
+  trace: TraceCheckInput,
+  deps: CheckTraceDeps & { fetchContent?: boolean; verifiedBy?: string } = {},
+): Promise<TraceRegistryCheckResult> {
+  const readTrace = deps.getOnChainTrace ?? getOnChainTrace;
+  const fetchBytes = deps.fetchVerifiedBytes ?? fetchVerifiedBytes;
+  const onChain = await readTrace(trace.onChainTraceId);
+  const onChainHash = Buffer.isBuffer(onChain.trace_hash)
+    ? onChain.trace_hash.toString('hex').toLowerCase()
+    : String(onChain.trace_hash).toLowerCase();
+
+  const storedHash = trace.traceHash?.toLowerCase() ?? null;
+  const storedCid = trace.ipfsCid ?? null;
+  const hashMatchesStored = storedHash !== null && storedHash === onChainHash;
+  const cidMatchesStored = storedCid !== null && storedCid === onChain.ipfs_cid;
+
+  let computedHash: string | null = null;
+  let bytesVerified: boolean | null = null;
+  let contentSource: 'cache' | 'gateway' | null = null;
+  let contentError: string | undefined;
+
+  if (deps.fetchContent !== false) {
+    try {
+      const { bytes, source } = await fetchBytes(
+        onChain.ipfs_cid,
+        onChainHash,
+        deps.verifiedBy ?? `reasoning_registry:trace:${trace.onChainTraceId}`,
+      );
+      computedHash = sha256Hex(bytes).toLowerCase();
+      bytesVerified = verifyTraceHash(bytes, onChainHash);
+      contentSource = source;
+    } catch (err) {
+      contentError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  return {
+    traceId: trace.id,
+    onChainTraceId: trace.onChainTraceId.toString(),
+    ipfsCid: onChain.ipfs_cid,
+    onChainHash,
+    onChainMarketId: BigInt(onChain.market_id),
+    onChainAgent: onChain.agent,
+    storedHash: trace.traceHash,
+    storedCid,
+    computedHash,
+    hashMatchesStored,
+    cidMatchesStored,
+    bytesVerified,
+    contentSource,
+    ...(contentError ? { contentError } : {}),
+  };
+}
+
 /**
  * Fetches the content at the on-chain CID, hashes the exact bytes and
- * compares them with the on-chain trace_hash.
+ * compares them with the on-chain trace_hash. Writes audit status on the row.
  */
 export async function verifyTraceOnChain(
   traceId: string,
 ): Promise<TraceVerification & { contentMode?: string; plaintextHash?: string | null }> {
-  const trace = await prisma.reasoningTrace.findUnique({
+  const trace = (await prisma.reasoningTrace.findUnique({
     where: { id: traceId },
     select: {
       id: true,
       onChainTraceId: true,
       traceHash: true,
-      contentMode: true,
-      plaintextHash: true,
+      ipfsCid: true,
     },
-  });
+  })) as (TraceCheckInput & { onChainTraceId: bigint | null }) | null;
   if (!trace) throw new AppError(404, 'TRACE_NOT_FOUND', 'Reasoning trace not found');
   if (trace.onChainTraceId === null) {
     throw new AppError(
@@ -115,14 +215,14 @@ export async function verifyTraceOnChain(
     );
   }
 
-  const onChain = await getOnChainTrace(trace.onChainTraceId);
-  const onChainHash = Buffer.from(onChain.trace_hash).toString('hex');
-  const { bytes, source } = await fetchVerifiedBytes(
-    onChain.ipfs_cid,
-    onChainHash,
-    `reasoning_registry:trace:${trace.onChainTraceId}`,
-  );
-  const verified = verifyTraceHash(bytes, onChainHash);
+  const checked = await checkTraceAgainstRegistry({
+    ...trace,
+    onChainTraceId: trace.onChainTraceId,
+  });
+  if (checked.contentError || checked.computedHash === null || checked.bytesVerified === null) {
+    throw new AppError(502, 'IPFS_RETRIEVAL_FAILED', checked.contentError ?? 'Could not retrieve trace content');
+  }
+  const verified = checked.bytesVerified;
 
   await prisma.reasoningTrace.update({
     where: { id: traceId },
@@ -135,13 +235,13 @@ export async function verifyTraceOnChain(
 
   return {
     traceId,
-    onChainTraceId: trace.onChainTraceId.toString(),
-    ipfsCid: onChain.ipfs_cid,
-    onChainHash,
-    computedHash: sha256Hex(bytes),
+    onChainTraceId: checked.onChainTraceId,
+    ipfsCid: checked.ipfsCid,
+    onChainHash: checked.onChainHash,
+    computedHash: checked.computedHash,
     storedHash: trace.traceHash,
     verified,
-    contentSource: source,
+    contentSource: checked.contentSource ?? 'gateway',
     verifiedAt: new Date(),
     contentMode: trace.contentMode,
     plaintextHash: trace.plaintextHash,

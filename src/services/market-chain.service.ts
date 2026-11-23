@@ -26,7 +26,7 @@ import {
   type WriteResult,
 } from './chain.service';
 import { ChainError, ChainPendingError } from './stellar/errors';
-import { registerHandler, type ChainTransactionRow, type CompletionOutcome } from './stellar/outbox';
+import { registerHandler, type ChainTransactionRow, type CompletionContext, type CompletionOutcome } from './stellar/outbox';
 import { MIN_SEED_RAW, initialYesBps, decideSeed, type SeedDecision, type SeedPolicyConfig } from './seed-policy.service';
 import { agentSigner } from './stellar/clients';
 import { pinJson, prepareDocument } from './ipfs.service';
@@ -44,12 +44,15 @@ import {
 export { MIN_SEED_RAW, initialYesBps };
 
 /**
- * Completion handler for `market.create` outbox rows (#35): links the landed
- * on-chain market id to the database market, whether confirmation arrived
- * inline or from the recovery worker after a crash. It never overwrites an
- * existing, different onChainMarketId — that would re-point live positions.
+ * Completion handler for `market.create` outbox rows (#35, #290): links the
+ * landed on-chain market id to the database market inside the outbox
+ * transaction using `ctx.tx` (never global `prisma`).
  */
-export async function handleMarketCreateOutcome(row: ChainTransactionRow, outcome: CompletionOutcome): Promise<void> {
+export async function handleMarketCreateOutcome(
+  row: ChainTransactionRow,
+  outcome: CompletionOutcome,
+  ctx: CompletionContext,
+): Promise<void> {
   const marketId = row.refId;
   if (!marketId) return;
 
@@ -65,7 +68,7 @@ export async function handleMarketCreateOutcome(row: ChainTransactionRow, outcom
   }
 
   const onChainMarketId = BigInt(String(outcome.value ?? '0'));
-  const existing = await prisma.market.findUnique({ where: { id: marketId }, select: { onChainMarketId: true } });
+  const existing = await ctx.tx.market.findUnique({ where: { id: marketId }, select: { onChainMarketId: true } });
   if (!existing) return;
   if (existing.onChainMarketId != null) {
     if (existing.onChainMarketId !== onChainMarketId) {
@@ -76,7 +79,7 @@ export async function handleMarketCreateOutcome(row: ChainTransactionRow, outcom
     }
     return;
   }
-  await linkLandedMarket(marketId, onChainMarketId, outcome.txHash ?? null);
+  await linkLandedMarket(marketId, onChainMarketId, outcome.txHash ?? null, ctx.tx);
 }
 
 registerHandler('market.create', handleMarketCreateOutcome);
@@ -472,7 +475,7 @@ export async function submitMarketCreation(
     // simply stays Unconfigured until then.
     if (spec.kind === 'price') {
       try {
-        await revealPriceSpec(result.value, spec);
+        await revealPriceSpec(result.value, spec, { marketId: market.id });
         logger.info({ marketId: market.id, onChainMarketId: result.value.toString() }, 'Price spec revealed');
       } catch (err) {
         await writeAgentLog({

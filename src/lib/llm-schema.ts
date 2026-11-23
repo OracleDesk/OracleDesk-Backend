@@ -373,8 +373,21 @@ export const marketProposalSpec = defineStructured(
 
 // ─── Trace reasoning ──────────────────────────────────────────────────────────
 
+export const llmHedgePredicateSchema = z.object({
+  kind: z.enum(['fred_series', 'news_entity_count']),
+  series_id: z.enum(['FEDFUNDS', 'CPIAUCSL', 'UNRATE', 'T10Y2Y']).nullable(),
+  entities: z.array(z.string()).nullable(),
+  window_hours: z.number().int().nullable(),
+  comparator: z.enum(['gt', 'gte', 'lt', 'lte']),
+  threshold: z.number(),
+  unit: z.enum(['percent', 'index', 'spread', 'articles']),
+  action: z.enum(['EXIT', 'REFORECAST']),
+  description: z.string(),
+});
+
 export const traceReasoningSchema = z.object({
   hedge_conditions: z.array(z.string()),
+  hedge_predicates: z.array(llmHedgePredicateSchema).optional(),
   reasoning_summary: z.string().min(10),
   key_signals: z.array(z.string()),
   risk_factors: z.array(z.string()),

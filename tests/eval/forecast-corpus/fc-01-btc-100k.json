@@ -1,0 +1,21 @@
+{
+  "id": "fc-01-btc-100k",
+  "marketId": "mkt-fc-01",
+  "question": "Will Bitcoin trade above $100,000 before December 1, 2026?",
+  "category": "CRYPTO",
+  "closeTime": "2026-11-30T23:59:59.000Z",
+  "resolutionSource": "CHAINLINK",
+  "questionDoc": null,
+  "signals": [
+    {
+      "id": "sig-fc-01-a",
+      "source": "NEWSAPI",
+      "title": "Bitcoin surges past $96,000 on institutional inflows",
+      "publishedAt": "2026-11-10T10:00:00.000Z"
+    }
+  ],
+  "asOf": "2026-11-10T12:00:00.000Z",
+  "marketProbability": 0.62,
+  "resolvedOutcome": 1,
+  "resolvedAt": "2026-11-18T15:00:00.000Z"
+}

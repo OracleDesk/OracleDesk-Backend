@@ -1,9 +1,5 @@
-import cron from 'node-cron';
 import { processTracePublications } from '../jobs/trace-publication.worker';
-import { logger } from '../lib/logger';
-import { config } from '../config';
-
-let isRunning = false;
+import { scheduleJob } from './registry';
 
 /**
  * Trace publication cron (#131). Every TRACE_PUBLISH_CRON (default 30 s) it
@@ -12,22 +8,11 @@ let isRunning = false;
  * FOR UPDATE SKIP LOCKED, so several processes can run this safely.
  */
 export function startTracePublicationCron(): void {
-  if (!config.TRACE_PUBLISH_ENABLED) {
-    logger.info('Trace publication cron is disabled by config (TRACE_PUBLISH_ENABLED=false)');
-    return;
-  }
-
-  cron.schedule(config.TRACE_PUBLISH_CRON, async () => {
-    if (isRunning) return;
-    isRunning = true;
-    try {
-      await processTracePublications();
-    } catch (err) {
-      logger.error({ err }, 'Trace publication cron encountered an error');
-    } finally {
-      isRunning = false;
-    }
+  scheduleJob('trace-publication', async () => {
+    const res = await processTracePublications();
+    return {
+      outcome: 'SUCCESS',
+      counters: { processed: res.processed, ...res.byStatus },
+    };
   });
-
-  logger.info({ cronSchedule: config.TRACE_PUBLISH_CRON }, 'Trace publication cron scheduled');
 }

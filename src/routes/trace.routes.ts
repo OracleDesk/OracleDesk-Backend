@@ -35,13 +35,17 @@ router.get(
       ...(typeof marketId === 'string' && marketId ? { marketId } : {}),
     };
     const [agg, count] = await Promise.all([
-      prisma.reasoningTrace.aggregate({ where, _max: { updatedAt: true } }),
+      (prisma.reasoningTrace.aggregate as any)({
+        where,
+        _max: { updatedAt: true, verdictCheckedAt: true },
+      }),
       prisma.reasoningTrace.count({ where }),
     ]);
     const maxUpdated = agg._max.updatedAt?.toISOString() ?? '0';
+    const maxVerdictChecked = agg._max.verdictCheckedAt?.toISOString() ?? '0';
     const page = req.query.page ?? '1';
     const limit = req.query.limit ?? '20';
-    return `traces:${maxUpdated}:${count}:${page}:${limit}`;
+    return `traces:${maxUpdated}:${maxVerdictChecked}:${count}:${page}:${limit}`;
   }),
   listTraces,
 );
@@ -75,7 +79,7 @@ router.get(
       select: { id: true, updatedAt: true, verified: true, onChainTraceId: true },
     });
     if (!trace) return null;
-    return `trace:${trace.id}:${trace.updatedAt.toISOString()}:${trace.verified}:${trace.onChainTraceId ?? ''}`;
+    return `trace:${trace.id}:${trace.updatedAt.toISOString()}:${trace.verified}:${trace.onChainTraceId ?? ''}:${trace.verdict ?? 'UNKNOWN'}:${trace.verdictVersion ?? 0}`;
   }),
   getTrace,
 );
