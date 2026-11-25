@@ -5,7 +5,8 @@ import { config } from '../config';
 import { deadline } from '../lib/resilience';
 import { shutdownController } from '../lib/shutdown';
 import { prodTraderEnv } from './trader-env';
-import { DEFAULT_PARAMS, runTraderPolicy } from './trader-policy';
+import { runTraderPolicy } from './trader-policy';
+import { snapshotTrader, traderParamsFromSnapshot } from '../services/risk-params.service';
 
 /**
  * Trader Agent — main execution loop.
@@ -38,7 +39,9 @@ export async function runTraderCycle(opts?: { signal?: AbortSignal }): Promise<v
 
   try {
     signal.throwIfAborted();
-    await runTraderPolicy(prodTraderEnv(), DEFAULT_PARAMS, { signal });
+    const snap = await snapshotTrader();
+    const params = traderParamsFromSnapshot(snap);
+    await runTraderPolicy(prodTraderEnv(params), params, { signal });
   } catch (err) {
     logger.error({ err }, 'Trader Agent: unhandled cycle error');
     await writeAgentLog({ agentType: 'TRADER', level: 'ERROR', action: 'CYCLE_FAILED', error: String(err) });

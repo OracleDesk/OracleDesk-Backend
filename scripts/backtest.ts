@@ -35,6 +35,8 @@ const HELP = `Usage: backtest [options]
   --fee-bps <n>             pool fee (default: inferred from history)
   --events-file <path>      offline JSON input instead of the database
   --out <dir>               where report.json and report.md go            default ./backtest-out
+  --params-file <path>      JSON file validated as TraderParamsV1 (#274)
+  --params-version <n>      load trader params version n from the database (#274)
 `;
 
 function parseTime(label: string, value: string | undefined): string {
@@ -104,7 +106,9 @@ async function main(): Promise<void> {
     options: {
       from: { type: 'string' }, to: { type: 'string' }, 'bankroll-raw': { type: 'string' }, 'max-trade-raw': { type: 'string' },
       'max-market-raw': { type: 'string' }, 'max-daily-raw': { type: 'string' }, impact: { type: 'string' }, forecaster: { type: 'string' },
-      seed: { type: 'string' }, sizing: { type: 'string' }, 'fee-bps': { type: 'string' }, 'events-file': { type: 'string' }, out: { type: 'string' }, help: { type: 'boolean' },
+      seed: { type: 'string' }, sizing: { type: 'string' }, 'fee-bps': { type: 'string' },
+      'params-file': { type: 'string' }, 'params-version': { type: 'string' },
+      'events-file': { type: 'string' }, out: { type: 'string' }, help: { type: 'boolean' },
     },
   });
   if (values.help) { process.stdout.write(HELP); return; }
@@ -122,6 +126,24 @@ async function main(): Promise<void> {
   const sizing = values.sizing ?? 'impact';
   if (sizing !== 'impact' && sizing !== 'mid') throw new Error('--sizing must be impact or mid');
 
+  let traderParams = { ...DEFAULT_PARAMS, sizing };
+  if (values['params-file']) {
+    const { parseTraderParams } = await import('../src/lib/risk-params');
+    const json = JSON.parse(fs.readFileSync(values['params-file'], 'utf8'));
+    traderParams = { ...parseTraderParams(json), sizing };
+  } else if (values['params-version']) {
+    const version = Number(values['params-version']);
+    if (!Number.isInteger(version) || version < 1) throw new Error('--params-version must be a positive integer');
+    const { prisma } = await import('../src/lib/prisma');
+    const row = await prisma.riskParamSet.findFirst({ where: { scope: 'TRADER', version } });
+    await prisma.$disconnect();
+    if (!row) throw new Error(`no TRADER risk param set version ${version}`);
+    const { parseTraderParams, traderParamsHash } = await import('../src/lib/risk-params');
+    const parsed = parseTraderParams(row.params);
+    if (traderParamsHash(parsed) !== row.paramsHash) throw new Error('params hash mismatch');
+    traderParams = { ...parsed, sizing };
+  }
+
   const bankrollRaw = raw(values['bankroll-raw'], 10_000);
   const cfg: BacktestConfig = {
     from, to, stepMinutes: 15, bankrollRaw,
@@ -133,7 +155,7 @@ async function main(): Promise<void> {
     feeBps: values['fee-bps'] === undefined ? undefined : Number(values['fee-bps']),
     // The policy sizes from the simulated treasury's cash and caps (#76),
     // on the pool's curve or at the mid (#225).
-    params: { ...DEFAULT_PARAMS, sizing },
+    params: traderParams,
   };
   if (!Number.isInteger(cfg.seed)) throw new Error('--seed must be an integer');
 

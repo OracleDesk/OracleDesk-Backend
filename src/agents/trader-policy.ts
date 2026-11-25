@@ -14,9 +14,10 @@
  *   5. For each mispriced market: size against the FPMM curve within the
  *      treasury's headroom (#225), check correlation, then trace and execute
  */
-import { MIN_EDGE_THRESHOLD } from '../services/kelly';
+import { compiledTraderParamsV1, type TraderParamsV1 } from '../lib/risk-params';
 import { sizeAgainstPool, sizeAtMid, type ImpactSizing } from '../services/impact-kelly';
-import { evaluateDailyDrawdown } from '../services/hedging.service';
+import { evaluateDailyDrawdown, type HedgingRiskParams } from '../services/hedging.service';
+import type { CorrelationRiskParams } from '../services/correlation.service';
 import {
   MIN_TRADE_RAW,
   budgetSnapshot,
@@ -32,34 +33,33 @@ import type { MarketView, TraderEnv, DecisionPrice, PoolView } from './trader-en
 import { StalePriceError } from '../services/market-price.service';
 import type { AggregatedSignals } from '../types';
 
-export interface TraderParams {
-  minEdge: number;
-  minLiquidity: number;
-  horizonDays: number;
-  /** Share of daily and per-market headroom left unused, in basis points (#76). */
-  headroomSafetyBps: number;
-  /** A budget older than this is re-read before the next order (#76). */
-  budgetMaxAgeMs: number;
+export type TraderParams = TraderParamsV1 & {
   /**
    * 'impact' (default) sizes against the FPMM curve (#225); 'mid' is the
    * closed-form half-Kelly at the mid, kept for backtest comparison.
    */
   sizing?: 'impact' | 'mid';
-}
-
-export const DEFAULT_PARAMS: TraderParams = {
-  minEdge: 0.08,
-  minLiquidity: 500,
-  horizonDays: 14,   // markets expiring within 14 days
-  headroomSafetyBps: config.TREASURY_HEADROOM_SAFETY_BPS,
-  budgetMaxAgeMs: 60_000,
-  sizing: 'impact',
+  /** Active risk-param set at cycle start (#274). */
+  paramsVersion?: { version: number; hash: string };
 };
 
-/** Fractional Kelly applied to the curve optimum. */
-const KELLY_MULTIPLIER = 0.5;
-/** MAX_SINGLE_POSITION_PCT of kelly.ts, in basis points of free cash. */
-const MAX_SINGLE_POSITION_BPS = 250n;
+export const DEFAULT_PARAMS: TraderParams = { ...compiledTraderParamsV1(), sizing: 'impact' };
+
+function hedgingFromParams(params: TraderParams): HedgingRiskParams {
+  return {
+    stopLossBps: params.stopLossBps,
+    hedgeLossBps: params.hedgeLossBps,
+    maxDailyDrawdownPct: params.maxDailyDrawdownPct,
+    drawdownPauseHours: params.drawdownPauseHours,
+  };
+}
+
+function correlationFromParams(params: TraderParams): CorrelationRiskParams {
+  return {
+    maxCorrelatedExposurePct: params.maxCorrelatedExposurePct,
+    correlationThreshold: params.correlationThreshold,
+  };
+}
 
 /** Ledger context recorded with every BuyOrder and SizingRecord (#266). */
 export interface PriceAsOf {
@@ -90,6 +90,8 @@ export interface ImpactRecord {
 
 /** The sizing decision recorded in the trace: every intermediate size in base units (#76). */
 export interface SizingRecord {
+  /** Risk parameter set used for this decision (#274). */
+  params?: { version: number; hash: string };
   /** The curve-optimal size within the caps, before correlation (#225). */
   kellyRaw: string;
   correlationRaw: string;
@@ -156,7 +158,7 @@ export async function runTraderPolicy(
   // Step 1: Check daily drawdown limit against the live bankroll
   const now = env.clock.now();
   const closedToday = await env.closedPnlSince(env.clock.startOfDay());
-  const drawdown = evaluateDailyDrawdown(closedToday, budget.availableRaw, now);
+  const drawdown = evaluateDailyDrawdown(closedToday, budget.availableRaw, now, hedgingFromParams(params));
   if (drawdown.isPaused) {
     await recordDecision({
       kind: 'DRAWDOWN_PAUSE',
@@ -348,16 +350,24 @@ async function analyzeAndTradeMarket(
     const sidePrice = edge > 0 ? marketProb : 1 - marketProb;
     const direction = edge > 0 ? 'YES' : 'NO';
 
-    if (conservativeProb - sidePrice < MIN_EDGE_THRESHOLD) {
-      // The point edge clears minEdge but the conservative end of the interval
-      // does not: intended, the forecast is too uncertain to size (#75). The
-      // gate calculateKellySize applied, kept as is when sizing moved to the curve (#225).
-      logger.debug({ marketId: market.id, edge, conservativeProb, sidePrice }, 'SIZE_ZERO_WIDE_CI: interval too wide to size');
+    if (conservativeProb - sidePrice < params.minConservativeEdge) {
+      logger.debug(
+        { marketId: market.id, edge, conservativeProb, sidePrice, minConservativeEdge: params.minConservativeEdge },
+        'Conservative edge below minimum',
+      );
       await recordDecision({
-        kind: 'SKIP', marketId: market.id,
-        reasonCode: 'SIZE_ZERO_WIDE_CI',
+        kind: 'SKIP',
+        marketId: market.id,
+        reasonCode: 'CONSERVATIVE_EDGE_BELOW_MIN',
         forecastRef,
-        data: { reason: 'SIZE_ZERO_WIDE_CI', direction, edge, p: agentProb, ci: confidenceInterval },
+        data: {
+          reason: 'CONSERVATIVE_EDGE_BELOW_MIN',
+          direction,
+          edge,
+          minConservativeEdge: params.minConservativeEdge,
+          p: agentProb,
+          ci: confidenceInterval,
+        },
       });
       return false;
     }
@@ -402,7 +412,8 @@ async function analyzeAndTradeMarket(
     const caps = clampSize(budget.availableRaw, budget, headroomRaw, params.headroomSafetyBps);
     let capRaw = caps.sizeRaw;
     let capBinding: SizingBinding = caps.binding === 'KELLY' ? 'AVAILABLE' : caps.binding;
-    const positionCapRaw = (budget.availableRaw * MAX_SINGLE_POSITION_BPS) / 10_000n;
+    const positionCapBps = BigInt(Math.round(params.maxSinglePositionPct * 10_000));
+    const positionCapRaw = (budget.availableRaw * positionCapBps) / 10_000n;
     if (positionCapRaw < capRaw) {
       capRaw = positionCapRaw;
       capBinding = 'KELLY';
@@ -412,7 +423,7 @@ async function analyzeAndTradeMarket(
     const reserves: PoolView = pool;
     const sizeWithin = (maxRaw: bigint) => (model === 'mid' ? sizeAtMid : sizeAgainstPool)({
       p: conservativeProb, side: direction, pool: reserves, wealthRaw: budget.availableRaw,
-      maxRaw, kellyMultiplier: KELLY_MULTIPLIER, minRaw: MIN_TRADE_RAW,
+      maxRaw, kellyMultiplier: params.kellyMultiplier, minRaw: MIN_TRADE_RAW,
     });
     let sized = sizeWithin(capRaw);
     const kellyRaw = sized.collateralRaw;
@@ -426,7 +437,7 @@ async function analyzeAndTradeMarket(
     let correlation: Awaited<ReturnType<TraderEnv['correlation']>> | null = null;
     if (kellyRaw > 0n) {
       const proposed = toDisplayUsdc(kellyRaw);
-      correlation = await env.correlation(market.id, proposed, direction, bankroll);
+      correlation = await env.correlation(market.id, proposed, direction, bankroll, correlationFromParams(params));
       if (correlation.adjustedPositionSize < parseFloat(proposed.toFixed(2))) {
         correlationRaw = usdcFromNumber(Math.max(0, correlation.adjustedPositionSize));
         sized = sizeWithin(correlationRaw);
@@ -435,6 +446,7 @@ async function analyzeAndTradeMarket(
     }
 
     const sizing: SizingRecord = {
+      ...(params.paramsVersion ? { params: params.paramsVersion } : {}),
       kellyRaw: kellyRaw.toString(),
       correlationRaw: correlationRaw.toString(),
       marketExposureRaw: exposure.totalRaw.toString(),

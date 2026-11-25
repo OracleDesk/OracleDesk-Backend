@@ -225,6 +225,8 @@ export interface TraceInput {
   sizing?: Record<string, unknown>;
   /** Weight set behind the evidence's relevance scores (#223). */
   sourceWeightSet?: SourceWeightSetRef;
+  /** Risk parameter set the agent cycle snapshotted (#274). */
+  riskParams?: { scope: string; version: number; hash: string };
 }
 
 export interface TraceVerification {

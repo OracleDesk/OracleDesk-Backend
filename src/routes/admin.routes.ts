@@ -162,4 +162,20 @@ router.get('/source-weights/:id', requirePermission('admin.read'), getSourceWeig
 router.post('/source-weights/:id/approve', requirePermission('agents.weights.approve', { audit: false }), requireStepUp, approveSourceWeightSet);
 router.post('/source-weights/:id/activate', requirePermission('agents.weights.approve', { audit: false }), requireStepUp, activateSourceWeightSet);
 
+// Versioned agent risk parameters (#274).
+import {
+  getRiskParamById,
+  getRiskParams,
+  postRiskParams,
+  postRiskParamsActivate,
+  postRiskParamsApprove,
+  postRiskParamsReject,
+} from '../controllers/agents.controller';
+router.get('/risk-params', requirePermission('admin.read'), getRiskParams);
+router.get('/risk-params/:id', requirePermission('admin.read'), getRiskParamById);
+router.post('/risk-params', requirePermission('risk_params.propose', { audit: false }), requireStepUp, idempotent({ required: true }), postRiskParams);
+router.post('/risk-params/:id/approve', requirePermission('risk_params.approve', { audit: false }), requireStepUp, idempotent({ required: true }), postRiskParamsApprove);
+router.post('/risk-params/:id/reject', requirePermission('risk_params.approve', { audit: false }), requireStepUp, idempotent({ required: true }), postRiskParamsReject);
+router.post('/risk-params/:id/activate', requirePermission('risk_params.approve', { audit: false }), requireStepUp, idempotent({ required: true }), postRiskParamsActivate);
+
 export default router;

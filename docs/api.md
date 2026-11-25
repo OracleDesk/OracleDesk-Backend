@@ -1156,6 +1156,15 @@ Admin-management endpoints:
 - `POST /admin/admins/revoke` `{ walletAddress: "G…" }` (`admin.manage`, step-up; refuses `409 LAST_SUPER_ADMIN`)
 - `GET /admin/audit?page&limit` (`admin.audit.read`, step-up)
 
+Risk parameter sets (#274):
+
+- `GET /admin/risk-params?scope=TRADER|MARKET_MAKER` (`admin.read`)
+- `GET /admin/risk-params/:id` (`admin.read`; field diff vs active set)
+- `POST /admin/risk-params` `{ scope, params, reason }` (`risk_params.propose`, step-up, idempotent)
+- `POST /admin/risk-params/:id/approve` (`risk_params.approve`, step-up, idempotent)
+- `POST /admin/risk-params/:id/reject` (`risk_params.approve`, step-up, idempotent)
+- `POST /admin/risk-params/:id/activate` (`risk_params.approve`, step-up, idempotent)
+
 All other admin routes map to `treasury.read`/`treasury.operate`,
 `agents.manage`, `disputes.manage`, `trace_audit.run`,
 `reconciliation.run`, `markets.generate` and `calibration.recompute`.

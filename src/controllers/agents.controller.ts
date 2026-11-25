@@ -3,6 +3,16 @@ import { z } from 'zod';
 import { config } from '../config';
 import { MARKET_CATEGORIES } from '../lib/llm-schema';
 import { sendError, sendSuccess } from '../utils/response.util';
+import { AppError } from '../middlewares/error.middleware';
+import { RISK_PARAM_SCOPES, type RiskParamScope } from '../lib/risk-params';
+import {
+  activateRiskParamSet,
+  approveRiskParamSet,
+  getRiskParamSet,
+  listRiskParamSets,
+  proposeRiskParamSet,
+  rejectRiskParamSet,
+} from '../services/risk-params.service';
 import {
   GROUP_BYS,
   WINDOWS,
@@ -77,4 +87,51 @@ export async function recomputeCalibration(_req: Request, res: Response): Promis
     return;
   }
   sendSuccess(res, run);
+}
+
+function actor(req: Request): string {
+  if (!req.user) throw new AppError(401, 'UNAUTHORIZED', 'Authentication required');
+  return req.user.walletAddress;
+}
+
+const scopeSchema = z.enum(RISK_PARAM_SCOPES);
+
+export async function getRiskParams(req: Request, res: Response): Promise<void> {
+  const parsed = scopeSchema.safeParse(req.query.scope);
+  if (!parsed.success) {
+    sendError(res, 400, 'VALIDATION_ERROR', `scope must be one of: ${RISK_PARAM_SCOPES.join(', ')}`);
+    return;
+  }
+  sendSuccess(res, await listRiskParamSets(parsed.data));
+}
+
+export async function getRiskParamById(req: Request, res: Response): Promise<void> {
+  sendSuccess(res, await getRiskParamSet(String(req.params.id)));
+}
+
+export async function postRiskParams(req: Request, res: Response): Promise<void> {
+  const body = z
+    .object({
+      scope: scopeSchema,
+      params: z.unknown(),
+      reason: z.string().min(1).max(2000),
+    })
+    .parse(req.body ?? {});
+  const row = await proposeRiskParamSet({ ...body, scope: body.scope as RiskParamScope, actor: actor(req) });
+  sendSuccess(res, row, 201);
+}
+
+export async function postRiskParamsApprove(req: Request, res: Response): Promise<void> {
+  await approveRiskParamSet(String(req.params.id), actor(req));
+  sendSuccess(res, { approved: true });
+}
+
+export async function postRiskParamsReject(req: Request, res: Response): Promise<void> {
+  await rejectRiskParamSet(String(req.params.id), actor(req));
+  sendSuccess(res, { rejected: true });
+}
+
+export async function postRiskParamsActivate(req: Request, res: Response): Promise<void> {
+  await activateRiskParamSet(String(req.params.id), actor(req));
+  sendSuccess(res, { activated: true });
 }

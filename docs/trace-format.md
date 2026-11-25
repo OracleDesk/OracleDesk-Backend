@@ -85,7 +85,8 @@ Every trace generated since #227 is v2. It is v1 plus everything the agents comp
 | `sourcesUsed[]` | object | v1 keys plus `signalId`, `url`, `publisher`, `publishedAt` (#73). Each one is `null` when the signal does not carry it. |
 | `provenance` | object | `{ schema, llm: [...], generator }` (#66). `llm` has at least one entry, because the hedge-condition fallback records a `source: "default"` entry. `fallbackFrom` and `generator.commit` are omitted, not nulled, when they don't apply. |
 | `forecast` | object \| null | Ensemble members, weights and input digests (#75). Trader traces only. |
-| `sizing` | object \| null | Kelly/correlation/final sizes and budget snapshot (#76). Trader traces only. |
+| `sizing` | object \| null | Kelly/correlation/final sizes and budget snapshot (#76). Trader traces only; includes `params: { version, hash }` (#274). |
+| `riskParams` | object \| null | `{ scope, version, hash }` of the risk param snapshot the cycle started with (#274). Absent on older traces. |
 | `seedPolicy` | object \| null | Seed-policy record (#82). Market-creation traces only. |
 | `correlation` | object \| null | `{ pairs, method: "snapshot"\|"matrix", snapshotId }` (#80). Trader traces only. |
 | `corroboration` | object \| null | `{ kind: "CORROBORATED"\|"AUTHORITATIVE"\|"UNCORROBORATED", units, domains }` (#228). Market-creation traces only; the corroborating signals are also in `sourcesUsed`. |

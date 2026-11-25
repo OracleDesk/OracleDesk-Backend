@@ -16,6 +16,7 @@ import { startReconcileCron } from './cron/reconcile.cron';
 import { startMoneyAuditCron } from './cron/money-audit.cron';
 import { startPriceResolutionCron } from './cron/price-resolution.cron';
 import { bootstrapAdminRbac, isAdminToken } from './middlewares/auth.middleware';
+import { bootstrapRiskParams, setRiskParamsEmitter } from './services/risk-params.service';
 import { startTraceAuditCron } from './cron/trace-audit.cron';
 import { startTracePublicationCron } from './cron/trace-publication.cron';
 import { startPaymentIntentCron } from './cron/payment-intent.cron';
@@ -107,6 +108,7 @@ async function bootstrap(): Promise<void> {
   if (rolePlan.startBootstrapRbac) {
     try {
       await bootstrapAdminRbac();
+      await bootstrapRiskParams();
     } catch (err) {
       logger.fatal({ err }, 'Failed to initialise admin RBAC');
       process.exit(1);
@@ -272,6 +274,7 @@ async function bootstrap(): Promise<void> {
     // Make io accessible via app
     app.set('io', io);
     setControlEmitter((event, payload) => activeIo.emit(event, payload));
+    setRiskParamsEmitter((event, payload) => activeIo.to('admins').emit(event, payload));
 
     io.on('connection', async (socket) => {
       if (Math.random() < config.SOCKET_LOG_SAMPLE_RATE) {

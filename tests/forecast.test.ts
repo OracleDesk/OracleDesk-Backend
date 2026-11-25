@@ -148,7 +148,8 @@ async function runCycle(market: any, docBytes: Buffer, forecast: string) {
   (ingestion as any).aggregateSignals = async () => SIGNALS;
   const decisions: any[] = [];
   try {
-    const env = prodTraderEnv();
+    const { DEFAULT_PARAMS } = await import('../src/agents/trader-policy');
+    const env = prodTraderEnv(DEFAULT_PARAMS);
     const record = env.recordDecision.bind(env);
     env.recordDecision = async (d) => { decisions.push(d); await record(d); };
     await runTraderPolicy(env, DEFAULT_PARAMS);
@@ -259,7 +260,9 @@ test('trader produces a YES trade when the recorded LLM forecast is 0.85 vs pric
   const trace = run.traces[0];
   const ci = trace.confidenceInterval;
   assert.ok(Math.abs(trade.edgeDetected - (trace.probabilityEstimate - 0.55)) < 1e-9);
-  const kelly = calculateKellySize({ agentProbability: ci.lower, marketProbability: 0.55, bankroll: 10_000, netOdds: 0.45 / 0.55 });
+  const { compiledTraderParamsV1 } = await import('../src/lib/risk-params');
+  const limits = compiledTraderParamsV1();
+  const kelly = calculateKellySize({ agentProbability: ci.lower, marketProbability: 0.55, bankroll: 10_000, netOdds: 0.45 / 0.55 }, limits);
   assert.equal(trade.amount, kelly.betSize, 'amount is the Kelly size from the ensemble CI');
   assert.equal(run.buys[0].collateral_in, 250n * USDC);
   assert.equal(trade.kellyFraction, kelly.halfKelly);
@@ -288,22 +291,24 @@ test('trader produces a NO trade when the forecast is 0.30 vs price 0.55', async
   assert.ok(trade.edgeDetected <= -0.08);
   // The NO side is sized against the NO price: P(NO) = 1 − ci.upper vs 1 − 0.55.
   const ci = run.traces[0].confidenceInterval;
-  const kelly = calculateKellySize({ agentProbability: 1 - ci.upper, marketProbability: 0.45, bankroll: 10_000, netOdds: 0.55 / 0.45 });
+  const { compiledTraderParamsV1 } = await import('../src/lib/risk-params');
+  const limits = compiledTraderParamsV1();
+  const kelly = calculateKellySize({ agentProbability: 1 - ci.upper, marketProbability: 0.45, bankroll: 10_000, netOdds: 0.55 / 0.45 }, limits);
   assert.ok(kelly.betSize > 0);
   assert.equal(trade.amount, kelly.betSize);
   assert.ok(Math.abs(trade.price - 0.45) < 1e-12);
   // Before #75 the NO side compared P(NO) with the YES price and sized nothing.
-  const old = calculateKellySize({ agentProbability: 1 - ci.upper, marketProbability: 0.55, bankroll: 10_000, netOdds: 0.55 / 0.45 });
+  const old = calculateKellySize({ agentProbability: 1 - ci.upper, marketProbability: 0.55, bankroll: 10_000, netOdds: 0.55 / 0.45 }, limits);
   assert.equal(old.betSize, 0);
 });
 
-test('a positive point edge with a wide interval sizes to zero and logs SIZE_ZERO_WIDE_CI', async () => {
+test('a positive point edge with a wide interval skips with CONSERVATIVE_EDGE_BELOW_MIN', async () => {
   const { row, bytes } = await marketRow({ currentYesProb: 0.55 });
   const run = await runCycle(row, bytes, llmOutput(0.75, 0.73, 0.77));
   assert.equal(run.trades.length, 0);
-  const skip = run.decisions.find((d) => d.data?.reason === 'SIZE_ZERO_WIDE_CI');
+  const skip = run.decisions.find((d) => d.reasonCode === 'CONSERVATIVE_EDGE_BELOW_MIN' || d.data?.reason === 'CONSERVATIVE_EDGE_BELOW_MIN');
   assert.ok(skip, JSON.stringify(run.decisions));
-  assert.ok(skip.data.edge >= 0.08, 'the point edge cleared MIN_EDGE');
+  assert.ok(skip!.data.edge >= 0.08, 'the point edge cleared MIN_EDGE');
 });
 
 test('unverified question document is ignored', async () => {

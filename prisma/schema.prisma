@@ -142,6 +142,10 @@ enum GenerationRunState {
   SKIPPED
   NEEDS_ATTENTION
   CANCELLED
+  GATED
+  VALIDATED
+  SEED_PLANNED
+  TRACE_ENQUEUED
 }
 
 enum TraceAuditStatus {
@@ -186,6 +190,7 @@ enum AgentDecisionReason {
   FORECAST_UNAVAILABLE
   EDGE_BELOW_MIN
   SIZE_ZERO_WIDE_CI
+  CONSERVATIVE_EDGE_BELOW_MIN
   SIZE_BELOW_MIN
   BUY_ACCEPTED
   BUY_REJECTED
@@ -357,19 +362,21 @@ model MarketGenerationJob {
 }
 
 model MarketGenerationRun {
-  id            String            @id @default(uuid())
+  id            String             @id @default(uuid())
   trigger       String
   state         GenerationRunState @default(STARTED)
-  attempts      Int               @default(0)
+  attempts      Int                @default(0)
   nextAttemptAt DateTime?
   lockedBy      String?
   lockedUntil   DateTime?
+  fence         Int                @default(0)
+  cycleId       String?
   inputs        Json?
-  outputs       Json              @default("{}")
-  marketId      String?           @unique
+  outputs       Json               @default("{}")
+  marketId      String?            @unique
   lastError     Json?
-  createdAt     DateTime          @default(now())
-  updatedAt     DateTime          @updatedAt
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
 
   market Market? @relation(fields: [marketId], references: [id], onDelete: SetNull)
 
@@ -1910,54 +1917,6 @@ model PremiumUsageDaily {
   @@map("premium_usage_daily")
 }
 
-/// Market generation saga state (#152, #242). TRACE_PINNED / TRACE_PUBLISHED
-/// are legacy: the saga maps them to TRACE_ENQUEUED on resume.
-enum GenerationRunState {
-  STARTED
-  SIGNALS_READY
-  PROPOSED
-  MARKET_PERSISTED
-  QUESTION_PINNED
-  CHAIN_SUBMITTED
-  CHAIN_CONFIRMED
-  TRACE_PERSISTED
-  TRACE_PINNED
-  TRACE_PUBLISHED
-  COMPLETED
-  SKIPPED
-  NEEDS_ATTENTION
-  CANCELLED
-  GATED
-  VALIDATED
-  SEED_PLANNED
-  TRACE_ENQUEUED
-}
-
-/// One market-generation saga run (#242). Every step persists its outputs
-/// before the next side effect; `fence` increments on every claim so a worker
-/// whose lease expired can no longer write step results.
-model MarketGenerationRun {
-  id            String             @id @default(uuid())
-  trigger       String
-  state         GenerationRunState @default(STARTED)
-  attempts      Int                @default(0)
-  nextAttemptAt DateTime?
-  lockedBy      String?
-  lockedUntil   DateTime?
-  fence         Int                @default(0)
-  cycleId       String?
-  inputs        Json?
-  outputs       Json               @default("{}")
-  marketId      String?            @unique
-  market        Market?            @relation(fields: [marketId], references: [id], onDelete: SetNull)
-  lastError     Json?
-  createdAt     DateTime           @default(now())
-  updatedAt     DateTime           @default(now()) @updatedAt
-
-  @@index([state, nextAttemptAt])
-  @@map("market_generation_runs")
-}
-
 /// Fitted per-category recalibration maps (#244). One active row per
 /// (agentType, category); superseded versions stay for audit. `id` is the
 /// map's content hash, so a refit from the same inputs reproduces it.
@@ -2083,4 +2042,34 @@ model MoneyAuditFinding {
   @@index([invariant, createdAt])
   @@index([fingerprint])
   @@map("money_audit_findings")
+}
+
+/// Versioned agent risk parameters (#274).
+model RiskParamSet {
+  id          String    @id @default(uuid())
+  scope       String
+  version     Int
+  params      Json
+  paramsHash  String
+  status      String    @default("PROPOSED")
+  reason      String
+  proposedBy  String
+  approvedBy  String?
+  activatedBy String?
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  approvedAt  DateTime? @db.Timestamptz(3)
+  activatedAt DateTime? @db.Timestamptz(3)
+
+  @@unique([scope, version])
+  @@index([scope, status])
+  @@map("risk_param_sets")
+}
+
+model RiskParamActive {
+  scope       String   @id
+  setId       String
+  version     Int
+  activatedAt DateTime @db.Timestamptz(3)
+
+  @@map("risk_param_active")
 }

@@ -22,6 +22,7 @@ import {
   type CorroborationAssessment,
 } from '../services/corroboration.service';
 import { createMarketOnChain, planMarketCreation } from '../services/market-chain.service';
+import { riskProvenance, snapshotMarketMaker } from '../services/risk-params.service';
 import { planPriceMarket } from '../services/price-resolution.service';
 import type { ResolutionSpecJson } from '../lib/resolution-spec';
 import { enqueueTracePublication } from '../services/trace-publish.service';
@@ -75,6 +76,10 @@ export async function runMarketMakerCycle(
     }
     throw err;
   }
+
+  const mmSnap = await snapshotMarketMaker();
+  const mmParams = mmSnap.params;
+  const mmRisk = riskProvenance(mmSnap);
 
   // Cron work stops at the budget minus the admin reserve; admin triggers run
   // up to the full budget (#71).
@@ -272,13 +277,17 @@ export async function runMarketMakerCycle(
       // Step 4: Seed policy. Decided before anything is written, pinned or sent:
       // when the budget does not allow a minimum seed there is no DB row, no
       // IPFS pin and no chain call.
-      const decision = await planMarketCreation({
-        category:             normalizeCategory(proposal.category),
-        closeTime:            new Date(proposal.expiry_timestamp * 1000),
-        p:                    proposal.initial_yes_probability,
-        ci:                   proposal.confidence_interval,
-        llmSuggestedSeedUsdc: proposal.minimum_liquidity_usdc,
-      });
+      const decision = await planMarketCreation(
+        {
+          category: normalizeCategory(proposal.category),
+          closeTime: new Date(proposal.expiry_timestamp * 1000),
+          p: proposal.initial_yes_probability,
+          ci: proposal.confidence_interval,
+          llmSuggestedSeedUsdc: proposal.minimum_liquidity_usdc,
+        },
+        undefined,
+        mmParams,
+      );
       if (decision.action === 'skip') {
         await recordDecision({
           kind: 'MARKET_SKIP',
@@ -301,7 +310,7 @@ export async function runMarketMakerCycle(
         await releaseReservation(reservationId, 'seed-policy-skip');
         return null;
       }
-      const seedPolicy = seedPolicyRecord(decision);
+      const seedPolicy = seedPolicyRecord(decision, mmRisk);
       const forecastRef = sha256Hex(canonicalJson({
         probability: proposal.initial_yes_probability,
         confidenceInterval: proposal.confidence_interval,

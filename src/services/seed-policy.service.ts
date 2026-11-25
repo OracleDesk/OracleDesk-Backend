@@ -256,7 +256,10 @@ export function decideSeed(i: SeedPolicyInput, cfg: SeedPolicyConfig): SeedDecis
 }
 
 /** JSON-safe record of a create decision, stored in Market.seedPolicy and the creation trace. */
-export function seedPolicyRecord(d: Extract<SeedDecision, { action: 'create' }>): Record<string, unknown> {
+export function seedPolicyRecord(
+  d: Extract<SeedDecision, { action: 'create' }>,
+  risk?: { scope: string; version: number; hash: string },
+): Record<string, unknown> {
   return {
     seedRaw: d.seedRaw.toString(),
     initialYesBps: d.initialYesBps,
@@ -264,5 +267,6 @@ export function seedPolicyRecord(d: Extract<SeedDecision, { action: 'create' }>)
     expectedLpLossRaw: d.expectedLpLossRaw.toString(),
     binding: d.binding,
     inputs: d.inputs,
+    ...(risk ? { riskParams: risk } : {}),
   };
 }

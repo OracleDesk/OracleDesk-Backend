@@ -51,12 +51,16 @@ test('probability, confidence interval, and edge calculations are deterministic'
 test('kelly sizing caps single-position exposure', async () => {
   const { calculateKellySize } = await import('../src/services/trade.service');
 
-  const result = calculateKellySize({
-    agentProbability: 0.7,
-    marketProbability: 0.5,
-    bankroll: 10_000,
-    netOdds: 1,
-  });
+  const { compiledTraderParamsV1 } = await import('../src/lib/risk-params');
+  const result = calculateKellySize(
+    {
+      agentProbability: 0.7,
+      marketProbability: 0.5,
+      bankroll: 10_000,
+      netOdds: 1,
+    },
+    compiledTraderParamsV1(),
+  );
 
   assert.equal(result.halfKelly, 0.025);
   assert.equal(result.betSize, 250);

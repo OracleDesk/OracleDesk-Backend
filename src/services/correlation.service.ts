@@ -11,8 +11,20 @@ import {
 import { MAX_PROB_BPS, MIN_PROB_BPS } from '../generated/fpmm';
 import type { CorrelationPair, CorrelationCheckResult } from '../types';
 
-export const MAX_CORRELATED_EXPOSURE_PCT = 0.05;
-export const CORRELATION_THRESHOLD       = 0.60;
+export interface CorrelationRiskParams {
+  maxCorrelatedExposurePct: number;
+  correlationThreshold: number;
+}
+
+export const DEFAULT_CORRELATION_RISK: CorrelationRiskParams = {
+  maxCorrelatedExposurePct: 0.05,
+  correlationThreshold: 0.6,
+};
+
+/** @deprecated Use snapshot params (#274). */
+export const MAX_CORRELATED_EXPOSURE_PCT = DEFAULT_CORRELATION_RISK.maxCorrelatedExposurePct;
+/** @deprecated Use snapshot params (#274). */
+export const CORRELATION_THRESHOLD = DEFAULT_CORRELATION_RISK.correlationThreshold;
 
 /** Snapshots older than this are ignored and sizing falls back to the matrix. */
 export const SNAPSHOT_MAX_AGE_MS = 2 * 60 * 60 * 1000;
@@ -458,7 +470,11 @@ export function evaluateCorrelation(input: {
   bankroll: number;
   positions: ExposurePosition[];
   snapshot: LoadedSnapshot | null;
+  limits?: CorrelationRiskParams;
 }): CorrelationCheckResult {
+  const limits = input.limits ?? DEFAULT_CORRELATION_RISK;
+  const exposurePct = limits.maxCorrelatedExposurePct;
+  const rhoMin = limits.correlationThreshold;
   const { proposed, proposedSize, bankroll, positions, snapshot } = input;
   const pairs: CorrelationPair[] = [];
   let net = 0;
@@ -472,7 +488,7 @@ export function evaluateCorrelation(input: {
       snapshot,
     );
     if (method !== 'matrix') usedSnapshot = true;
-    if (Math.abs(rho) < CORRELATION_THRESHOLD) continue;
+    if (Math.abs(rho) < rhoMin) continue;
 
     let effective: number;
     if (proposed.direction === undefined) {
@@ -492,7 +508,7 @@ export function evaluateCorrelation(input: {
   }
 
   const totalCorrelatedExposure = Math.max(0, net);
-  const maxCorrelatedUsdc = bankroll * MAX_CORRELATED_EXPOSURE_PCT;
+  const maxCorrelatedUsdc = bankroll * exposurePct;
   let adjustedPositionSize = proposedSize;
   if (totalCorrelatedExposure + proposedSize > maxCorrelatedUsdc) {
     adjustedPositionSize = Math.min(proposedSize, Math.max(0, maxCorrelatedUsdc - totalCorrelatedExposure));
@@ -522,7 +538,7 @@ export async function checkCorrelation(
   proposedMarketId: string,
   proposedSize:     number,
   bankroll:         number,
-  opts: { direction?: Direction; now?: Date } = {},
+  opts: { direction?: Direction; now?: Date; limits?: CorrelationRiskParams } = {},
 ): Promise<CorrelationCheckResult> {
   const proposedMarket = await prisma.market.findUnique({
     where:  { id: proposedMarketId },
@@ -550,6 +566,7 @@ export async function checkCorrelation(
     proposed: { marketId: proposedMarketId, category: proposedMarket.category, direction: opts.direction },
     proposedSize,
     bankroll,
+    limits: opts.limits,
     positions: openPositions.map((p) => ({
       marketId: p.market.id,
       category: p.market.category,
