@@ -1,0 +1,8 @@
+{
+  "caseId": "fc-01-btc-100k",
+  "kind": "forecast",
+  "promptKey": "synthetic-baseline-v1",
+  "provider": "synthetic",
+  "model": "synthetic-baseline",
+  "output": "{\"base_rate\":0.45,\"adjustments\":[{\"signal_id\":\"s1\",\"delta\":0.25,\"why\":\"Bitcoin already above $96,000 with strong institutional inflows.\"}],\"p\":0.72,\"p_low_50\":0.62,\"p_high_50\":0.81,\"rationale\":\"Strong momentum near $100k resistance makes a breach before December 1 likely.\"}"
+}

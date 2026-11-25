@@ -61,40 +61,79 @@ export interface ContractEventParsed {
 }
 
 /**
- * Extracts and decodes Soroban events from a transaction response's resultMetaXdr.
+ * Extracts and decodes Soroban events from a transaction response's
+ * `events.contractEventsXdr` or `resultMetaXdr` (supporting TransactionMeta v3
+ * and v4 per-operation events). Filters by `contractIdFilter` when provided.
  */
-export function readContractEvents(response: rpc.Api.GetTransactionResponse): ContractEventParsed[] {
+export function readContractEvents(
+  response: rpc.Api.GetTransactionResponse,
+  contractIdFilter?: string,
+): ContractEventParsed[] {
   const results: ContractEventParsed[] = [];
-  let meta = (response as any).resultMetaXdr as any;
-  if (!meta) return results;
+  const rawEvents: any[] = [];
 
-  if (typeof meta === 'string') {
-    try {
-      meta = xdr.TransactionMeta.fromXDR(meta, 'base64');
-    } catch {}
-  }
-
-  let rawEvents: any[] = [];
-  if (Array.isArray(meta.events)) {
-    rawEvents = meta.events;
-  } else {
-    try {
-      if (typeof meta.v3 === 'function') {
-        const sm = meta.v3().sorobanMeta?.();
-        if (sm && typeof sm.events === 'function') {
-          rawEvents = sm.events() ?? [];
+  // Prefer RPC >= 23 per-operation contractEventsXdr when present and non-empty
+  const rpcContractEvents = (response as any)?.events?.contractEventsXdr;
+  if (Array.isArray(rpcContractEvents) && rpcContractEvents.some((ops: any) => Array.isArray(ops) && ops.length > 0)) {
+    for (const ops of rpcContractEvents) {
+      if (!Array.isArray(ops)) continue;
+      for (const ev of ops) {
+        if (typeof ev === 'string') {
+          try {
+            rawEvents.push(xdr.ContractEvent.fromXDR(ev, 'base64'));
+          } catch {}
+        } else if (ev) {
+          rawEvents.push(ev);
         }
       }
-    } catch {}
-    if (rawEvents.length === 0) {
+    }
+  }
+
+  if (rawEvents.length === 0) {
+    let meta = (response as any).resultMetaXdr as any;
+    if (!meta) return results;
+
+    if (typeof meta === 'string') {
       try {
-        if (typeof meta.v4 === 'function') {
-          const sm = meta.v4().sorobanMeta?.();
-          if (sm && typeof sm.events === 'function') {
-            rawEvents = sm.events() ?? [];
+        meta = xdr.TransactionMeta.fromXDR(meta, 'base64');
+      } catch {
+        return results;
+      }
+    }
+
+    if (Array.isArray(meta.events)) {
+      rawEvents.push(...meta.events);
+    } else {
+      let switchVal: number | null = null;
+      try {
+        switchVal = typeof meta.switch === 'function' ? meta.switch() : null;
+      } catch {
+        switchVal = null;
+      }
+
+      if (switchVal === 3 || (switchVal === null && typeof meta.v3 === 'function')) {
+        try {
+          const sm = meta.v3().sorobanMeta?.();
+          const evs = sm && typeof sm.events === 'function' ? sm.events() : [];
+          if (Array.isArray(evs)) rawEvents.push(...evs);
+        } catch {}
+      }
+
+      if (rawEvents.length === 0 && (switchVal === 4 || (switchVal === null && typeof meta.v4 === 'function'))) {
+        try {
+          const v4 = meta.v4();
+          const operations = typeof v4?.operations === 'function' ? (v4.operations() ?? []) : [];
+          for (const op of operations) {
+            const evs = op && typeof op.events === 'function' ? op.events() : [];
+            if (Array.isArray(evs)) rawEvents.push(...evs);
           }
-        }
-      } catch {}
+          if (rawEvents.length === 0) {
+            const sm = v4?.sorobanMeta?.();
+            const evs = sm && typeof sm.events === 'function' ? sm.events() : [];
+            if (Array.isArray(evs)) rawEvents.push(...evs);
+          }
+        } catch {}
+      }
     }
   }
 
@@ -117,6 +156,13 @@ export function readContractEvents(response: rpc.Api.GetTransactionResponse): Co
         } else if (Buffer.isBuffer(ev.contractId)) {
           contractId = StrKey.encodeContract(ev.contractId);
         }
+      }
+
+      if (contractIdFilter && contractId && contractId !== contractIdFilter) {
+        continue;
+      }
+      if (contractId && contractId !== CONTRACTS.marketCore) {
+        continue;
       }
 
       let topics: xdr.ScVal[] = [];

@@ -3,7 +3,6 @@ import { Prisma } from '@prisma/client';
 import { logger } from '../lib/logger';
 import { currentContext } from '../lib/context';
 import { sendError } from '../utils/response.util';
-
 export class AppError extends Error {
   constructor(
     public readonly statusCode: number,
@@ -16,6 +15,7 @@ export class AppError extends Error {
     Error.captureStackTrace(this, this.constructor);
   }
 }
+import { JsonBoundsError } from '../utils/hash.util';
 
 /**
  * Global Express error handler.
@@ -27,6 +27,11 @@ export function errorMiddleware(
   res: Response,
   _next: NextFunction,
 ): void {
+  if (err instanceof JsonBoundsError) {
+    sendError(res, 413, 'JSON_TOO_COMPLEX', 'The JSON request exceeds the allowed safety limits');
+    return;
+  }
+
   // Client aborted request
   if (err.name === 'ClientAbortedError' || (err instanceof AppError && err.code === 'CLIENT_ABORTED')) {
     logger.debug({ path: req.path, method: req.method }, 'Client aborted request');
@@ -43,8 +48,8 @@ export function errorMiddleware(
       { code: err.code, path: req.path, details: err.details, requestId: currentContext()?.requestId },
       err.message,
     );
-    // #50: degraded dependencies tell clients when to retry.
-    const retryAfter = err.details?.retryAfterSecs;
+    // #50 / #300: degraded dependencies tell clients when to retry.
+    const retryAfter = err.details?.retryAfterSecs ?? err.details?.retryAfter;
     if (typeof retryAfter === 'number' && Number.isFinite(retryAfter) && retryAfter >= 0) {
       res.setHeader('Retry-After', String(Math.ceil(retryAfter)));
     }

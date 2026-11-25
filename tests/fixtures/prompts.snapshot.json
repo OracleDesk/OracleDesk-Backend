@@ -5,9 +5,19 @@
     "contentHash": "57843ac125c45d0f0ac350210bb316cf30f857dd01ff89ffd5cdbdeb9bef8910"
   },
   {
+    "id": "forecast",
+    "version": 2,
+    "contentHash": "baff0393cdb50941d63d2f7c74473d66898a799b46d4d06fbe525727bd09296b"
+  },
+  {
     "id": "hedge-conditions",
     "version": 1,
     "contentHash": "78a41bf35699ca54c26a792c705c4bc6c4015b45425548d088b8f72136d1c603"
+  },
+  {
+    "id": "hedge-conditions",
+    "version": 2,
+    "contentHash": "5de51c5261216fe6936a40f2b452c35e68c931996bfed339c03f054328a2030e"
   },
   {
     "id": "market-proposal",

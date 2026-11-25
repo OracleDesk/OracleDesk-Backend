@@ -25,9 +25,10 @@ import { config } from '../config';
 import { CONTRACTS } from '../config/contracts';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
-import { newId, runWithContext } from '../lib/context';
+import { newId, runWithContext, withCallerClass } from '../lib/context';
 import { readClients, rpcServer } from './stellar/clients';
 import { disabledEventProjections } from './stellar/spec-compat';
+import { requestSpecCheck } from './stellar/spec-monitor';
 import { printable } from './chain.service';
 import { priceYesBps } from '../generated/fpmm';
 import { withTimeout, deadline } from '../lib/resilience';
@@ -42,6 +43,8 @@ export interface PublishMeta {
   ledger: number;
   /** On-chain market id (decimal string) when the event belongs to a market. */
   marketKey: string | null;
+  /** Within SOCKET_LIVE_LEDGER_LAG of the RPC tip; older events are catch-up (#291). */
+  live?: boolean;
 }
 
 export type PublishFn = (event: string, payload: unknown, meta: PublishMeta) => unknown;
@@ -103,6 +106,7 @@ export function decodeEvent(event: rpc.Api.EventResponse, known = specs()): Deco
       { contract: entry.name, eventId: event.id, err: err instanceof Error ? err.message : String(err) },
       'Indexer: event does not decode with the binding spec (skipped; see /admin/chain/spec-compat)',
     );
+    requestSpecCheck(`decode_failure:${entry.name}`);
     return null;
   }
   if (!parsed) return null;
@@ -167,6 +171,29 @@ async function applySideEffects(event: DecodedEvent): Promise<void> {
       }
       if (event.eventName === 'Trade' && p.trader === CONTRACTS.treasury) {
         await cache.invalidateTag('treasury:capital', event.ledger);
+        if (event.txHash && p.collateral != null && p.shares != null && p.reserve_yes != null && p.reserve_no != null) {
+          const { recordExecutionFillFromEvent } = await import('./execution-quality.service');
+          await recordExecutionFillFromEvent({
+            txHash: event.txHash,
+            ledger: event.ledger,
+            isBuy: Boolean(p.is_buy),
+            outcome: String(p.outcome ?? 'Yes'),
+            collateral: BigInt(String(p.collateral)),
+            shares: BigInt(String(p.shares)),
+            fee: BigInt(String(p.fee ?? 0)),
+            reserveYes: BigInt(String(p.reserve_yes)),
+            reserveNo: BigInt(String(p.reserve_no)),
+          }).catch((err) => {
+            logger.warn({ err, txHash: event.txHash }, 'Execution quality fill recording failed');
+          });
+        }
+      }
+      if (['MarketResolved', 'MarketCreated'].includes(event.eventName) && marketIdStr) {
+        const m = await prisma.market.findUnique({ where: { onChainMarketId: BigInt(marketIdStr) }, select: { id: true } });
+        if (m) {
+          const { invalidateProvenanceCache } = await import('./provenance.service');
+          await invalidateProvenanceCache(m.id);
+        }
       }
     } else if (event.contractName === 'resolver') {
       if (['ResolutionProposed', 'ResolutionFinalized', 'PriceResolution'].includes(event.eventName)) {
@@ -175,13 +202,44 @@ async function applySideEffects(event: DecodedEvent): Promise<void> {
           await cache.invalidateTag(`market:${marketIdStr}`, event.ledger);
         }
       }
+    } else if (event.contractName === 'reasoningRegistry') {
+      if (event.eventName === 'TracePublished' && marketIdStr) {
+        const m = await prisma.market.findUnique({ where: { onChainMarketId: BigInt(marketIdStr) }, select: { id: true } });
+        if (m) {
+          const { invalidateProvenanceCache } = await import('./provenance.service');
+          await invalidateProvenanceCache(m.id);
+        }
+      }
     } else if (event.contractName === 'treasury') {
-      if (['TradeAuthorized', 'PositionClosed', 'FeesCollected'].includes(event.eventName)) {
+      if (
+        [
+          'TradeAuthorized',
+          'PositionClosed',
+          'FeesCollected',
+          'Deposited',
+          'Withdrawn',
+          'WithdrawalQueued',
+          'WithdrawalClaimed',
+          'YieldDeposited',
+          'YieldWithdrawn',
+        ].includes(event.eventName)
+      ) {
         await cache.invalidateTag('treasury:capital', event.ledger);
       }
     }
   } catch (err) {
     logger.warn({ err, eventId: event.id }, 'Indexer: chain cache invalidation failed');
+  }
+
+  if (event.contractName === 'marketCore') {
+    if (['MarketCreated', 'Trade', 'Redeemed', 'MarketResolved'].includes(event.eventName)) {
+      try {
+        const { applyWalletEvent } = await import('./wallet-pnl.service');
+        await applyWalletEvent(event);
+      } catch (err) {
+        logger.error({ err, eventId: event.id }, 'Indexer: wallet PnL projection failed');
+      }
+    }
   }
 
   if (event.contractName === 'marketCore' && event.eventName === 'Trade') {
@@ -233,6 +291,13 @@ async function applySideEffects(event: DecodedEvent): Promise<void> {
     return;
   }
 
+  // #309: verify price-mode resolutions independently after the poll tick.
+  if (event.contractName === 'resolver' && event.eventName === 'PriceResolution') {
+    const verifier = await import('./price-resolution-verifier.service');
+    verifier.schedulePriceVerification(event.id);
+    return;
+  }
+
   if (event.contractName === 'reasoningRegistry' && event.eventName === 'TracePublished') {
     const traceHash =
       typeof p.trace_hash === 'string'
@@ -273,6 +338,79 @@ async function applySideEffects(event: DecodedEvent): Promise<void> {
         data: { status: 'CONFIRMED', confirmedAt: new Date(), lastError: null },
       });
     }
+    return;
+  }
+
+  // #306: registry governance events trigger an authoritative chain verdict re-check
+  // (never compute the verdict from the event payload alone).
+  if (
+    event.contractName === 'reasoningRegistry' &&
+    (event.eventName === 'TraceFlagged' || event.eventName === 'TraceUnflagged')
+  ) {
+    if (p.trace_id !== undefined) {
+      const onChainTraceId = BigInt(p.trace_id);
+      const { scheduleVerdictRecheck } = await import('./trace-audit.service');
+      scheduleVerdictRecheck([onChainTraceId]);
+    }
+    return;
+  }
+
+  if (event.contractName === 'reasoningRegistry' && event.eventName === 'AgentRevoked') {
+    const agent = String(p.agent ?? '');
+    if (!agent) return;
+    const effectiveFrom = BigInt(p.effective_from ?? 0);
+    const reason = String(p.reason ?? '');
+
+    const agentRevocationDb = (prisma as unknown as {
+      agentRevocation: { upsert(args: unknown): Promise<unknown> };
+    }).agentRevocation;
+    await agentRevocationDb.upsert({
+      where: { agent },
+      create: { agent, effectiveFrom, reason, observedLedger: event.ledger },
+      update: { effectiveFrom, reason, observedLedger: event.ledger },
+    });
+
+    const effectiveDate = new Date(Number(effectiveFrom) * 1000);
+    // Select affected traces by ReasoningTrace.agentWallet, falling back to latest TraceAudit.agent where null
+    const directTraces = await prisma.reasoningTrace.findMany({
+      where: {
+        onChainTraceId: { not: null },
+        agentWallet: agent,
+        createdAt: { gte: effectiveDate },
+      },
+      select: { onChainTraceId: true },
+    });
+    const nullWalletTraces = await prisma.reasoningTrace.findMany({
+      where: {
+        onChainTraceId: { not: null },
+        agentWallet: null,
+        createdAt: { gte: effectiveDate },
+      },
+      select: {
+        onChainTraceId: true,
+        audits: {
+          orderBy: { checkedAt: 'desc' },
+          take: 1,
+          select: { agent: true },
+        },
+      },
+    });
+
+    const affectedIds = new Set<bigint>();
+    for (const t of directTraces) {
+      if (t.onChainTraceId !== null) affectedIds.add(t.onChainTraceId);
+    }
+    for (const t of nullWalletTraces) {
+      if (t.onChainTraceId !== null && t.audits[0]?.agent?.toUpperCase() === agent.toUpperCase()) {
+        affectedIds.add(t.onChainTraceId);
+      }
+    }
+
+    if (affectedIds.size > 0) {
+      const { scheduleVerdictRecheck } = await import('./trace-audit.service');
+      scheduleVerdictRecheck(Array.from(affectedIds));
+    }
+    return;
   }
 }
 
@@ -289,6 +427,17 @@ export interface PublicEvent {
  */
 export async function publicEventFor(event: DecodedEvent): Promise<PublicEvent | null> {
   const p = event.params;
+
+  if (event.contractName === 'marketCore') {
+    if (['MarketCreated', 'Trade', 'Redeemed', 'MarketResolved'].includes(event.eventName)) {
+      try {
+        const { applyWalletEvent } = await import('./wallet-pnl.service');
+        await applyWalletEvent(event);
+      } catch (err) {
+        logger.error({ err, eventId: event.id }, 'Indexer: wallet PnL projection failed');
+      }
+    }
+  }
 
   if (event.contractName === 'marketCore' && event.eventName === 'Trade') {
     const onChainMarketId = BigInt(p.market_id);
@@ -345,6 +494,15 @@ export async function publicEventFor(event: DecodedEvent): Promise<PublicEvent |
 
 const PUBLISH_BATCH = 200;
 
+/** Latest ledger the RPC reported on the most recent successful poll. */
+let rpcLatestLedger: number | null = null;
+
+/** True when a row is close enough to the RPC tip to be a live event. */
+export function isLiveLedger(ledger: number, latestLedger: number | null): boolean {
+  if (latestLedger === null) return true;
+  return ledger >= latestLedger - config.SOCKET_LIVE_LEDGER_LAG;
+}
+
 // The live path and the recovery loop both go through this queue, so they can
 // never publish concurrently and (ledger, id) order holds within one instance.
 let publishQueue: Promise<unknown> = Promise.resolve();
@@ -372,7 +530,15 @@ export function publishPending(emit: PublishFn): Promise<{ published: number; fa
         try {
           const decoded = decodedFromStored(row);
           const pub = await publicEventFor(decoded);
-          if (pub) await emit(pub.type, pub.payload, { id: row.id, ledger: row.ledger, marketKey: pub.marketKey });
+          if (pub) {
+            const latest = rpcLatestLedger ?? pollState.lastLedger;
+            await emit(pub.type, pub.payload, {
+              id: row.id,
+              ledger: row.ledger,
+              marketKey: pub.marketKey,
+              live: isLiveLedger(row.ledger, latest),
+            });
+          }
           await prisma.chainEvent.update({ where: { id: row.id }, data: { published: true } });
           published++;
         } catch (err) {
@@ -401,43 +567,148 @@ async function writeCursor(lastLedger: number): Promise<void> {
   });
 }
 
+export type StartPlan =
+  | { action: 'resume'; startLedger: number }
+  | { action: 'idle'; startLedger: number; lastLedger: number }
+  | {
+      action: 'gap';
+      startLedger: number;
+      gap: {
+        fromLedger: number;
+        toLedger: number;
+        kind: 'RETENTION' | 'INITIAL';
+      };
+    };
+
+/**
+ * Pure planner for indexer start ledger and gap detection (#10).
+ * Decides whether to resume normally, idle when caught up, or record a gap
+ * when the desired starting ledger is older than the oldest ledger RPC retains.
+ */
+export function planStart(
+  cursor: number | null,
+  fromLedger: number | undefined,
+  health: { oldestLedger: number; latestLedger: number },
+  deployLedger?: number,
+): StartPlan {
+  const intended =
+    fromLedger !== undefined
+      ? fromLedger
+      : cursor !== null
+        ? cursor + 1
+        : deployLedger !== undefined
+          ? deployLedger
+          : health.oldestLedger;
+
+  if (intended > health.latestLedger) {
+    return {
+      action: 'idle',
+      startLedger: intended,
+      lastLedger: cursor ?? health.latestLedger,
+    };
+  }
+
+  if (intended < health.oldestLedger) {
+    const kind: 'RETENTION' | 'INITIAL' = cursor !== null ? 'RETENTION' : 'INITIAL';
+    return {
+      action: 'gap',
+      startLedger: health.oldestLedger,
+      gap: {
+        fromLedger: intended,
+        toLedger: health.oldestLedger - 1,
+        kind,
+      },
+    };
+  }
+
+  return {
+    action: 'resume',
+    startLedger: intended,
+  };
+}
+
 /**
  * Indexes from `fromLedger` (default: the stored cursor + 1, or the oldest
  * ledger RPC retains) up to the latest ledger. Returns counts.
  */
+const LIVE_TAIL_MAX_LAG_LEDGERS = 20;
+
 export async function backfillEvents(
   fromLedger?: number,
   deps: IndexerDeps = { source: rpcServer, emit: () => undefined },
-  opts?: { signal?: AbortSignal },
+  opts?: { signal?: AbortSignal; liveTail?: boolean },
 ): Promise<{ startLedger: number; lastLedger: number; seen: number; stored: number }> {
   const tickLimitMs = Math.floor(config.CYCLE_DEADLINE_MS / 10);
   const handle = deadline('rpc-events', opts?.signal, tickLimitMs);
 
   try {
     const health = await withTimeout('rpc-events', async () => deps.source.getHealth(), { signal: handle.signal });
+    rpcLatestLedger = health.latestLedger;
     const cursor = await readCursor();
-    let startLedger = fromLedger ?? (cursor !== null ? cursor + 1 : health.oldestLedger);
+    const plan = planStart(cursor, fromLedger, health, config.INDEXER_START_LEDGER);
 
-    if (startLedger < health.oldestLedger) {
-      logger.warn(
-        { requested: startLedger, oldestAvailable: health.oldestLedger },
-        'Indexer cursor is older than RPC retention; resuming from the oldest available ledger. Events in between are not indexed.',
-      );
-      startLedger = health.oldestLedger;
+    if (plan.action === 'idle') {
+      return { startLedger: plan.startLedger, lastLedger: plan.lastLedger, seen: 0, stored: 0 };
     }
-    if (startLedger > health.latestLedger) {
-      return { startLedger, lastLedger: cursor ?? health.latestLedger, seen: 0, stored: 0 };
+
+    if (plan.action === 'gap') {
+      if (plan.gap.kind === 'RETENTION') {
+        logger.error(
+          { network: CURSOR_ID, fromLedger: plan.gap.fromLedger, toLedger: plan.gap.toLedger, kind: plan.gap.kind },
+          'Indexer cursor is older than RPC retention; gap recorded and advancing cursor to oldest available ledger',
+        );
+      } else {
+        logger.warn(
+          { network: CURSOR_ID, fromLedger: plan.gap.fromLedger, toLedger: plan.gap.toLedger, kind: plan.gap.kind },
+          'Indexer start ledger is older than RPC retention; gap recorded and starting from oldest available ledger',
+        );
+      }
+
+      await prisma.$transaction([
+        prisma.indexerGap.upsert({
+          where: {
+            network_fromLedger_toLedger: {
+              network: CURSOR_ID,
+              fromLedger: plan.gap.fromLedger,
+              toLedger: plan.gap.toLedger,
+            },
+          },
+          create: {
+            network: CURSOR_ID,
+            fromLedger: plan.gap.fromLedger,
+            toLedger: plan.gap.toLedger,
+            kind: plan.gap.kind,
+          },
+          update: {},
+        }),
+        prisma.indexerCursor.upsert({
+          where: { id: CURSOR_ID },
+          create: { id: CURSOR_ID, lastLedger: plan.gap.toLedger },
+          update: { lastLedger: plan.gap.toLedger },
+        }),
+      ]);
     }
+
+    let startLedger = plan.startLedger;
+
+    // Catch-up runs as background; live tail runs as agent to protect freshness (#300).
+    const isLiveTail =
+      Boolean(opts?.liveTail) &&
+      fromLedger === undefined &&
+      health.latestLedger - startLedger <= LIVE_TAIL_MAX_LAG_LEDGERS;
+    const eventsClass = isLiveTail ? 'agent' : 'background';
 
     const known = specs();
     const filters: rpc.Api.EventFilter[] = [{ type: 'contract', contractIds: [...known.keys()] }];
     let seen = 0;
     let stored = 0;
     let latestLedger = health.latestLedger;
-    let page = await withTimeout(
-      'rpc-events',
-      async () => deps.source.getEvents({ startLedger, filters, limit: PAGE_LIMIT }),
-      { signal: handle.signal },
+    let page = await withCallerClass(eventsClass, () =>
+      withTimeout(
+        'rpc-events',
+        async () => deps.source.getEvents({ startLedger, filters, limit: PAGE_LIMIT }),
+        { signal: handle.signal },
+      ),
     );
 
     for (;;) {
@@ -475,14 +746,22 @@ export async function backfillEvents(
         }
       }
       if (page.events.length < PAGE_LIMIT) break;
-      page = await withTimeout(
-        'rpc-events',
-        async () => deps.source.getEvents({ filters, cursor: page.cursor, limit: PAGE_LIMIT }),
-        { signal: handle.signal },
+      page = await withCallerClass(eventsClass, () =>
+        withTimeout(
+          'rpc-events',
+          async () => deps.source.getEvents({ filters, cursor: page.cursor, limit: PAGE_LIMIT }),
+          { signal: handle.signal },
+        ),
       );
     }
 
     await writeCursor(latestLedger);
+    // Repair any markets marked dirty by out-of-order wallet PnL events (#298)
+    await import('./wallet-pnl.service')
+      .then((m) => m.processDirtyMarkets())
+      .catch((err) =>
+        logger.warn({ err: err instanceof Error ? err.message : err }, 'Indexer: dirty wallet PnL repair failed'),
+      );
     // Also covers rows left unpublished by an earlier outage, not just this run's.
     await publishPending(deps.emit).catch((err) =>
       logger.warn({ err: err instanceof Error ? err.message : err }, 'Indexer: publish pass failed'),
@@ -547,16 +826,27 @@ export function startEventListener(emit: IndexerDeps['emit']): () => void {
   let stopped = false;
   let timer: NodeJS.Timeout | null = null;
   const tick = async () => {
-    try {
-      const result = await backfillEvents(undefined, { source: rpcServer, emit });
-      pollState.lastLedger = result.lastLedger;
-      pollState.updatedAt = new Date().toISOString();
-      pollState.lastPollError = null;
-    } catch (err) {
-      pollState.lastPollError = err instanceof Error ? err.message : String(err);
-      logger.warn({ err: err instanceof Error ? err.message : err }, 'Indexer poll failed; will retry');
-    }
-    pollState.lastPollAt = new Date().toISOString();
+    const isLiveTail = pollState.lastLedger !== null;
+    await runWithContext(
+      {
+        requestId: newId('cyc'),
+        kind: 'indexer',
+        job: 'indexer-poll',
+        callerClass: isLiveTail ? 'agent' : 'background',
+      },
+      async () => {
+        try {
+          const result = await backfillEvents(undefined, { source: rpcServer, emit }, { liveTail: isLiveTail });
+          pollState.lastLedger = result.lastLedger;
+          pollState.updatedAt = new Date().toISOString();
+          pollState.lastPollError = null;
+        } catch (err) {
+          pollState.lastPollError = err instanceof Error ? err.message : String(err);
+          logger.warn({ err: err instanceof Error ? err.message : err }, 'Indexer poll failed; will retry');
+        }
+        pollState.lastPollAt = new Date().toISOString();
+      },
+    );
     if (!stopped) timer = setTimeout(tick, config.INDEXER_POLL_MS);
   };
   void tick();

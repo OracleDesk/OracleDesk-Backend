@@ -456,3 +456,128 @@ test('the manifest pins the bindings the backend was built against', async () =>
     assert.equal(pinned.specSha256, expected, `${contract} manifest specSha256 does not match the binding`);
   }
 });
+
+// ─── Runtime monitor, wiring check, holds & ack flow (#322) ─────────────────
+
+test('wiring mismatch in computeSpecCompat produces a breaking wiring diff and classifies as breaking for all scopes', async () => {
+  const { computeSpecCompat, classify } = await load();
+  const baseFetch = await matchingFetch();
+  const boot = await computeSpecCompat({
+    fetch: baseFetch,
+    readWiring: async () => ({
+      resolver: (await import('../src/config/contracts')).CONTRACTS.resolver,
+      treasury: (await import('../src/config/contracts')).CONTRACTS.treasury,
+    }),
+  });
+  assert.equal(boot.ok, true);
+
+  const rewired = await computeSpecCompat({
+    fetch: baseFetch,
+    readWiring: async () => ({
+      resolver: 'CRETIRED_RESOLVER_CONTRACT_ID',
+      treasury: (await import('../src/config/contracts')).CONTRACTS.treasury,
+    }),
+  });
+  assert.equal(rewired.ok, false);
+  assert.ok(rewired.breaking.some((d) => d.item === 'wiring' && /resolver/.test(d.change)));
+
+  const classification = classify(boot, rewired);
+  assert.equal(classification.cls, 'breaking');
+  assert.deepEqual(classification.affected, ['TRADER', 'MARKET_MAKER']);
+});
+
+test('runtime spec monitor: transient unverifiable backs off without pausing; breaking drift holds affected scope and requires ack + passing check to resume', async () => {
+  const { computeSpecCompat } = await load();
+  const monitor = await import('../src/services/stellar/spec-monitor');
+  const controls = await import('../src/services/agent-controls.service');
+  const { prisma } = await import('../src/lib/prisma');
+
+  // Stub minimal agent_controls table
+  const controlRows = new Map<string, any>(
+    ['ALL', 'MARKET_MAKER', 'TRADER'].map((s) => [
+      s,
+      { scope: s, paused: false, reason: null, source: null, pausedUntil: null, pausedBy: null, version: 0 },
+    ]),
+  );
+  (prisma as any).$transaction = async (fn: any) =>
+    fn({
+      $queryRawUnsafe: async (_sql: string, scope: string) => [{ ...controlRows.get(scope)! }],
+      agentControl: {
+        update: async ({ where, data }: any) => {
+          const row = controlRows.get(where.scope)!;
+          const { version, ...rest } = data;
+          Object.assign(row, rest);
+          if (version?.increment) row.version += version.increment;
+          return row;
+        },
+      },
+      agentControlEvent: { create: async ({ data }: any) => data },
+    });
+  (prisma.agentControl as any).findMany = async ({ where }: any) =>
+    where.scope.in.map((s: string) => ({ ...controlRows.get(s)! }));
+
+  controls.clearMemoryHoldsForTest();
+  const alerts: Array<{ key: string; level: string }> = [];
+  const fakeAlerts = {
+    async send(key: string, alert: { level: string }) {
+      alerts.push({ key, level: alert.level });
+      return ['test-sink'];
+    },
+  };
+
+  const baseFetch = await matchingFetch();
+  // Establish clean boot report
+  await (await load()).checkSpecCompat({ fetch: baseFetch });
+  monitor.resetSpecMonitorForTest();
+
+  // 1. Single transient RPC error -> unverifiable, below threshold (3), does NOT pause or alert
+  const transientRun = await monitor.runSpecCheck('signal', {
+    fetch: async (contract, id) => {
+      if (contract === 'resolver') throw new Error('transient timeout');
+      return baseFetch(contract, id);
+    },
+    alertService: fakeAlerts,
+    unverifiableRunsThreshold: 3,
+    baseBackoffMs: 50_000,
+  });
+  assert.equal(transientRun.cls, 'unverifiable');
+  assert.equal(controlRows.get('MARKET_MAKER')!.paused, false);
+  assert.equal(alerts.length, 0);
+
+  // 2. Breaking drift on resolver -> pauses MARKET_MAKER (not TRADER) with spec_drift hold + CRITICAL alert
+  const brokenResolverSpec = clone(await bindingEntries('resolver')).filter(
+    (e) => !(e.switch().name === 'scSpecEntryFunctionV0' && e.functionV0().name().toString() === 'state'),
+  );
+  const breakingRun = await monitor.runSpecCheck('periodic', {
+    fetch: async (contract, id) =>
+      contract === 'resolver'
+        ? { contract, contractId: id, wasmHash: 'dd'.repeat(32), kind: 'wasm' as const, spec: brokenResolverSpec }
+        : baseFetch(contract, id),
+    alertService: fakeAlerts,
+  });
+  assert.equal(breakingRun.cls, 'breaking');
+  assert.deepEqual(breakingRun.affected, ['MARKET_MAKER']);
+  assert.equal(controlRows.get('MARKET_MAKER')!.paused, true);
+  assert.equal(controlRows.get('TRADER')!.paused, false);
+  assert.equal(alerts.length, 1);
+  assert.equal(alerts[0].level, 'CRITICAL');
+
+  // 3. Operator resume is refused with 409 SPEC_DRIFT_UNACKED before ack
+  await assert.rejects(
+    controls.resumeAgent('MARKET_MAKER', { actor: 'GADMIN', reason: 'try resume' }),
+    (err: any) => err.statusCode === 409 && err.code === 'SPEC_DRIFT_UNACKED',
+  );
+
+  // 4. Acknowledge while still fixed -> clears hold and resumes MARKET_MAKER
+  const ackRes = await monitor.acknowledgeSpecDrift('GADMIN', {
+    fetch: baseFetch,
+    alertService: fakeAlerts,
+  });
+  assert.equal(ackRes.acknowledged, true);
+  assert.equal(ackRes.cleared, true);
+  assert.equal(controlRows.get('MARKET_MAKER')!.paused, false);
+
+  void computeSpecCompat;
+  controls.clearMemoryHoldsForTest();
+  monitor.resetSpecMonitorForTest();
+});

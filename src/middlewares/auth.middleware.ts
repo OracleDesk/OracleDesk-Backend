@@ -91,7 +91,12 @@ export function verifyAccessToken(token: string): { user?: JwtPayload; error?: A
 /** Tag the request's log context with the caller (mutates this request's own store object). */
 function setContextUser(userId: string): void {
   const ctx = currentContext();
-  if (ctx) ctx.userId = userId;
+  if (ctx) {
+    ctx.userId = userId;
+    if (!ctx.callerClass || ctx.callerClass === 'public') {
+      ctx.callerClass = 'interactive';
+    }
+  }
 }
 
 /**

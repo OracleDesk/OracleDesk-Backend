@@ -24,6 +24,17 @@ import { getRedis } from './redis';
 import type { BusEvent, EventBus } from './event-bus';
 import { assertPublic } from './socket-auth';
 
+export interface FanoutThrottle {
+  handle(event: string, payload: unknown, meta: { live: boolean; ledger: number; marketKey: string | null }): void;
+  flush(): void;
+  stop(): void;
+}
+
+export interface FanoutStreamMonitor {
+  shedding(): boolean;
+  consumeResync(): boolean;
+}
+
 export interface FanoutOptions {
   redis?: Redis;
   /** Key prefix; tests use a per-test prefix. */
@@ -37,6 +48,15 @@ export interface FanoutOptions {
   seenTtlSeconds?: number;
   /** Leadership is re-read from Redis before delivering if last confirmed longer ago than this. */
   fenceMs?: number;
+  /** Coalescing/throttle that must be the only path to io.emit (#291). */
+  throttle?: FanoutThrottle;
+  /** Adapter lag source: sheds coalescable public traffic and signals resync. */
+  monitor?: FanoutStreamMonitor;
+}
+
+/** Events that may be shed under lag without losing durable private/admin state. */
+export function isCoalescablePublic(type: string): boolean {
+  return type === 'TRADE_EXECUTED' || type === 'MARKET_PRICE';
 }
 
 const RENEW_LUA = `
@@ -92,6 +112,9 @@ export function startFanout(bus: EventBus, io: Pick<Server, 'emit'>, opts: Fanou
     if (!leading) return;
     leading = false;
     logger.warn({ instanceId, reason }, 'Fan-out: stopped consuming');
+    // A lost lease must not flush a price that a successor may already have
+    // superseded; the successor replays from the cursor and coalesces again.
+    opts.throttle?.stop();
     const stop = stopSubscription;
     stopSubscription = null;
     // Not awaited: this can be called from inside the handler that stop() waits for.
@@ -109,7 +132,26 @@ export function startFanout(bus: EventBus, io: Pick<Server, 'emit'>, opts: Fanou
       return;
     }
     assertPublic(event.type);
-    io.emit(event.type, event.payload);
+    if (opts.monitor?.consumeResync()) {
+      io.emit('RESYNC_REQUIRED', {
+        reason: 'STREAM_GAP',
+        ledger: event.ledger,
+        streamId,
+      });
+    }
+    // Coalescable public traffic is the only thing shed under adapter lag;
+    // reasoning traces, private rooms and admin events are never dropped here.
+    if (opts.monitor?.shedding() && isCoalescablePublic(event.type)) {
+      logger.warn({ instanceId, eventId: event.id, type: event.type }, 'Fan-out: shedding public event under adapter lag');
+    } else if (opts.throttle) {
+      opts.throttle.handle(event.type, event.payload, {
+        live: event.live !== false,
+        ledger: event.ledger,
+        marketKey: event.marketKey,
+      });
+    } else {
+      io.emit(event.type, event.payload);
+    }
     remember(event.id);
     await redis.multi().set(seenKey(event.id), '1', 'EX', seenTtl).set(cursorKey, streamId).exec();
   }
@@ -163,7 +205,12 @@ export function startFanout(bus: EventBus, io: Pick<Server, 'emit'>, opts: Fanou
     const stop = stopSubscription;
     stopSubscription = null;
     if (stop) await stop().catch(() => undefined);
-    if (wasLeading) await redis.eval(RELEASE_LUA, 1, leaderKey, instanceId).catch(() => undefined);
+    // Graceful handover: the last coalesced price leaves before the lock is
+    // released, so the successor does not have to replay it.
+    if (wasLeading) {
+      opts.throttle?.flush();
+      await redis.eval(RELEASE_LUA, 1, leaderKey, instanceId).catch(() => undefined);
+    }
   };
 }
 
@@ -171,9 +218,25 @@ export function startFanout(bus: EventBus, io: Pick<Server, 'emit'>, opts: Fanou
  * Single-process variant for EVENT_BUS_ENABLED=false: no leader election and
  * no Redis, one consumer emitting to this process's sockets.
  */
-export function startLocalFanout(bus: EventBus, io: Pick<Server, 'emit'>): () => Promise<void> {
-  return bus.subscribe((event) => {
+export function startLocalFanout(
+  bus: EventBus,
+  io: Pick<Server, 'emit'>,
+  opts: { throttle?: FanoutThrottle; monitor?: FanoutStreamMonitor } = {},
+): () => Promise<void> {
+  return bus.subscribe((event, streamId) => {
     assertPublic(event.type);
-    io.emit(event.type, event.payload);
+    if (opts.monitor?.consumeResync()) {
+      io.emit('RESYNC_REQUIRED', { reason: 'STREAM_GAP', ledger: event.ledger, streamId });
+    }
+    if (opts.monitor?.shedding() && isCoalescablePublic(event.type)) return;
+    if (opts.throttle) {
+      opts.throttle.handle(event.type, event.payload, {
+        live: event.live !== false,
+        ledger: event.ledger,
+        marketKey: event.marketKey,
+      });
+    } else {
+      io.emit(event.type, event.payload);
+    }
   });
 }

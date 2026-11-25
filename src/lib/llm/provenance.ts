@@ -48,6 +48,8 @@ export interface LlmProvenance {
   source: 'llm';
   provider: ProvenanceProvider;
   model: string;
+  /** Provider-reported model version/snapshot served for this call (#296). */
+  servedModel?: string;
   promptId: string;
   promptVersion: number;
   promptHash: string;
@@ -67,6 +69,8 @@ export interface LlmProvenance {
   route?: LlmRoute;
   /** sha256 of the raw model output (canonical JSON of a tool input). */
   outputSha256: string;
+  /** Output citation validation summary (#304). */
+  citationCheck?: CitationCheckProvenance;
 }
 
 /** No model produced the output: a hard-coded safe default was used. */
@@ -74,7 +78,9 @@ export interface DefaultProvenance {
   source: 'default';
   promptId: string;
   promptVersion: number;
-  reason: 'LLM_FAILED' | 'LLM_BUDGET_EXCEEDED';
+  reason: 'LLM_FAILED' | 'LLM_BUDGET_EXCEEDED' | 'CITATION_REJECTED';
+  /** Output citation validation summary when rejected (#304). */
+  citationCheck?: CitationCheckProvenance;
 }
 
 export type ProvenanceEntry = LlmProvenance | DefaultProvenance;

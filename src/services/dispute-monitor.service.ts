@@ -332,7 +332,12 @@ export async function reviewProposal(id: string, deps: MonitorDeps): Promise<Dis
 
   let result;
   try {
-    result = await deps.evaluator.evaluate(doc, new Date(Number(doc.closeTime) * 1000));
+    const deadlineMs = review.windowEndsAt !== null ? Number(review.windowEndsAt) * 1000 : undefined;
+    result = await deps.evaluator.evaluate(
+      doc,
+      new Date(Number(doc.closeTime) * 1000),
+      deadlineMs !== undefined ? { deadlineMs } : undefined,
+    );
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : err, reviewId: id }, 'Dispute review: evaluation failed');
     review = await save(id, {

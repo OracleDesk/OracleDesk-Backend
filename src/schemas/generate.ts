@@ -96,6 +96,11 @@ export const TRACE_V1_SCHEMA = {
         },
       },
     },
+    citedSourceIds: {
+      type: 'array',
+      maxItems: 50,
+      items: { type: 'string' },
+    },
     betFraction: { type: ['number', 'null'] },
     betSizeUsdc: { type: ['number', 'null'] },
     hedgeConditions: {
@@ -239,6 +244,47 @@ export const TRACE_V2_SCHEMA = {
         domains: { type: 'array', maxItems: 50, items: { type: 'string' } },
       },
     },
+    hedgePredicates: {
+      type: ['array', 'null'],
+      maxItems: 10,
+      items: {
+        oneOf: [
+          {
+            type: 'object',
+            additionalProperties: false,
+            required: ['id', 'version', 'kind', 'seriesId', 'comparator', 'threshold', 'unit', 'action', 'description'],
+            properties: {
+              id: { type: 'string', minLength: 1, maxLength: 32 },
+              version: { const: 1 },
+              kind: { const: 'fred_series' },
+              seriesId: { type: 'string', enum: ['FEDFUNDS', 'CPIAUCSL', 'UNRATE', 'T10Y2Y'] },
+              comparator: { type: 'string', enum: ['gt', 'gte', 'lt', 'lte'] },
+              threshold: { type: 'number' },
+              unit: { type: 'string', enum: ['percent', 'index', 'spread'] },
+              action: { type: 'string', enum: ['EXIT', 'REFORECAST'] },
+              description: { type: 'string', minLength: 1, maxLength: 500 },
+            },
+          },
+          {
+            type: 'object',
+            additionalProperties: false,
+            required: ['id', 'version', 'kind', 'entities', 'comparator', 'threshold', 'windowHours', 'unit', 'action', 'description'],
+            properties: {
+              id: { type: 'string', minLength: 1, maxLength: 32 },
+              version: { const: 1 },
+              kind: { const: 'news_entity_count' },
+              entities: { type: 'array', minItems: 1, maxItems: 5, items: { type: 'string', minLength: 1, maxLength: 64 } },
+              comparator: { type: 'string', enum: ['gt', 'gte', 'lt', 'lte'] },
+              threshold: { type: 'integer', minimum: 1, maximum: 1000 },
+              windowHours: { type: 'integer', minimum: 1, maximum: 720 },
+              unit: { const: 'articles' },
+              action: { type: 'string', enum: ['EXIT', 'REFORECAST'] },
+              description: { type: 'string', minLength: 1, maxLength: 500 },
+            },
+          },
+        ],
+      },
+    },
   },
 };
 
@@ -324,6 +370,199 @@ export const QUESTION_V2_SCHEMA = {
   },
 };
 
+export const REPORT_V2_SCHEMA = {
+  $schema: 'https://json-schema.org/draft/2020-12/schema',
+  $id: `${CANONICAL_BASE}/api/v1/schemas/report/v2.json`,
+  title: 'OracleDesk Transparency Report v2',
+  type: 'object',
+  additionalProperties: false,
+  required: [
+    'kind',
+    'schemaVersion',
+    'network',
+    'contracts',
+    'agent',
+    'period',
+    'anchor',
+    'consistency',
+    'treasury',
+    'chain',
+    'reconciliation',
+    'markets',
+    'totals',
+    'period_flows',
+    'traces',
+    'method',
+    'previous',
+  ],
+  properties: {
+    kind: { const: 'oracledesk.transparency-report' },
+    schemaVersion: { const: 2 },
+    network: { type: 'string' },
+    contracts: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['treasury', 'marketCore', 'usdc', 'reasoningRegistry'],
+      properties: {
+        treasury: { type: 'string' },
+        marketCore: { type: 'string' },
+        usdc: { type: 'string' },
+        reasoningRegistry: { type: 'string' },
+      },
+    },
+    agent: { type: 'string' },
+    period: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['from', 'to'],
+      properties: {
+        from: { type: 'string', format: 'date-time' },
+        to: { type: 'string', format: 'date-time' },
+      },
+    },
+    anchor: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['ledger', 'closedAt'],
+      properties: {
+        ledger: { type: 'integer', minimum: 0 },
+        closedAt: { type: 'string', format: 'date-time' },
+      },
+    },
+    consistency: { type: 'string', enum: ['exact', 'best_effort'] },
+    treasury: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['usdcBalanceRaw', 'availableCapitalRaw', 'riskConfig', 'dailyUsage'],
+      properties: {
+        usdcBalanceRaw: { type: 'string', pattern: '^-?\\d+$' },
+        availableCapitalRaw: { type: 'string', pattern: '^-?\\d+$' },
+        riskConfig: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['maxTradeRaw', 'maxMarketRaw', 'maxDailyRaw'],
+          properties: {
+            maxTradeRaw: { type: 'string', pattern: '^\\d+$' },
+            maxMarketRaw: { type: 'string', pattern: '^\\d+$' },
+            maxDailyRaw: { type: 'string', pattern: '^\\d+$' },
+          },
+        },
+        dailyUsage: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['amountRaw', 'dayStart'],
+          properties: {
+            amountRaw: { type: 'string', pattern: '^\\d+$' },
+            dayStart: { type: 'integer', minimum: 0 },
+          },
+        },
+      },
+    },
+    chain: {
+      type: 'object',
+      additionalProperties: false,
+      required: [
+        'navRaw',
+        'liquidRaw',
+        'yieldPrincipalRaw',
+        'yieldValueShares',
+        'queueReservedRaw',
+        'netExposureRaw',
+        'ledger',
+      ],
+      properties: {
+        navRaw: { type: 'string', pattern: '^-?\\d+$' },
+        liquidRaw: { type: 'string', pattern: '^-?\\d+$' },
+        yieldPrincipalRaw: { type: 'string', pattern: '^-?\\d+$' },
+        yieldValueShares: { type: ['string', 'null'], pattern: '^-?\\d+$' },
+        queueReservedRaw: { type: 'string', pattern: '^-?\\d+$' },
+        netExposureRaw: { type: 'string', pattern: '^-?\\d+$' },
+        ledger: { type: 'integer', minimum: 0 },
+      },
+    },
+    reconciliation: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['navDiffRaw', 'perMarket', 'flags'],
+      properties: {
+        navDiffRaw: { type: 'string', pattern: '^-?\\d+$' },
+        perMarket: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['marketId', 'chainFloorRaw', 'recomputedFloorRaw', 'diffRaw'],
+            properties: {
+              marketId: { type: 'string', pattern: '^\\d+$' },
+              chainFloorRaw: { type: 'string', pattern: '^-?\\d+$' },
+              recomputedFloorRaw: { type: 'string', pattern: '^-?\\d+$' },
+              diffRaw: { type: 'string', pattern: '^-?\\d+$' },
+            },
+          },
+        },
+        flags: {
+          type: 'array',
+          items: {
+            type: 'string',
+            enum: [
+              'NAV_EXCLUDES_YIELD',
+              'YIELD_VALUE_IN_SHARES',
+              'YIELD_READ_FAILED',
+              'AVAILABLE_MIXES_UNITS',
+              'NAV_DIFF_EXCEEDS_TOLERANCE',
+            ],
+          },
+        },
+      },
+    },
+    markets: {
+      type: 'array',
+      items: { type: 'object', additionalProperties: true },
+    },
+    totals: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['positionsMarkRaw', 'positionsLiquidationRaw', 'navRaw'],
+      properties: {
+        positionsMarkRaw: { type: 'string', pattern: '^-?\\d+$' },
+        positionsLiquidationRaw: { type: 'string', pattern: '^-?\\d+$' },
+        navRaw: { type: 'string', pattern: '^-?\\d+$' },
+      },
+    },
+    period_flows: {
+      type: 'object',
+      additionalProperties: true,
+    },
+    traces: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['total', 'byAction'],
+      properties: {
+        total: { type: 'integer', minimum: 0 },
+        byAction: { type: 'object', additionalProperties: { type: 'integer', minimum: 0 } },
+      },
+    },
+    method: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['version', 'doc'],
+      properties: {
+        version: { const: '2' },
+        doc: { type: 'string' },
+      },
+    },
+    previous: {
+      type: ['object', 'null'],
+      additionalProperties: false,
+      required: ['onChainTraceId', 'traceHash'],
+      properties: {
+        onChainTraceId: { type: 'string', pattern: '^\\d+$' },
+        traceHash: { type: 'string', pattern: '^[0-9a-f]{64}$' },
+      },
+    },
+  },
+};
+
 export interface SchemaTarget {
   file: string;
   path: string;
@@ -336,6 +575,7 @@ export const SCHEMA_TARGETS: SchemaTarget[] = [
   { file: 'trace-v2.schema.json', path: 'trace/v2.json', schema: TRACE_V2_SCHEMA, title: 'Reasoning Trace v2' },
   { file: 'question.schema.json', path: 'question/v2.json', schema: QUESTION_V2_SCHEMA, title: 'Question v2' },
   { file: 'question-v1.schema.json', path: 'question/v1.json', schema: QUESTION_V1_SCHEMA, title: 'Question v1' },
+  { file: 'report.schema.json', path: 'report/v2.json', schema: REPORT_V2_SCHEMA, title: 'Transparency Report v2' },
 ];
 
 export function jsonSchemaFor(target: SchemaTarget, baseUrl: string): Record<string, unknown> {

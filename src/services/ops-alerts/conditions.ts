@@ -12,10 +12,11 @@
  */
 import { config } from '../../config';
 import { prisma } from '../../lib/prisma';
+import { socketStreamClusterStats } from '../../lib/socket-stream';
 import type { AlertLevel } from '../alerts.service';
 import { controlsOverview, type PauseSource } from '../agent-controls.service';
 
-export type SubjectType = 'agent_pause' | 'outbox_stuck' | 'outbox_unhandled' | 'cron_failing' | 'reconcile_drift';
+export type SubjectType = 'agent_pause' | 'outbox_stuck' | 'outbox_unhandled' | 'cron_failing' | 'reconcile_drift' | 'socket_stream';
 
 export interface Observation {
   subjectKey: string;
@@ -171,4 +172,37 @@ export const reconcileDrift: Evaluator = {
   },
 };
 
-export const DEFAULT_EVALUATORS: readonly Evaluator[] = [agentPauses, outboxStuck, outboxUnhandled, cronFailing, reconcileDrift];
+/** Socket.io Redis Streams adapter lag, trimmed gaps and read errors (#293). */
+export const socketStreamLag: Evaluator = {
+  subjectType: 'socket_stream',
+  async evaluate() {
+    if (!config.EVENT_BUS_ENABLED) return [];
+    const stats = await socketStreamClusterStats();
+    const out: Observation[] = [];
+    for (const inst of stats.instances) {
+      const lagHigh =
+        inst.lagEntries >= config.SOCKET_ADAPTER_LAG_WARN_ENTRIES ||
+        inst.lagMs >= config.SOCKET_ADAPTER_LAG_WARN_MS;
+      const hasErrors = inst.trimmedGaps > 0 || inst.readErrors > 0 || inst.shedding;
+      if (!lagHigh && !hasErrors) continue;
+      const critical = inst.trimmedGaps > 0 || inst.shedding;
+      out.push({
+        subjectKey: `socket_stream:${inst.instanceId}`,
+        bad: true,
+        severity: critical ? 'CRITICAL' : 'WARN',
+        summary: `Socket stream instance ${inst.instanceId} lagging (lagEntries=${inst.lagEntries}, lagMs=${inst.lagMs}, trimmedGaps=${inst.trimmedGaps}, readErrors=${inst.readErrors})`,
+        detail: { ...inst },
+      });
+    }
+    return out;
+  },
+};
+
+export const DEFAULT_EVALUATORS: readonly Evaluator[] = [
+  agentPauses,
+  outboxStuck,
+  outboxUnhandled,
+  cronFailing,
+  reconcileDrift,
+  socketStreamLag,
+];

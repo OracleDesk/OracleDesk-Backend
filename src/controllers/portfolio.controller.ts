@@ -7,6 +7,7 @@ import { treasuryAvailableCapitalCached } from '../services/chain.service';
 import { readTreasuryBudget } from '../services/treasury-budget.service';
 import { toDisplayUsdc } from '../lib/amounts';
 import { logger } from '../lib/logger';
+import { freshnessMeta } from '../lib/freshness';
 
 /**
  * GET /portfolio
@@ -43,7 +44,7 @@ export async function getPortfolio(req: Request, res: Response): Promise<void> {
     availableCapitalRaw,
     availableCapitalLedger: capRes.ledger,
     latestReport,
-  });
+  }, 200, await freshnessMeta(capRes.ledger === null ? 'mixed' : 'mixed', capRes.ledger));
 }
 
 /**

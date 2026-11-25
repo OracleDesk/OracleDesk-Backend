@@ -1,3 +1,4 @@
+import { config } from '../config';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { writeAgentLog } from '../lib/agent-log';
@@ -5,6 +6,7 @@ import { AppError } from '../middlewares/error.middleware';
 import type { HedgeRecommendation } from '../types';
 import { decimalToBigint, priceToBps, toDisplayUsdc, usdcFromNumber } from '../lib/amounts';
 import { pauseAgent } from './agent-controls.service';
+import { twapMark, valuePositionAtPrice, type TwapMarkResult } from './valuation.service';
 
 // ─── Hedging constants ───
 const HEDGE_SIZE_BPS            = 5_000n; // Hedge 50% of original position
@@ -218,25 +220,120 @@ export async function autoHedge(recommendation: HedgeRecommendation): Promise<an
 export async function enforceStopLoss(positionId: string): Promise<{
   shouldClose: boolean;
   reason?: string;
+  deferred?: boolean;
+  divergenceBps?: number;
 }> {
   const position = await prisma.position.findUnique({
     where: { id: positionId },
+    include: { market: { select: { onChainMarketId: true } } },
   });
 
   if (!position || position.status !== 'OPEN') {
     return { shouldClose: false };
   }
 
-  // Positions marked to market stop out on what selling them would return (#78).
-  if (position.costBasisRaw != null && position.unrealisedPnlRaw != null) {
-    return evaluateLiquidationStopLoss(decimalToBigint(position.costBasisRaw), decimalToBigint(position.unrealisedPnlRaw));
-  }
-  return evaluateStopLoss({
+  return evaluateStopLossWithTwap({
+    id: position.id,
+    marketId: position.marketId,
+    direction: position.direction,
+    sharesRaw: position.sharesRaw == null ? null : decimalToBigint(position.sharesRaw),
+    costBasisRaw: position.costBasisRaw == null ? null : decimalToBigint(position.costBasisRaw),
+    unrealisedPnlRaw: position.unrealisedPnlRaw == null ? null : decimalToBigint(position.unrealisedPnlRaw),
+    markPriceBps: position.markPriceBps,
     entryPriceBps: position.entryPriceBps,
-    currentPriceBps: position.markPriceBps,
     entryPrice: position.entryPrice,
     currentPrice: position.currentPrice,
+    onChainMarketId: position.market.onChainMarketId,
   });
+}
+
+export interface TwapStopLossInput {
+  id: string;
+  marketId: string;
+  direction: 'YES' | 'NO';
+  sharesRaw: bigint | null;
+  costBasisRaw: bigint | null;
+  unrealisedPnlRaw: bigint | null;
+  markPriceBps: number | null;
+  entryPriceBps: number | null;
+  entryPrice: number;
+  currentPrice: number | null;
+  onChainMarketId: bigint | null;
+}
+
+/**
+ * Evaluates stop-loss using market-core TWAP when available, falling back to
+ * the spot mark (#292). When spot and TWAP diverge by more than
+ * TWAP_DIVERGENCE_BPS and only the spot would trigger, defers the exit as
+ * likely single-ledger manipulation.
+ */
+export async function evaluateStopLossWithTwap(
+  position: TwapStopLossInput,
+  deps: { readTwap?: (onChainMarketId: bigint) => Promise<TwapMarkResult>; divergenceBps?: number } = {},
+): Promise<{
+  shouldClose: boolean;
+  reason?: string;
+  deferred?: boolean;
+  divergenceBps?: number;
+}> {
+  const spotResult =
+    position.costBasisRaw != null && position.unrealisedPnlRaw != null
+      ? evaluateLiquidationStopLoss(position.costBasisRaw, position.unrealisedPnlRaw)
+      : evaluateStopLoss({
+          entryPriceBps: position.entryPriceBps,
+          currentPriceBps: position.markPriceBps,
+          entryPrice: position.entryPrice,
+          currentPrice: position.currentPrice,
+        });
+
+  if (position.onChainMarketId == null || position.sharesRaw == null || position.costBasisRaw == null) {
+    return spotResult;
+  }
+
+  const readTwap = deps.readTwap ?? ((id: bigint) => twapMark(id));
+  const twap = await readTwap(position.onChainMarketId);
+  if (twap.source !== 'twap' || twap.yesBps === null) {
+    return spotResult;
+  }
+
+  const twapVal = valuePositionAtPrice(position.direction, position.sharesRaw, position.costBasisRaw, BigInt(twap.yesBps));
+  const twapOutcomeBps = Number(twapVal.priceBps);
+  const spotOutcomeBps = position.markPriceBps ?? (position.currentPrice != null ? priceToBps(position.currentPrice) : null);
+  const divergenceBps = spotOutcomeBps != null ? Math.abs(spotOutcomeBps - twapOutcomeBps) : 0;
+  const maxDivergenceBps = deps.divergenceBps ?? config.TWAP_DIVERGENCE_BPS;
+
+  const twapTriggered = lossReaches(position.costBasisRaw, twapVal.unrealisedPnlRaw, STOP_LOSS_PCT_BPS);
+  if (twapTriggered) {
+    const lossBps = (-twapVal.unrealisedPnlRaw * 10_000n) / position.costBasisRaw;
+    return {
+      shouldClose: true,
+      reason: `STOP_LOSS: TWAP value ${(Number(lossBps) / 100).toFixed(1)}% below cost`,
+      divergenceBps,
+    };
+  }
+
+  if (spotResult.shouldClose && divergenceBps > maxDivergenceBps) {
+    logger.warn(
+      {
+        positionId: position.id,
+        marketId: position.marketId,
+        spotOutcomeBps,
+        twapOutcomeBps,
+        divergenceBps,
+        maxDivergenceBps,
+      },
+      'Stop-loss deferred: spot/TWAP divergence exceeds threshold (possible manipulation)',
+    );
+    return {
+      shouldClose: false,
+      deferred: true,
+      divergenceBps,
+      reason: `STOP_LOSS_DEFERRED: spot (${spotOutcomeBps} bps) vs TWAP (${twapOutcomeBps} bps) divergence ${divergenceBps} > ${maxDivergenceBps} bps`,
+    };
+  }
+
+  // TWAP is healthy and did not trigger stop-loss.
+  return { shouldClose: false, divergenceBps };
 }
 
 /** True when the unrealised loss is at least `pctBps` of the cost basis. */

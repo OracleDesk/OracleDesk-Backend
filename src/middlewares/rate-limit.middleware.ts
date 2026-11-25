@@ -29,3 +29,6 @@ export const generateLimiter = limiter(60 * 60 * 1000, 5);
 
 /** /signer/*: 30 requests per minute per IP (each prepare simulates against RPC). */
 export const signerLimiter = limiter(60 * 1000, 30);
+
+/** /markets/:id/provenance: 30 requests per minute per IP (cold misses fan out to RPC & IPFS). */
+export const provenanceLimiter = limiter(60 * 1000, 30);

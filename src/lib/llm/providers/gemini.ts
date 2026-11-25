@@ -69,8 +69,10 @@ export const geminiProvider: LlmProvider = {
       const text = result.response.text()?.trim();
       if (!text) throw new LlmError('empty', 'gemini', 'Gemini returned an empty response', undefined, []);
       const usage = result.response.usageMetadata;
+      const modelVersion = (result.response as any).modelVersion;
       return {
         text,
+        ...(typeof modelVersion === 'string' && modelVersion ? { servedModel: modelVersion } : {}),
         usage: {
           inputTokens: usage?.promptTokenCount,
           outputTokens: usage?.candidatesTokenCount,

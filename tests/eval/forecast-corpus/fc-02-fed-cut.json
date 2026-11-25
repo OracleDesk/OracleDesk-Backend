@@ -1,0 +1,21 @@
+{
+  "id": "fc-02-fed-cut",
+  "marketId": "mkt-fc-02",
+  "question": "Will the Federal Reserve cut rates by 50bps at its November 2026 meeting?",
+  "category": "MACRO",
+  "closeTime": "2026-11-06T18:00:00.000Z",
+  "resolutionSource": "FRED",
+  "questionDoc": null,
+  "signals": [
+    {
+      "id": "sig-fc-02-a",
+      "source": "FED",
+      "title": "Fed officials signal gradual 25bps easing path amid sticky services inflation",
+      "publishedAt": "2026-10-28T14:00:00.000Z"
+    }
+  ],
+  "asOf": "2026-10-29T12:00:00.000Z",
+  "marketProbability": 0.35,
+  "resolvedOutcome": 0,
+  "resolvedAt": "2026-11-06T19:05:00.000Z"
+}

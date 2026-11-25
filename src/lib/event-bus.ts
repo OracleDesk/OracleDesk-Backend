@@ -26,6 +26,8 @@ export interface BusEvent {
   ledger: number;
   /** On-chain market id as a decimal string; the per-market ordering key. */
   marketKey: string | null;
+  /** True when the event is within SOCKET_LIVE_LEDGER_LAG of the RPC tip (#291). */
+  live?: boolean;
   payload: unknown;
 }
 
@@ -56,6 +58,7 @@ function encode(event: BusEvent): string[] {
     'type', event.type,
     'ledger', String(event.ledger),
     'marketKey', event.marketKey ?? '',
+    'live', event.live === undefined ? '1' : event.live ? '1' : '0',
     'payload', JSON.stringify(event.payload, bigintSafe),
   ];
 }
@@ -70,6 +73,7 @@ function decode(fields: string[]): BusEvent | null {
       type: map.type,
       ledger: Number(map.ledger),
       marketKey: map.marketKey ? map.marketKey : null,
+      live: map.live === undefined ? true : map.live === '1',
       payload: JSON.parse(map.payload ?? 'null'),
     };
   } catch {
@@ -81,6 +85,12 @@ export interface RedisBusOptions {
   /** Stream key; tests use a per-test prefix. */
   key?: string;
   maxLen?: number;
+  /** One XREAD batch. */
+  readCount?: number;
+  /** XREAD BLOCK duration. */
+  blockMs?: number;
+  /** Safety net above blockMs for the blocking connection. */
+  blockingTimeoutMs?: number;
   /** Connection for XADD and XREVRANGE. */
   redis?: Redis;
   /** Creates the dedicated connection for each blocking read loop. */
@@ -92,8 +102,11 @@ export interface RedisBusOptions {
 export function redisEventBus(opts: RedisBusOptions = {}): EventBus {
   const key = opts.key ?? EVENT_STREAM_KEY;
   const maxLen = opts.maxLen ?? config.EVENT_BUS_MAXLEN;
+  const readCount = opts.readCount ?? config.EVENT_BUS_READ_COUNT;
+  const blockMs = opts.blockMs ?? config.EVENT_BUS_BLOCK_MS;
+  const blockingTimeoutMs = opts.blockingTimeoutMs ?? config.EVENT_BUS_BLOCKING_TIMEOUT_MS;
   const shared = () => opts.redis ?? getRedis();
-  const open = opts.blocking ?? getBlockingRedis;
+  const open = opts.blocking ?? (() => getBlockingRedis({ blockMs, blockingTimeoutMs }));
   const release = opts.release ?? releaseBlockingRedis;
 
   async function tailId(connection: Redis = shared()): Promise<string> {
@@ -130,7 +143,7 @@ export function redisEventBus(opts: RedisBusOptions = {}): EventBus {
         }
         while (!stopped) {
           try {
-            const result = await connection.xread('COUNT', 100, 'BLOCK', 1000, 'STREAMS', key, last as string);
+            const result = await connection.xread('COUNT', readCount, 'BLOCK', blockMs, 'STREAMS', key, last as string);
             if (!result) continue;
             for (const [, entries] of result) {
               for (const [streamId, fields] of entries) {

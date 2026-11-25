@@ -26,6 +26,7 @@ export const SECRET_NAMES = [
   'NEWSAPI_KEY',
   'FRED_API_KEY',
   'ENTITLEMENT_SIGNING_KEY',
+  'RECEIPT_SIGNING_KEY',
   'URI_REQUEST_SIGNING_SECRET',
   'TRACE_SIGNING_KEY',
   'X402_ALLOWANCE_HMAC_SECRET',
@@ -71,6 +72,7 @@ interface ResolvedSecrets {
   NEWSAPI_KEY: string;
   FRED_API_KEY: string;
   ENTITLEMENT_SIGNING_KEY: string;
+  RECEIPT_SIGNING_KEY?: string;
   URI_REQUEST_SIGNING_SECRET?: string;
   TRACE_SIGNING_KEY?: string;
   X402_ALLOWANCE_HMAC_SECRET?: string;
@@ -180,6 +182,10 @@ export function validateSecrets(
     // Never echo the key; only say that it could not be parsed.
     const problem = entitlementKeyProblem(values.ENTITLEMENT_SIGNING_KEY);
     if (problem) problems.push(`ENTITLEMENT_SIGNING_KEY ${problem}`);
+  }
+  if (values.RECEIPT_SIGNING_KEY) {
+    const problem = entitlementKeyProblem(values.RECEIPT_SIGNING_KEY);
+    if (problem) problems.push(`RECEIPT_SIGNING_KEY ${problem}`);
   }
   if (nodeEnv === 'production' && requireProd) {
     if (!values.JWT_SECRET) problems.push('JWT_SECRET is required in production');

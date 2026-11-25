@@ -7,8 +7,9 @@ import { checkAccess } from '../services/subscription.service';
 import { CONTRACTS } from '../config/contracts';
 import { config } from '../config';
 import { toDisplayUsdc } from '../lib/amounts';
-import { confirmCopyTradeSchema, copyTradeSchema } from '../validators/trade.validator';
+import { confirmCopyTradeSchema, copyTradeQuoteSchema, copyTradeSchema } from '../validators/trade.validator';
 import { confirmCopyTrade as serviceConfirmCopyTrade } from '../services/copy-trade.service';
+import { estimateCopyTradeImpact } from '../services/copy-trade-impact.service';
 import { AppError } from '../middlewares/error.middleware';
 
 /**
@@ -71,6 +72,19 @@ export async function initiateCopyTrade(req: Request, res: Response): Promise<vo
     return;
   }
 
+  // #306: copy-trading moves user money — require a fresh VALID registry verdict.
+  const verdict = await getFreshTraceVerdict(trace as any);
+  if (verdict.kind !== TraceVerdictKind.VALID) {
+    sendError(
+      res,
+      409,
+      'TRACE_NOT_TRUSTED',
+      `Copy-trading is blocked because this trace verdict is ${verdict.kind}`,
+      { verdict },
+    );
+    return;
+  }
+
   const market = trace.market;
   if (market.onChainMarketId === null) {
     sendError(res, 409, 'MARKET_NOT_ON_CHAIN', 'This market is not on-chain yet');
@@ -86,6 +100,27 @@ export async function initiateCopyTrade(req: Request, res: Response): Promise<vo
     return;
   }
   const direction = trace.edge > 0 ? 'YES' : 'NO';
+
+  const impact = await estimateCopyTradeImpact({
+    traceId,
+    marketId,
+    onChainMarketId: BigInt(market.onChainMarketId),
+    direction,
+    collateralInRaw: BigInt(amountRaw),
+    probabilityEstimate: trace.probabilityEstimate,
+  });
+
+  if (impact.exceedsMaxImpact) {
+    sendError(
+      res,
+      422,
+      'IMPACT_TOO_HIGH',
+      `Estimated price impact (${impact.impactBps} bps) exceeds maximum allowed (${impact.maxImpactBps} bps)`,
+      { impact },
+    );
+    return;
+  }
+
   const expiresAt = new Date(Date.now() + config.COPY_TRADE_TTL_MINUTES * 60 * 1000);
 
   // #46: a custodial sub-user shares the pooled base account. Return the muxed
@@ -113,6 +148,7 @@ export async function initiateCopyTrade(req: Request, res: Response): Promise<vo
   sendSuccess(res, {
     copyTradeId: copyTrade.id,
     expiresAt,
+    impact,
     transactionPayload: {
       contractId:      CONTRACTS.marketCore,
       onChainMarketId: market.onChainMarketId.toString(),
@@ -124,6 +160,75 @@ export async function initiateCopyTrade(req: Request, res: Response): Promise<vo
     },
     instructions: 'Quote, then sign market_core.buy with min_shares_out from the quote. ' +
                   'Then call PATCH /trade/copy/:id/confirm with the transaction hash.',
+  }, 200);
+}
+
+/**
+ * GET /trade/copy/quote?traceId&amountRaw
+ * Read-only FPMM price-impact quote for copying a reasoning trace.
+ * Creates no CopyTrade row.
+ */
+export async function quoteCopyTrade(req: Request, res: Response): Promise<void> {
+  if (!req.user) {
+    sendError(res, 401, 'UNAUTHORIZED', 'Authentication required to quote a copy trade');
+    return;
+  }
+
+  const parsed = copyTradeQuoteSchema.safeParse({ query: req.query });
+  if (!parsed.success) {
+    sendError(res, 400, 'VALIDATION_ERROR', 'Invalid copy-trade quote parameters',
+      parsed.error.flatten().fieldErrors as any);
+    return;
+  }
+
+  const { traceId, amountRaw } = parsed.data.query;
+
+  const access = await checkAccess(req.user.userId, traceId);
+  if (!access.hasAccess) {
+    sendError(res, 403, 'TRACE_LOCKED', 'Unlock this trace before quoting a copy trade');
+    return;
+  }
+
+  const trace = await prisma.reasoningTrace.findUnique({
+    where: { id: traceId },
+    include: { market: true },
+  });
+  if (!trace) {
+    sendError(res, 404, 'TRACE_NOT_FOUND', 'Reasoning trace not found');
+    return;
+  }
+
+  const market = trace.market;
+  if (market.onChainMarketId === null) {
+    sendError(res, 409, 'MARKET_NOT_ON_CHAIN', 'This market is not on-chain yet');
+    return;
+  }
+  if (market.status !== 'ACTIVE') {
+    sendError(res, 409, 'MARKET_NOT_ACTIVE', 'Market is not active for trading');
+    return;
+  }
+  if (!trace.edge) {
+    sendError(res, 422, 'NO_EDGE', 'This trace has no edge, so there is no trade to copy');
+    return;
+  }
+
+  const direction = trace.edge > 0 ? 'YES' : 'NO';
+  const impact = await estimateCopyTradeImpact({
+    traceId,
+    marketId: market.id,
+    onChainMarketId: BigInt(market.onChainMarketId),
+    direction,
+    collateralInRaw: BigInt(amountRaw),
+    probabilityEstimate: trace.probabilityEstimate,
+  });
+
+  sendSuccess(res, {
+    traceId,
+    marketId: market.id,
+    onChainMarketId: market.onChainMarketId.toString(),
+    outcome: direction === 'YES' ? 'Yes' : 'No',
+    collateralInRaw: amountRaw,
+    impact,
   }, 200);
 }
 

@@ -3,6 +3,7 @@ import { requireAuth, requirePermission, requireStepUp } from '../middlewares/au
 import {
   ackAlert,
   ackDispute,
+  ackSpecCompat,
   addOperationSignature,
   cancelDisputeTx,
   cancelTreasuryOperation,
@@ -20,6 +21,7 @@ import {
   silenceAlert,
   getSystemStatus,
   getChainFeesReport,
+  getExecutionQuality,
   pauseAgentControl,
   postGrantAdmin,
   postRevokeAdmin,
@@ -30,6 +32,7 @@ import {
   getOperationSep7Status,
   issueOperationSep7,
   getDisputes,
+  getPriceMarketsHealth,
   listReconciliationRuns,
   listTreasuryOperations,
   recordTreasuryOperation,
@@ -42,6 +45,16 @@ import {
   recoverChainTransaction,
   rerunChainTransactionHandler,
   abandonChainTransaction,
+  getIndexerGaps,
+  resolveIndexerGap,
+  getAgentDecisions,
+  getAgentDecisionCycles,
+  getAgentDecisionCycleFunnel,
+  getCronRuns,
+  listMoneyAuditRuns,
+  listMoneyAuditFindings,
+  triggerMoneyAuditRun,
+  ackMoneyAuditFinding,
 } from '../controllers/admin.controller';
 
 const router = Router();
@@ -75,7 +88,9 @@ router.get('/agent-decisions/cycles/:cycleId', requirePermission('admin.read'), 
 router.post('/agents/:agent/pause', requirePermission('agents.manage'), pauseAgentControl);
 router.post('/agents/:agent/resume', requirePermission('agents.manage'), resumeAgentControl);
 router.get('/status', requirePermission('admin.read'), getSystemStatus);
+router.get('/crons/:job/runs', requirePermission('admin.read'), getCronRuns);
 router.get('/fees', requirePermission('admin.read'), getChainFeesReport);
+router.get('/execution-quality', requirePermission('admin.read'), getExecutionQuality);
 router.get('/disputes', requirePermission('disputes.manage'), getDisputes);
 router.post('/disputes/:id/ack', requirePermission('disputes.manage'), ackDispute);
 router.post('/disputes/:id/cancel-tx', requirePermission('disputes.manage'), cancelDisputeTx);
@@ -116,6 +131,7 @@ router.post('/agents/:agent/pause', pauseAgentControl);
 router.post('/agents/:agent/resume', resumeAgentControl);
 router.get('/status', getSystemStatus);
 router.get('/fees', getChainFeesReport);
+router.get('/execution-quality', getExecutionQuality);
 router.get('/disputes', getDisputes);
 router.post('/disputes/:id/ack', ackDispute);
 router.post('/disputes/:id/cancel-tx', cancelDisputeTx);
@@ -155,11 +171,20 @@ import {
   getSourceWeightSet,
   listSourceWeightSets,
   rollbackSourceWeightSet,
+  getLlmCanaryStatus,
+  overrideLlmDemotion,
 } from '../controllers/admin.controller';
 router.get('/source-weights', requirePermission('admin.read'), listSourceWeightSets);
 router.post('/source-weights/rollback', requirePermission('agents.weights.approve', { audit: false }), requireStepUp, rollbackSourceWeightSet);
 router.get('/source-weights/:id', requirePermission('admin.read'), getSourceWeightSet);
 router.post('/source-weights/:id/approve', requirePermission('agents.weights.approve', { audit: false }), requireStepUp, approveSourceWeightSet);
 router.post('/source-weights/:id/activate', requirePermission('agents.weights.approve', { audit: false }), requireStepUp, activateSourceWeightSet);
+
+// Indexer ledger gaps (#10)
+router.get('/indexer/gaps', requirePermission('admin.read'), getIndexerGaps);
+router.patch('/indexer/gaps/:id/resolve', requirePermission('admin.manage'), resolveIndexerGap);
+// LLM drift canary & model demotions (#296)
+router.get('/llm/canary', requirePermission('admin.read'), getLlmCanaryStatus);
+router.post('/llm/demotions', requirePermission('agents.manage'), requireStepUp, overrideLlmDemotion);
 
 export default router;

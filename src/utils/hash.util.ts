@@ -9,6 +9,47 @@ export function canonicalJson(value: unknown): string {
   return JSON.stringify(sortKeysDeep(value));
 }
 
+export interface JsonBounds {
+  maxDepth?: number;
+  maxNodes?: number;
+  maxStringBytes?: number;
+  maxBytes?: number;
+}
+
+export class JsonBoundsError extends Error {
+  constructor(public readonly reason: string) {
+    super(`JSON exceeds safety limits: ${reason}`);
+    this.name = 'JsonBoundsError';
+  }
+}
+
+/** Guard untrusted parsed JSON before recursive canonicalisation or hashing. */
+export function canonicalJsonBounded(value: unknown, bounds: JsonBounds = {}): string {
+  const maxDepth = bounds.maxDepth ?? 64;
+  const maxNodes = bounds.maxNodes ?? 10_000;
+  const maxStringBytes = bounds.maxStringBytes ?? 1_048_576;
+  const maxBytes = bounds.maxBytes ?? 1_048_576;
+  const stack: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
+  let nodes = 0;
+  while (stack.length) {
+    const current = stack.pop()!;
+    nodes++;
+    if (nodes > maxNodes) throw new JsonBoundsError('node count');
+    if (current.depth > maxDepth) throw new JsonBoundsError('nesting depth');
+    if (typeof current.value === 'string' && Buffer.byteLength(current.value, 'utf8') > maxStringBytes) {
+      throw new JsonBoundsError('string length');
+    }
+    if (current.value !== null && typeof current.value === 'object') {
+      for (const child of Object.values(current.value as Record<string, unknown>)) {
+        stack.push({ value: child, depth: current.depth + 1 });
+      }
+    }
+  }
+  const result = canonicalJson(value);
+  if (Buffer.byteLength(result, 'utf8') > maxBytes) throw new JsonBoundsError('encoded size');
+  return result;
+}
+
 function sortKeysDeep(value: unknown): unknown {
   if (typeof value === 'bigint') return value.toString();
   if (value instanceof Date) return value.toISOString();

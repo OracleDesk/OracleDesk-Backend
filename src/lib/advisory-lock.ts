@@ -1,5 +1,22 @@
 import type { Prisma } from '@prisma/client';
 import { prisma } from './prisma';
+import { logger } from './logger';
+import { isInPaymentLock, withActiveLockContext } from './context';
+import { getTransactionReader, setTransactionReader } from '../services/stellar/tx-inspect';
+
+export interface AdvisoryLockWaitInfo {
+  keys: string[];
+  attempt: number;
+  elapsedMs: number;
+}
+
+export interface AdvisoryLockWaitOptions {
+  waitMs?: number;
+  pollMs?: number;
+  timeoutMs?: number;
+  maxWaitMs?: number;
+  onWait?: (info: AdvisoryLockWaitInfo) => void;
+}
 
 /**
  * Runs `fn` on one instance at a time using a Postgres advisory lock. The lock
@@ -25,7 +42,13 @@ export async function withAdvisoryLock<T>(
     async (tx) => {
       const rows = await tx.$queryRaw<Array<{ locked: boolean }>>`SELECT pg_try_advisory_xact_lock(hashtext(${key})) AS locked`;
       if (!rows[0]?.locked) return { acquired: false as const };
-      return { acquired: true as const, value: await fn(tx) };
+      const heldAt = Date.now();
+      try {
+        const value = await withActiveLockContext([key], () => fn(tx));
+        return { acquired: true as const, value };
+      } finally {
+        logger.debug({ key, holderDurationMs: Date.now() - heldAt }, 'advisory lock released');
+      }
     },
     {
       timeout: opts.timeoutMs ?? 10 * 60_000,
@@ -51,7 +74,13 @@ export async function withAdvisoryLocks<T>(
         const rows = await tx.$queryRaw<Array<{ locked: boolean }>>`SELECT pg_try_advisory_xact_lock(hashtext(${key})) AS locked`;
         if (!rows[0]?.locked) return { acquired: false as const };
       }
-      return { acquired: true as const, value: await fn(tx) };
+      const heldAt = Date.now();
+      try {
+        const value = await withActiveLockContext(ordered, () => fn(tx));
+        return { acquired: true as const, value };
+      } finally {
+        logger.debug({ keys: ordered, holderDurationMs: Date.now() - heldAt }, 'advisory locks released');
+      }
     },
     { timeout: opts.timeoutMs ?? 10 * 60_000, maxWait: opts.maxWaitMs ?? 5_000 },
   );
@@ -61,14 +90,32 @@ export async function withAdvisoryLocks<T>(
 export async function withAdvisoryLocksWait<T>(
   keys: string[],
   fn: (tx: Prisma.TransactionClient) => Promise<T>,
-  opts: { waitMs?: number; pollMs?: number; timeoutMs?: number; maxWaitMs?: number } = {},
+  opts: AdvisoryLockWaitOptions = {},
 ): Promise<{ acquired: true; value: T } | { acquired: false }> {
-  const deadline = Date.now() + (opts.waitMs ?? 30_000);
+  const ordered = [...new Set(keys)].sort();
+  const startedAt = Date.now();
+  const deadline = startedAt + (opts.waitMs ?? 30_000);
   const pollMs = opts.pollMs ?? 50;
+  let attempts = 0;
+
   for (;;) {
-    const result = await withAdvisoryLocks(keys, fn, { timeoutMs: opts.timeoutMs, maxWaitMs: opts.maxWaitMs });
-    if (result.acquired) return result;
-    if (Date.now() >= deadline) return { acquired: false };
+    attempts++;
+    const attemptStart = Date.now();
+    const result = await withAdvisoryLocks(ordered, fn, { timeoutMs: opts.timeoutMs, maxWaitMs: opts.maxWaitMs });
+    if (result.acquired) {
+      const waitMs = attemptStart - startedAt;
+      const holderDurationMs = Date.now() - attemptStart;
+      if (attempts > 1 || holderDurationMs > 1_000) {
+        logger.info({ keys: ordered, attempts, waitMs, holderDurationMs }, 'advisory locks acquired and completed');
+      }
+      return result;
+    }
+    const elapsedMs = Date.now() - startedAt;
+    opts.onWait?.({ keys: ordered, attempt: attempts, elapsedMs });
+    if (Date.now() >= deadline) {
+      logger.warn({ keys: ordered, attempts, waitMs: elapsedMs }, 'advisory locks wait timed out');
+      return { acquired: false };
+    }
     await sleep(pollMs);
   }
 }
@@ -86,14 +133,53 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 export async function withAdvisoryLockWait<T>(
   key: string,
   fn: (tx: Prisma.TransactionClient) => Promise<T>,
-  opts: { waitMs?: number; pollMs?: number; timeoutMs?: number; maxWaitMs?: number } = {},
+  opts: AdvisoryLockWaitOptions = {},
 ): Promise<{ acquired: true; value: T } | { acquired: false }> {
-  const deadline = Date.now() + (opts.waitMs ?? 30_000);
+  const startedAt = Date.now();
+  const deadline = startedAt + (opts.waitMs ?? 30_000);
   const pollMs = opts.pollMs ?? 50;
+  let attempts = 0;
+
   for (;;) {
+    attempts++;
+    const attemptStart = Date.now();
     const result = await withAdvisoryLock(key, fn, { timeoutMs: opts.timeoutMs, maxWaitMs: opts.maxWaitMs });
-    if (result.acquired) return result;
-    if (Date.now() >= deadline) return { acquired: false };
+    if (result.acquired) {
+      const waitMs = attemptStart - startedAt;
+      const holderDurationMs = Date.now() - attemptStart;
+      if (attempts > 1 || holderDurationMs > 1_000) {
+        logger.info({ key, attempts, waitMs, holderDurationMs }, 'advisory lock acquired and completed');
+      }
+      return result;
+    }
+    const elapsedMs = Date.now() - startedAt;
+    opts.onWait?.({ keys: [key], attempt: attempts, elapsedMs });
+    if (Date.now() >= deadline) {
+      logger.warn({ key, attempts, waitMs: elapsedMs }, 'advisory lock wait timed out');
+      return { acquired: false };
+    }
     await sleep(pollMs);
   }
+}
+
+/**
+ * Test assertion helper (#305): wraps the active Stellar `TransactionReader`
+ * and throws immediately if `getTransaction` is invoked while a payment
+ * advisory lock transaction is open (tracked via AsyncLocalStorage).
+ * Returns a restore function to unwrap the reader.
+ */
+export function assertNoIoInLock(): () => void {
+  const inner = getTransactionReader();
+  const guarded = {
+    async getTransaction(hash: string) {
+      if (isInPaymentLock()) {
+        throw new Error(`RPC getTransaction(${hash}) called while holding a payment advisory lock`);
+      }
+      return inner.getTransaction(hash);
+    },
+  };
+  const prev = setTransactionReader(guarded);
+  return () => {
+    setTransactionReader(prev);
+  };
 }
