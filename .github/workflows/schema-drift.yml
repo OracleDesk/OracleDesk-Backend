@@ -1,0 +1,33 @@
+name: Schema drift
+
+on:
+  pull_request:
+    paths:
+      - 'prisma/**'
+      - 'src/**'
+      - '.github/workflows/schema-drift.yml'
+  push:
+    branches: [develop]
+
+permissions:
+  contents: read
+
+jobs:
+  prisma-schema:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.node-version'
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate
+      - name: Verify migrations match the Prisma schema
+        run: |
+          npx prisma migrate diff \
+            --from-migrations prisma/migrations \
+            --to-schema-datamodel prisma/schema.prisma \
+            --exit-code
+      - name: Check generated contract and schema artifacts
+        run: npm run check:drift

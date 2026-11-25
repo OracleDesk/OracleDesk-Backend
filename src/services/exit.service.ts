@@ -19,26 +19,36 @@ import { nowMs } from '../lib/clock';
 import { config } from '../config';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
+import { cancelPositionPredicates } from './hedge-predicate.service';
+import {
+  classifyLiquidityBucket,
+  markExecutionReportOutcome,
+  recordExecutionQuoteAttempt,
+} from './execution-quality.service';
+import { priceYesBps } from '../generated/fpmm';
 import { writeAgentLog } from '../lib/agent-log';
 import { AppError } from '../middlewares/error.middleware';
 import { CONTRACTS } from '../config/contracts';
+import { checkFillDiscrepancies, resolveAgentTradeFill } from './agent-fill.service';
 import {
   bigintToDecimalString,
   decimalToBigint,
   priceBpsFromRaw,
   toDisplayUsdc,
 } from '../lib/amounts';
-import { MathError, calcSell, collateralOutForShares } from '../generated/fpmm';
+import { MathError, calcSell, collateralOutForShares, priceYesBps } from '../generated/fpmm';
 import type { Market as OnChainMarket } from '../generated/market-core';
 import {
   Outcomes,
   agentSell,
+  getBreakerConfig,
+  getBreakerState,
   getOnChainMarket,
   getPosition,
   quoteSell,
 } from './chain.service';
 import { ChainError, ChainPendingError } from './stellar/errors';
-import { registerHandler, type ChainTransactionRow, type CompletionOutcome } from './stellar/outbox';
+import { registerHandler, type ChainTransactionRow, type CompletionContext, type CompletionOutcome } from './stellar/outbox';
 import { AgentPausedError } from './agent-controls.service';
 
 /** Remaining shares at or below this are dust: the position counts as closed. */
@@ -156,7 +166,7 @@ async function chainHeld(onChainMarketId: bigint, outcome: Outcome): Promise<big
   return BigInt(outcome === 'YES' ? held.yes : held.no);
 }
 
-type Failure = 'slippage' | 'insufficient' | 'closed' | 'paused' | 'agent-paused' | 'ambiguous' | 'other';
+type Failure = 'slippage' | 'insufficient' | 'closed' | 'paused' | 'agent-paused' | 'breaker' | 'ambiguous' | 'other';
 
 function classify(err: unknown): Failure {
   if (err instanceof AgentPausedError) return 'agent-paused';
@@ -167,10 +177,13 @@ function classify(err: unknown): Failure {
     switch (err.contractError) {
       case 'SlippageExceeded': return 'slippage';
       case 'InsufficientShares': return 'insufficient';
+      case 'PriceImpactTooHigh':
+      case 'PriceBandExceeded': return 'breaker';
       case 'MarketClosed':
       case 'MarketNotOpen': return 'closed';
       case 'Paused': return 'paused';
     }
+    if ((err.details as { failureClass?: string } | undefined)?.failureClass === 'BREAKER_TRIPPED') return 'breaker';
     // The submission may or may not have landed. #40 reports this as a
     // TransactionError with failureClass UNKNOWN_OUTCOME / submitted=true.
     if (err.code === 'CHAIN_SUBMISSION_TIMEOUT') return 'ambiguous';
@@ -183,6 +196,7 @@ function classify(err: unknown): Failure {
 const FAILURE_CODES: Record<Exclude<Failure, 'ambiguous'>, string> = {
   slippage: 'EXIT_SLIPPAGE',
   insufficient: 'EXIT_INSUFFICIENT_SHARES',
+  breaker: 'EXIT_BREAKER_TRIPPED',
   closed: 'EXIT_MARKET_CLOSED',
   paused: 'EXIT_PAUSED',
   'agent-paused': 'AGENT_PAUSED',
@@ -224,69 +238,99 @@ async function recordFailure(
  * position confirmed at once (two recoverers, #229) would otherwise both start
  * from the same sharesBefore and the second update would undo the first.
  */
+async function applyConfirmedExitInTx(
+  tx: Prisma.TransactionClient,
+  positionId: string,
+  exitId: string,
+  p: { sold: bigint; collateralOut: bigint; txHash: string | null; reason: string; note?: string },
+): Promise<{ closed: boolean } | null> {
+  const [current] = await tx.$queryRaw<
+    Array<{
+      sharesRaw: Prisma.Decimal | null;
+      costBasisRaw: Prisma.Decimal | null;
+      realisedCollateralRaw: Prisma.Decimal;
+      realisedPnlRaw: Prisma.Decimal;
+      size: number;
+    }>
+  >`SELECT "sharesRaw", "costBasisRaw", "realisedCollateralRaw", "realisedPnlRaw", "size" FROM positions WHERE id = ${positionId} FOR UPDATE`;
+  if (!current) return null;
+
+  const sharesBefore = decimalToBigint(current.sharesRaw as never);
+  const costBefore = current.costBasisRaw == null
+    ? BigInt(Math.round(current.size * 1_000_000))
+    : decimalToBigint(current.costBasisRaw);
+  const sold = p.sold > sharesBefore ? sharesBefore : p.sold;
+  const remaining = sharesBefore - sold;
+  const closed = remaining <= DUST_SHARES;
+  const costSold = closed || sharesBefore === 0n ? costBefore : (costBefore * sold) / sharesBefore;
+  const realisedPnlRaw = decimalToBigint(current.realisedPnlRaw) + (p.collateralOut - costSold);
+  const effectivePriceBps = priceBpsFromRaw(p.collateralOut, sold);
+  const effectivePrice = effectivePriceBps === null ? null : effectivePriceBps / 10_000;
+
+  const won = await tx.positionExit.updateMany({
+    where: { id: exitId, status: 'SUBMITTED' },
+    data: {
+      status: 'CONFIRMED',
+      sharesSoldRaw: bigintToDecimalString(sold),
+      collateralOutRaw: bigintToDecimalString(p.collateralOut),
+      effectivePrice,
+      effectivePriceBps,
+      txHash: p.txHash,
+      error: p.note ?? null,
+    },
+  });
+  if (won.count === 0) return null;
+  await tx.position.update({
+    where: { id: positionId },
+    data: {
+      sharesRaw: bigintToDecimalString(remaining),
+      costBasisRaw: bigintToDecimalString(costBefore - costSold),
+      realisedCollateralRaw: bigintToDecimalString(decimalToBigint(current.realisedCollateralRaw) + p.collateralOut),
+      realisedPnlRaw: bigintToDecimalString(realisedPnlRaw),
+      pnl: toDisplayUsdc(realisedPnlRaw),
+      ...(closed
+        ? {
+            status: p.reason === 'STOP_LOSS' ? 'STOP_LOSS' : 'CLOSED',
+            closedAt: new Date(),
+            closeReason: p.reason,
+            markValueRaw: '0',
+            liquidationValueRaw: '0',
+            unrealisedPnlRaw: '0',
+            ...(effectivePriceBps !== null
+              ? { currentPrice: effectivePriceBps / 10_000, markPriceBps: effectivePriceBps }
+              : {}),
+          }
+        : {}),
+    } as any,
+  });
+  return { closed };
+}
+
 async function applyConfirmedExit(
   position: LoadedPosition,
   exitId: string,
-  p: { sold: bigint; collateralOut: bigint; txHash: string | null; reason: string; note?: string },
+  p: {
+    sold: bigint;
+    collateralOut: bigint;
+    txHash: string | null;
+    reason: string;
+    note?: string;
+    feeRaw?: bigint | null;
+    reserveYesRaw?: bigint | null;
+    reserveNoRaw?: bigint | null;
+    fillLedger?: number | null;
+    fillMismatch?: Record<string, unknown> | null;
+  },
 ): Promise<{ closed: boolean; applied: boolean }> {
-  const result = await prisma.$transaction(async (tx) => {
-    const [current] = await tx.$queryRaw<
-      Array<{ sharesRaw: Prisma.Decimal | null; costBasisRaw: Prisma.Decimal | null; realisedCollateralRaw: Prisma.Decimal; realisedPnlRaw: Prisma.Decimal }>
-    >`SELECT "sharesRaw", "costBasisRaw", "realisedCollateralRaw", "realisedPnlRaw" FROM positions WHERE id = ${position.id} FOR UPDATE`;
-    if (!current) return null;
-
-    const sharesBefore = decimalToBigint(current.sharesRaw as never);
-    const costBefore = current.costBasisRaw == null
-      ? usdcFromNumber(position.trade?.amount ?? position.size)
-      : decimalToBigint(current.costBasisRaw);
-    const sold = p.sold > sharesBefore ? sharesBefore : p.sold;
-    const remaining = sharesBefore - sold;
-    const closed = remaining <= DUST_SHARES;
-    const costSold = closed || sharesBefore === 0n ? costBefore : (costBefore * sold) / sharesBefore;
-    const realisedPnlRaw = decimalToBigint(current.realisedPnlRaw) + (p.collateralOut - costSold);
-    const effectivePrice = sold > 0n ? Math.min(1, Number(p.collateralOut) / Number(sold)) : null;
-
-    const won = await tx.positionExit.updateMany({
-      where: { id: exitId, status: 'SUBMITTED' },
-      data: {
-        status: 'CONFIRMED',
-        sharesSoldRaw: bigintToDecimalString(sold),
-        collateralOutRaw: bigintToDecimalString(p.collateralOut),
-        effectivePrice,
-        effectivePriceBps,
-        txHash: p.txHash,
-        error: p.note ?? null,
-      },
-    });
-    if (won.count === 0) return null;
-    await tx.position.update({
-      where: { id: position.id },
-      data: {
-        sharesRaw: bigintToDecimalString(remaining),
-        costBasisRaw: bigintToDecimalString(costBefore - costSold),
-        realisedCollateralRaw: bigintToDecimalString(decimalToBigint(current.realisedCollateralRaw) + p.collateralOut),
-        realisedPnlRaw: bigintToDecimalString(realisedPnlRaw),
-        pnl: toDisplayUsdc(realisedPnlRaw),
-        ...(closed
-          ? {
-              status: p.reason === 'STOP_LOSS' ? 'STOP_LOSS' : 'CLOSED',
-              closedAt: new Date(),
-              closeReason: p.reason,
-              markValueRaw: '0',
-              liquidationValueRaw: '0',
-              unrealisedPnlRaw: '0',
-              ...(effectivePriceBps !== null
-                ? { currentPrice: effectivePriceBps / 10_000, markPriceBps: effectivePriceBps }
-                : {}),
-            }
-          : {}),
-      } as any,
-    });
-    return { closed };
-  });
+  const result = await prisma.$transaction((tx) => applyConfirmedExitInTx(tx, position.id, exitId, p));
   if (!result) {
     const current = await prisma.position.findUnique({ where: { id: position.id }, select: { status: true } });
     return { closed: current != null && current.status !== 'OPEN', applied: false };
+  }
+  if (result.closed) {
+    await cancelPositionPredicates(position.id).catch((err) => {
+      logger.warn({ err, positionId: position.id }, 'Failed to cancel predicates on closed position');
+    });
   }
   return { closed: result.closed, applied: true };
 }
@@ -359,6 +403,62 @@ async function reconcileStuckExit(position: LoadedPosition, stuck: any): Promise
  * Never throws for chain-side failures: the outcome is in the returned status
  * and the PositionExit rows.
  */
+/**
+ * Plans a sale that fits within market-core's circuit breakers (#292), halving
+ * `target` up to `EXIT_BREAKER_MAX_PARTS` times when a single sell would breach
+ * `max_impact_bps` or `band_bps`. Remaining shares stay open for the next ledger.
+ */
+async function planBreakerSafeExit(
+  onChainMarketId: bigint,
+  market: Pick<OnChainMarket, 'reserve_yes' | 'reserve_no' | 'fee_bps'>,
+  outcome: Outcome,
+  target: bigint,
+  slippageBps: bigint,
+  held: bigint,
+): Promise<{ plan: ExitPlan; splitForBreaker: boolean }> {
+  const [breakerCfg, breakerSt] = await Promise.all([
+    getBreakerConfig(onChainMarketId).catch(() => null),
+    getBreakerState(onChainMarketId).catch(() => null),
+  ]);
+  if (!breakerCfg) {
+    return { plan: planExit(market, outcome, target, slippageBps, held), splitForBreaker: false };
+  }
+
+  const rYes = BigInt(market.reserve_yes);
+  const rNo = BigInt(market.reserve_no);
+  const feeBps = BigInt(market.fee_bps);
+  const preYesBps = Number(priceYesBps(rYes, rNo));
+  const maxImpact = Number(breakerCfg.max_impact_bps);
+  const maxBand = Number(breakerCfg.band_bps);
+
+  let partTarget = target;
+  let splitForBreaker = false;
+  const maxParts = Math.max(1, config.EXIT_BREAKER_MAX_PARTS);
+
+  for (let part = 0; part < maxParts && partTarget > 0n; part++) {
+    const plan = planExit(market, outcome, partTarget, slippageBps, held);
+    const [rSold, rOther] = outcome === 'YES' ? [rYes, rNo] : [rNo, rYes];
+    const sale = calcSell(rSold, rOther, plan.collateralOut, feeBps);
+    const postYesBps = Number(
+      outcome === 'YES'
+        ? priceYesBps(sale.newRSold, sale.newROther)
+        : priceYesBps(sale.newROther, sale.newRSold),
+    );
+    const impactBps = Math.abs(postYesBps - preYesBps);
+    const bandBps = breakerSt ? Math.abs(postYesBps - Number(breakerSt.ref_price_bps)) : 0;
+
+    if (impactBps <= maxImpact && bandBps <= maxBand) {
+      return { plan, splitForBreaker };
+    }
+    splitForBreaker = true;
+    partTarget = plan.sharesTarget / 2n;
+  }
+
+  // Return the smallest planned chunk if halving exhausted EXIT_BREAKER_MAX_PARTS.
+  const fallbackTarget = partTarget > 0n ? partTarget : 1n;
+  return { plan: planExit(market, outcome, fallbackTarget, slippageBps, held), splitForBreaker: true };
+}
+
 export async function exitPosition(
   positionId: string,
   opts: { fraction?: number; reason: string },
@@ -409,22 +509,26 @@ export async function exitPosition(
 
   let slippageRetries = 0;
   let insufficientRetries = 0;
+  let breakerSplits = 0;
+  let effectiveFractionBps = fractionBps;
   for (;;) {
     const recorded = decimalToBigint(position.sharesRaw);
     const available = recorded < held ? recorded : held;
-    const target = (available * fractionBps) / 10_000n;
+    const target = (available * effectiveFractionBps) / 10_000n;
     if (target <= 0n) return failed('EXIT_NO_SHARES', { error: `recorded ${recorded}, on-chain ${held}` });
 
     let plan: ExitPlan;
+    let exitMarket: OnChainMarket;
     try {
       let market = await getOnChainMarket(onChainMarketId);
-      plan = planExit(market, outcome, target, EXIT_SLIPPAGE_BPS, held);
+      ({ plan } = await planBreakerSafeExit(onChainMarketId, market, outcome, target, EXIT_SLIPPAGE_BPS, held));
       const quoted = await quoteSell(onChainMarketId, outcomeValue(outcome), plan.collateralOut);
       const drift = quoted > plan.quotedSharesIn ? quoted - plan.quotedSharesIn : plan.quotedSharesIn - quoted;
       if (drift > 1n) {
         market = await getOnChainMarket(onChainMarketId);
-        plan = planExit(market, outcome, target, EXIT_SLIPPAGE_BPS, held);
+        ({ plan } = await planBreakerSafeExit(onChainMarketId, market, outcome, target, EXIT_SLIPPAGE_BPS, held));
       }
+      exitMarket = market;
     } catch (err) {
       if (err instanceof ExitError) return failed(err.code, { error: err.message });
       const kind = classify(err);
@@ -442,6 +546,28 @@ export async function exitPosition(
       },
     });
 
+    const exitResYes = BigInt(exitMarket.reserve_yes);
+    const exitResNo = BigInt(exitMarket.reserve_no);
+    const exitYesMidBps = exitResYes > 0n && exitResNo > 0n ? Number(priceYesBps(exitResYes, exitResNo)) : null;
+    const exitQuoteMidBps = exitYesMidBps === null ? null : (outcome === 'YES' ? exitYesMidBps : 10_000 - exitYesMidBps);
+    await recordExecutionQuoteAttempt({
+      kind: 'SELL',
+      positionExitId: row.id,
+      marketId: position.marketId,
+      direction: outcome,
+      decisionMidBps: position.markPriceBps ?? null,
+      slippageBoundBps: Number(EXIT_SLIPPAGE_BPS),
+      liquidityBucket: classifyLiquidityBucket(exitResYes, exitResNo),
+      quote: {
+        attempt: 1,
+        quotedAt: new Date().toISOString(),
+        quoteMidBps: exitQuoteMidBps,
+        quotedOutRaw: plan.quotedSharesIn.toString(),
+        boundRaw: plan.maxSharesIn.toString(),
+        quotedPriceBps: priceBpsFromRaw(plan.collateralOut, plan.quotedSharesIn),
+      },
+    });
+
     try {
       const result = await agentSell(
         {
@@ -453,6 +579,13 @@ export async function exitPosition(
         undefined,
         { kind: 'trade.sell', refId: row.id },
       );
+      if (result.txHash) {
+        await markExecutionReportOutcome({
+          positionExitId: row.id,
+          status: 'PENDING',
+          landedTxHash: result.txHash,
+        });
+      }
       const sold = BigInt(result.value);
 
       if (result.mode === 'dry-run') {
@@ -469,15 +602,21 @@ export async function exitPosition(
         return { exitId: row.id, status: 'SIMULATED', sharesSoldRaw: sold, collateralOutRaw: plan.collateralOut, closed: false };
       }
 
-      // #35: the trade.sell completion handler may already have applied this
-      // before agentSell resolved; applyConfirmedExit's CAS makes the second
-      // call a read-back, so exactly one of the two applies the deltas.
-      const { closed } = await applyConfirmedExit(position, row.id, {
-        sold,
-        collateralOut: plan.collateralOut,
-        txHash: result.txHash,
-        reason: opts.reason,
-      });
+      // #35, #290: the trade.sell outbox completion handler already applied this
+      // inside the outbox transaction before agentSell resolved; only apply
+      // directly when an injected test override bypassed the outbox.
+      let closed: boolean;
+      if (!result.outboxId) {
+        ({ closed } = await applyConfirmedExit(position, row.id, {
+          sold,
+          collateralOut: plan.collateralOut,
+          txHash: result.txHash,
+          reason: opts.reason,
+        }));
+      } else {
+        const current = await prisma.position.findUnique({ where: { id: position.id }, select: { status: true } });
+        closed = current != null && current.status !== 'OPEN';
+      }
       await writeAgentLog({
         agentType: 'TRADER',
         level: 'INFO',
@@ -487,13 +626,13 @@ export async function exitPosition(
           positionId,
           exitId: row.id,
           reason: opts.reason,
-          sharesSoldRaw: sold.toString(),
-          collateralOutRaw: plan.collateralOut.toString(),
+          sharesSoldRaw: finalSold.toString(),
+          collateralOutRaw: finalCollateralOut.toString(),
           txHash: result.txHash,
         },
       }).catch(() => undefined);
       logger.info({ positionId, exitId: row.id, closed }, 'Position exit confirmed');
-      return { exitId: row.id, status: 'CONFIRMED', sharesSoldRaw: sold, collateralOutRaw: plan.collateralOut, closed };
+      return { exitId: row.id, status: 'CONFIRMED', sharesSoldRaw: finalSold, collateralOutRaw: finalCollateralOut, closed };
     } catch (err) {
       const kind = classify(err);
 
@@ -505,10 +644,21 @@ export async function exitPosition(
 
       const code = FAILURE_CODES[kind];
       await prisma.positionExit.update({ where: { id: row.id }, data: { status: 'FAILED', error: `${code}: ${errorText(err)}` } });
+      await markExecutionReportOutcome({
+        positionExitId: row.id,
+        status: kind === 'slippage' ? 'SLIPPAGE_EXCEEDED' : 'FAILED',
+        failureCode: kind === 'slippage' ? 'SlippageExceeded' : code,
+      });
 
       if (kind === 'slippage' && slippageRetries < MAX_SLIPPAGE_RETRIES) {
         slippageRetries++;
         continue; // re-plan from a fresh get_market
+      }
+      if (kind === 'breaker' && breakerSplits < config.EXIT_BREAKER_MAX_PARTS && effectiveFractionBps > 1n) {
+        breakerSplits++;
+        effectiveFractionBps = effectiveFractionBps / 2n;
+        logger.info({ positionId, breakerSplits, effectiveFractionBps: effectiveFractionBps.toString() }, 'Exit tripped breaker; splitting exit size');
+        continue;
       }
       if (kind === 'insufficient' && insufficientRetries < MAX_INSUFFICIENT_RETRIES) {
         insufficientRetries++;
@@ -530,20 +680,21 @@ export async function exitPosition(
 }
 
 /**
- * Completion handler for `trade.sell` outbox rows (#35). It only applies an
- * exit that is still SUBMITTED: the inline path reads the handler's result
- * back, and a failure thrown to a live caller is marked handled upstream, so
- * this effectively runs once per exit — inline on confirmation, or from the
- * recovery worker after a crash or an ambiguous submission.
+ * Completion handler for `trade.sell` outbox rows (#35, #290). Runs inside
+ * the outbox completion transaction using `ctx.tx` (never global `prisma`).
  */
-export async function handleTradeSellOutcome(row: ChainTransactionRow, outcome: CompletionOutcome): Promise<void> {
+export async function handleTradeSellOutcome(
+  row: ChainTransactionRow,
+  outcome: CompletionOutcome,
+  ctx: CompletionContext,
+): Promise<void> {
   const exitId = row.refId;
   if (!exitId) return;
-  const exit = await prisma.positionExit.findUnique({ where: { id: exitId } });
+  const exit = await ctx.tx.positionExit.findUnique({ where: { id: exitId } });
   if (!exit || exit.status !== 'SUBMITTED') return;
 
   if (outcome.status !== 'SUCCESS') {
-    await prisma.positionExit.updateMany({
+    await ctx.tx.positionExit.updateMany({
       where: { id: exitId, status: 'SUBMITTED' },
       data: {
         status: 'FAILED',
@@ -553,14 +704,42 @@ export async function handleTradeSellOutcome(row: ChainTransactionRow, outcome: 
     return;
   }
 
-  const position = await loadPosition(exit.positionId);
-  if (!position) return;
-  await applyConfirmedExit(position, exitId, {
-    sold: BigInt(String(outcome.value ?? '0')),
-    collateralOut: decimalToBigint(exit.collateralOutRaw ?? '0'),
+  const pos = await ctx.tx.position.findUnique({
+    where: { id: exit.positionId },
+    select: { id: true, marketId: true },
+  });
+  if (!pos) return;
+  const sold = BigInt(String(outcome.value ?? '0'));
+  const collateralOut = decimalToBigint(exit.collateralOutRaw ?? '0');
+  const applied = await applyConfirmedExitInTx(ctx.tx, pos.id, exitId, {
+    sold,
+    collateralOut,
     txHash: outcome.txHash ?? null,
     reason: exit.reason,
+    feeRaw: eventFill?.fee ?? null,
+    reserveYesRaw: eventFill?.reserveYes ?? null,
+    reserveNoRaw: eventFill?.reserveNo ?? null,
+    fillLedger: eventFill?.ledger ?? outcome.ledger ?? null,
+    fillMismatch,
   });
+  if (applied) {
+    ctx.afterCommit(() =>
+      writeAgentLog({
+        agentType: 'TRADER',
+        level: 'INFO',
+        action: applied.closed ? 'POSITION_CLOSED' : 'POSITION_REDUCED',
+        marketId: pos.marketId,
+        data: {
+          positionId: pos.id,
+          exitId,
+          reason: exit.reason,
+          sharesSoldRaw: sold.toString(),
+          collateralOutRaw: collateralOut.toString(),
+          txHash: outcome.txHash ?? null,
+        },
+      }).catch(() => undefined),
+    );
+  }
 }
 
 registerHandler('trade.sell', handleTradeSellOutcome);

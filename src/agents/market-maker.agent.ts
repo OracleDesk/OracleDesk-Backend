@@ -34,6 +34,7 @@ import { config } from '../config';
 import { AgentPausedError, gateCycle } from '../services/agent-controls.service';
 import { TransactionError } from '../services/stellar/errors';
 import { deadline } from '../lib/resilience';
+import { withCallerClass } from '../lib/context';
 import { shutdownController } from '../lib/shutdown';
 import { correlation, newId } from '../lib/context';
 import { recordAgentDecision, type RecordAgentDecisionInput } from '../services/agent-decision.service';
@@ -52,9 +53,10 @@ export interface MarketCycleResult {
  * Runs via the market-maker saga state machine.
  */
 export async function runMarketMakerCycle(
-  opts?: { signal?: AbortSignal; priority?: Priority },
+  opts?: { signal?: AbortSignal; priority?: Priority; onPaused?: () => void },
 ): Promise<MarketCycleResult | null> {
-  const cycleId = correlation().cycleId ?? newId('cyc');
+  return withCallerClass('agent', async () => {
+    const cycleId = correlation().cycleId ?? newId('cyc');
   const recordDecision = (decision: Omit<RecordAgentDecisionInput, 'cycleId' | 'agentType'>) =>
     recordAgentDecision({ ...decision, cycleId, agentType: 'MARKET_MAKER' });
   let createdMarketId: string | undefined;
@@ -72,6 +74,7 @@ export async function runMarketMakerCycle(
         outcome: { status: 'SKIPPED' },
       });
       logger.info({ ...err.details }, 'Market Maker Agent: paused — skipping cycle');
+      opts?.onPaused?.();
       return null;
     }
     throw err;
@@ -170,7 +173,7 @@ export async function runMarketMakerCycle(
       return null;
     }
     proposal = prepared.proposal;
-    const resolutionDetails = prepared.resolution;
+    let resolutionDetails: Record<string, unknown> | null = prepared.resolution ? { ...prepared.resolution } : null;
 
     signal.throwIfAborted();
 
@@ -197,6 +200,12 @@ export async function runMarketMakerCycle(
       if (plan.spec && plan.question) {
         marketSpec = plan.spec;
         proposal = { ...proposal, market_question: plan.question };
+        if (plan.resolution) {
+          resolutionDetails = {
+            ...(resolutionDetails ?? {}),
+            price: plan.resolution,
+          };
+        }
       }
     }
 
@@ -464,4 +473,5 @@ export async function runMarketMakerCycle(
   } finally {
     handle.cleanup?.();
   }
+  });
 }

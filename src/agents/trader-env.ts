@@ -11,8 +11,12 @@ import { decisionPrice, type DecisionPrice } from '../services/market-price.serv
 import { config } from '../config';
 import { ForecastSession, forecastMarket, rankForForecast, type ForecastMarket } from '../services/forecast.service';
 import { exitPosition } from '../services/exit.service';
+import {
+  evaluatePositionPredicates,
+  type TriggeredPredicateResult,
+} from '../services/hedge-predicate.service';
 import { latestReserves, markOpenPositions, type MarketReserves } from '../services/valuation.service';
-import { getOnChainMarketCached } from '../services/chain.service';
+import { getOnChainMarketCached, Outcomes, wouldTripBreaker } from '../services/chain.service';
 import { indexerLag, latestLedgerView, type IndexerLag } from '../services/chain-freshness.service';
 import type { PoolState } from '../services/impact-kelly';
 import { checkCorrelation, type CorrelationRiskParams } from '../services/correlation.service';
@@ -160,6 +164,10 @@ export interface TraderEnv {
   /** Marks open positions to market from the latest reserves (#78); a backtest values its own pools. */
   markToMarket?(): Promise<void>;
   stopLoss(position: PositionView): Promise<{ shouldClose: boolean; reason?: string }>;
+  /** Evaluates active hedge predicates for a position as of `asOf` (#302). */
+  evaluatePredicates?(position: PositionView, asOf: Date, cycleId: string): Promise<TriggeredPredicateResult[]>;
+  /** Re-runs the forecaster on a position's market when a REFORECAST predicate triggers (#302). */
+  reforecast?(position: PositionView, asOf: Date): Promise<{ ok: boolean; probabilityEstimate?: number; reason?: string }>;
   /** `bankroll` is the cycle's free treasury cash in USDC; the correlated-exposure cap is a share of it. */
   correlation(
     marketId: string,
@@ -178,6 +186,8 @@ export interface TraderEnv {
   price(m: MarketView): Promise<DecisionPrice>;
   /** Ledger-tagged FPMM reserves and the market's own fee_bps for sizing (#225); null when the market has none. */
   pool(marketId: string): Promise<PoolView | null>;
+  /** Pre-checks market-core circuit breakers before sizing/submitting a buy (#292). */
+  wouldTrip?(marketId: string, direction: TradeDirection, collateralInRaw: bigint): Promise<boolean>;
 }
 
 /** Chain reads behind the production pool(); injectable for tests. */
@@ -273,7 +283,13 @@ export function prodTraderEnv(params: import('./trader-policy').TraderParams): T
       });
       // The forecast cap (#75) goes to markets without a recent forecast, soonest close first.
       // onChainMarketId is included so the trader can gate on fresh ledger prices (#266).
-      return rankForForecast(markets.map(m => ({
+      const disputed = new Set(
+        (await prisma.disputeReview.findMany({
+          where: { onChainMarketId: { in: markets.flatMap(m => m.onChainMarketId === null ? [] : [m.onChainMarketId]) }, resolvedAs: null },
+          select: { onChainMarketId: true },
+        })).map(r => r.onChainMarketId.toString()),
+      );
+      return rankForForecast(markets.filter(m => m.onChainMarketId === null || !disputed.has(m.onChainMarketId.toString())).map(m => ({
         ...m,
         onChainMarketId: m.onChainMarketId !== null ? BigInt(m.onChainMarketId) : undefined,
       })));
@@ -333,6 +349,17 @@ export function prodTraderEnv(params: import('./trader-policy').TraderParams): T
           const detail = m.detail as { provenance?: unknown } | undefined;
           return Array.isArray(detail?.provenance) ? (detail!.provenance as ProvenanceEntry[]) : [];
         });
+
+      const citedSourceIds = [
+        ...new Set(
+          (order.forecast.ensemble?.members ?? []).flatMap((m) => {
+            const detail = m.detail as { citedSignalIds?: unknown } | undefined;
+            return Array.isArray(detail?.citedSignalIds)
+              ? (detail!.citedSignalIds.filter((x): x is string => typeof x === 'string'))
+              : [];
+          }),
+        ),
+      ];
 
       // Generate reasoning trace BEFORE executing
       const { trace, tracePayload } = await generateReasoningTrace({
@@ -440,6 +467,19 @@ export function prodTraderEnv(params: import('./trader-policy').TraderParams): T
       const row = await prisma.market.findUnique({ where: { id: marketId }, select: { onChainMarketId: true } });
       if (row?.onChainMarketId == null) return null;
       return poolFromChain(BigInt(row.onChainMarketId));
+    },
+
+    async wouldTrip(marketId, direction, collateralInRaw) {
+      const row = await prisma.market.findUnique({ where: { id: marketId }, select: { onChainMarketId: true } });
+      if (row?.onChainMarketId == null) return false;
+      const outcome = direction === 'YES' ? Outcomes.Yes : Outcomes.No;
+      try {
+        return await wouldTripBreaker(BigInt(row.onChainMarketId), outcome, collateralInRaw);
+      } catch {
+        // Pre-breaker markets (NotSupported) or transient read failures fail open;
+        // the on-chain check_breakers guard remains authoritative.
+        return false;
+      }
     },
   };
 }

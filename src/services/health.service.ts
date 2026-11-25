@@ -54,7 +54,7 @@ export interface HealthServiceDeps {
   probes: Probe[];
   ttlMs: number;
   timeoutMs: number;
-  criticality: Record<ProbeName, boolean>;
+  criticality: Partial<Record<ProbeName, boolean>>;
   maxLoopDelayMs?: number;
   now?: () => number;
 }

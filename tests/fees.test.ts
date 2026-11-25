@@ -211,6 +211,14 @@ test('fees: config override merge and invalid override', () => {
   }, ConfigError);
 });
 
+test('fees: rolling spend budgets validate their windows', () => {
+  const baseEnv = { ...process.env, DATABASE_URL: 'postgresql://test:test@localhost:5432/test' };
+  const budgets = JSON.stringify({ trade: [{ windowSeconds: 3600, budget: '25000000' }] });
+  assert.equal(loadConfig({ ...baseEnv, FEE_SPEND_BUDGETS_JSON: budgets, FEE_SPEND_ENFORCE: 'true' }).FEE_SPEND_ENFORCE, true);
+  assert.throws(() => loadConfig({ ...baseEnv, FEE_SPEND_ENFORCE: 'true' }), ConfigError);
+  assert.throws(() => loadConfig({ ...baseEnv, FEE_SPEND_BUDGETS_JSON: JSON.stringify({ trade: [{ windowSeconds: 0, budget: '1' }] }) }), ConfigError);
+});
+
 test('fees: BigInt handling above 2^53', async () => {
   const largeStroops = '900719925474099300'; // > Number.MAX_SAFE_INTEGER
   const fakeLarge = {

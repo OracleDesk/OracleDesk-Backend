@@ -10,6 +10,7 @@ import type {
 } from './types';
 import { LlmError } from './types';
 import type { LlmPolicies } from './policy';
+import { getEffectiveChain } from './policy';
 import { LlmBudgetExceeded } from '../llm-budget';
 
 export interface ProviderHealth {
@@ -182,7 +183,7 @@ export function createRouter(
     },
 
     async complete(req) {
-      const policy = policies[req.task];
+      const policy = getEffectiveChain(req.task, policies);
       if (!policy || policy.length === 0) {
         throw new LlmError('invalid_request', 'router', `No LLM policy configured for task "${req.task}"`);
       }
@@ -238,6 +239,7 @@ export function createRouter(
                 task: req.task,
                 provider: spec.provider,
                 model: spec.model,
+                ...(completion.servedModel ? { servedModel: completion.servedModel } : {}),
                 attempts,
                 latencyMs: clock() - startedAt,
                 usage: completion.usage,

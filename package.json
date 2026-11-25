@@ -31,7 +31,9 @@
     "gen:schemas": "tsx scripts/gen-schemas.ts",
     "check:schemas": "tsx scripts/gen-schemas.ts --check",
     "check:config": "tsx scripts/check-config-usage.ts",
-    "weights:estimate": "tsx scripts/estimate-source-weights.ts"
+    "weights:estimate": "tsx scripts/estimate-source-weights.ts",
+    "eval:markets": "tsx scripts/eval-markets.ts",
+    "eval:forecast": "tsx scripts/eval-forecast.ts"
   },
   "keywords": [],
   "author": "",
@@ -47,6 +49,7 @@
     "bullmq": "~5.76.8",
     "compression": "~1.8.1",
     "cors": "~2.8.6",
+    "cron-parser": "4.9.0",
     "dayjs": "~1.11.20",
     "dotenv": "~17.4.2",
     "express": "~5.2.1",

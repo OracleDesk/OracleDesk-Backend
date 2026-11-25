@@ -1,5 +1,6 @@
 import { AgentPausedError, gateCycle } from '../services/agent-controls.service';
 import { writeAgentLog } from '../lib/agent-log';
+import { withCallerClass } from '../lib/context';
 import { logger } from '../lib/logger';
 import { config } from '../config';
 import { deadline } from '../lib/resilience';
@@ -16,26 +17,27 @@ import { snapshotTrader, traderParamsFromSnapshot } from '../services/risk-param
  * service, wall clock); the backtester runs the same policy against replayed
  * history. This function only adds the cycle deadline and failure logging.
  */
-export async function runTraderCycle(opts?: { signal?: AbortSignal }): Promise<void> {
-  logger.info('Trader Agent: starting cycle');
+export async function runTraderCycle(opts?: { signal?: AbortSignal }): Promise<{ outcome: 'SUCCESS' | 'SKIPPED_PAUSED' }> {
+  return withCallerClass('agent', async () => {
+    logger.info('Trader Agent: starting cycle');
 
-  // Persistent kill switch / pause (#79): a paused agent is an expected state.
-  try {
-    await gateCycle('TRADER');
-  } catch (err) {
-    if (err instanceof AgentPausedError) {
-      logger.info({ ...err.details }, 'Trader Agent: paused — skipping cycle');
-      return;
+    // Persistent kill switch / pause (#79): a paused agent is an expected state.
+    try {
+      await gateCycle('TRADER');
+    } catch (err) {
+      if (err instanceof AgentPausedError) {
+        logger.info({ ...err.details }, 'Trader Agent: paused — skipping cycle');
+        return { outcome: 'SKIPPED_PAUSED' };
+      }
+      throw err;
     }
-    throw err;
-  }
 
-  const parentSignal = opts?.signal
-    ? opts.signal
-    : shutdownController.signal;
+    const parentSignal = opts?.signal
+      ? opts.signal
+      : shutdownController.signal;
 
-  const handle = deadline('rpc-write', parentSignal, config.CYCLE_DEADLINE_MS);
-  const signal = handle.signal;
+    const handle = deadline('rpc-write', parentSignal, config.CYCLE_DEADLINE_MS);
+    const signal = handle.signal;
 
   try {
     signal.throwIfAborted();

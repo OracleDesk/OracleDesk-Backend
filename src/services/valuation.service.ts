@@ -16,11 +16,13 @@
  * `get_market`; `fee_bps` is fixed at market creation and cached.
  */
 import { now as clockNow } from '../lib/clock';
+import { config } from '../config';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { bigintToDecimalString, decimalToBigint, toDisplayUsdc } from '../lib/amounts';
 import { BPS, MathError, collateralOutForShares, priceYesBps, settleValue } from '../generated/fpmm';
-import { getOnChainMarket } from './chain.service';
+import { getMarketTwap, getOnChainMarket } from './chain.service';
+import { ChainError } from './stellar/errors';
 import { indexerStatus } from './indexer.service';
 
 export type OutcomeName = 'YES' | 'NO';
@@ -237,4 +239,100 @@ export async function markOpenPositions(
     }
   }
   return { marked, skippedMarkets };
+}
+
+// ─── Market-core TWAP mark (#292) ────────────────────────────────────────────
+
+export interface TwapDeps {
+  twap(onChainMarketId: bigint, windowSecs: bigint): Promise<number>;
+  countObservations(onChainMarketId: bigint, since: Date): Promise<number>;
+}
+
+export const defaultTwapDeps: TwapDeps = {
+  twap: (id, windowSecs) => getMarketTwap(id, windowSecs),
+  async countObservations(onChainMarketId, since) {
+    const rows = await prisma.$queryRaw<Array<{ n: number }>>`
+      SELECT count(*)::int AS n FROM chain_events
+      WHERE "eventName" = 'Trade' AND "contractName" = 'marketCore'
+        AND params->>'market_id' = ${onChainMarketId.toString()}
+        AND "createdAt" >= ${since}`;
+    return Number(rows[0]?.n ?? 0);
+  },
+};
+
+export interface TwapMarkResult {
+  yesBps: number | null;
+  source: 'twap' | 'spot_fallback';
+  fallbackReason?: 'NotSupported' | 'ObservationTooOld' | 'InsufficientObservations' | 'RpcError';
+  windowSecs: number;
+  observations: number;
+}
+
+/**
+ * Reads the market-core TWAP over `TWAP_WINDOW_SECS` when at least
+ * `TWAP_MIN_OBSERVATIONS` exist. Falls back explicitly to spot on
+ * pre-accumulator markets (`NotSupported`), young rings (`ObservationTooOld`),
+ * sparse trading (`InsufficientObservations`), or RPC errors.
+ */
+export async function twapMark(
+  onChainMarketId: bigint,
+  opts: { windowSecs?: number; minObservations?: number; deps?: TwapDeps; now?: Date } = {},
+): Promise<TwapMarkResult> {
+  const windowSecs = opts.windowSecs ?? config.TWAP_WINDOW_SECS;
+  const minObservations = opts.minObservations ?? config.TWAP_MIN_OBSERVATIONS;
+  const deps = opts.deps ?? defaultTwapDeps;
+  const now = opts.now ?? clockNow();
+
+  let observations = 0;
+  if (minObservations > 1) {
+    try {
+      const since = new Date(now.getTime() - windowSecs * 1000);
+      observations = await deps.countObservations(onChainMarketId, since);
+    } catch {
+      observations = 0;
+    }
+    if (observations < minObservations) {
+      return {
+        yesBps: null,
+        source: 'spot_fallback',
+        fallbackReason: 'InsufficientObservations',
+        windowSecs,
+        observations,
+      };
+    }
+  }
+
+  try {
+    const yesBps = await deps.twap(onChainMarketId, BigInt(windowSecs));
+    return { yesBps: Number(yesBps), source: 'twap', windowSecs, observations };
+  } catch (err) {
+    const contractErr = err instanceof ChainError ? err.contractError : null;
+    const fallbackReason =
+      contractErr === 'NotSupported'
+        ? 'NotSupported'
+        : contractErr === 'ObservationTooOld'
+          ? 'ObservationTooOld'
+          : 'RpcError';
+    logger.debug(
+      { onChainMarketId: onChainMarketId.toString(), fallbackReason, err: err instanceof Error ? err.message : err },
+      'TWAP unavailable; falling back to spot mark',
+    );
+    return { yesBps: null, source: 'spot_fallback', fallbackReason, windowSecs, observations };
+  }
+}
+
+/** Values a position at a given YES price in bps (e.g. from TWAP). */
+export function valuePositionAtPrice(
+  outcome: OutcomeName,
+  sharesRaw: bigint,
+  costBasisRaw: bigint,
+  yesBps: bigint,
+): { priceBps: bigint; midValueRaw: bigint; unrealisedPnlRaw: bigint } {
+  const priceBps = outcome === 'YES' ? yesBps : BPS - yesBps;
+  const midValueRaw = (sharesRaw * priceBps) / BPS;
+  return {
+    priceBps,
+    midValueRaw,
+    unrealisedPnlRaw: midValueRaw - costBasisRaw,
+  };
 }

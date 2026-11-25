@@ -26,6 +26,7 @@ import {
 import { logger } from '../../lib/logger';
 import { ChainError } from './errors';
 import { rpcServer } from './clients';
+import { withTimeout } from '../../lib/resilience';
 
 /** Thrown inside the critical section when this holder lost its lock (#36). */
 export class SequenceLockLost extends Error {
@@ -102,7 +103,7 @@ export function setSequenceDepsForTest(next: Partial<SequenceDeps> | null): void
 /** Reads the account sequence from RPC and caches it. Returns the raw sequence. */
 export async function syncSequence(account: string, override: Partial<SequenceDeps> = {}): Promise<bigint> {
   const d = deps(override);
-  const remote = await d.rpc.getAccount(account);
+  const remote = await withTimeout('rpc-read', () => d.rpc.getAccount(account));
   const seq = BigInt(remote.sequenceNumber());
   await d.redis.set(keys(account).seq, seq.toString());
   logger.info({ account, sequence: seq.toString() }, 'sequence: synced from RPC');

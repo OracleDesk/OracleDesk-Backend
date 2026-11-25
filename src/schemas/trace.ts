@@ -1,4 +1,9 @@
 import { z } from 'zod';
+import {
+  HedgePredicateSchema,
+  MAX_HEDGE_PREDICATES,
+  type HedgePredicate,
+} from './hedge-predicate';
 
 // z.guid(), not z.uuid(): zod 4's uuid() also checks RFC 9562 version and
 // variant bits, which the published JSON Schema (`format: uuid`) and zod 3
@@ -41,6 +46,7 @@ export const TraceDocV1 = z
           .strict(),
       )
       .max(50),
+    citedSourceIds: z.array(z.string()).max(50).optional(),
     betFraction: z.number().nullable(),
     betSizeUsdc: z.number().nullable(),
     hedgeConditions: z.array(z.string().max(500)).max(20),
@@ -147,6 +153,8 @@ export const TraceDocV2 = TraceDocV1.extend({
     })
     .strict()
     .nullable(),
+  /** Machine-checkable hedge predicates (#302). Null on older traces. */
+  hedgePredicates: z.array(HedgePredicateSchema).max(MAX_HEDGE_PREDICATES).nullable().optional(),
 }).strict();
 export type TraceDocV2 = z.infer<typeof TraceDocV2>;
 
@@ -246,9 +254,11 @@ export function buildTraceDoc(params: {
   edge: number;
   confidenceInterval: { lower: number; upper: number };
   sourcesUsed: Array<{ source: string; weight: number; signal: string; rawValue?: number | null }>;
+  citedSourceIds?: string[];
   betFraction?: number | null;
   betSizeUsdc?: number | null;
   hedgeConditions?: string[] | null;
+  hedgePredicates?: HedgePredicate[] | null;
   agentWallet?: string | null;
   createdAt?: string | Date;
 }): TraceDocV1 {
@@ -291,6 +301,7 @@ export function buildTraceDoc(params: {
     edge: Math.max(-1, Math.min(1, params.edge)),
     confidenceInterval: ci,
     sourcesUsed,
+    ...(params.citedSourceIds !== undefined ? { citedSourceIds: params.citedSourceIds.slice(0, 50) } : {}),
     betFraction: params.betFraction ?? null,
     betSizeUsdc: params.betSizeUsdc ?? null,
     hedgeConditions: (params.hedgeConditions ?? []).slice(0, 20).map((h) => h.slice(0, 500)),
@@ -371,6 +382,7 @@ export interface TraceDocV2Params {
   betFraction?: number | null;
   betSizeUsdc?: number | null;
   hedgeConditions?: string[] | null;
+  hedgePredicates?: HedgePredicate[] | null;
   agentWallet?: string | null;
   forecast?: Record<string, unknown> | null;
   sizing?: Record<string, unknown> | null;
@@ -444,6 +456,9 @@ export function buildTraceDocV2(params: TraceDocV2Params, now: Date): TraceDocV2
           units: params.corroboration.units,
           domains: [...params.corroboration.domains].sort().slice(0, 50),
         }
+      : null,
+    hedgePredicates: params.hedgePredicates
+      ? params.hedgePredicates.slice(0, MAX_HEDGE_PREDICATES)
       : null,
   };
 

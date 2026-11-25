@@ -14,7 +14,7 @@ import { sha256Hex } from '../../src/utils/hash.util';
 
 export interface Recording {
   caseId: string;
-  kind: 'proposal' | 'judge';
+  kind: 'proposal' | 'judge' | 'forecast';
   /** sha256(system + user) of the prompt that produced `output`. */
   promptKey: string;
   provider: string;
@@ -47,8 +47,10 @@ export function assertNoKeys(text: string): void {
   }
 }
 
-const file = (dir: string, model: string, caseId: string, kind: Recording['kind']) =>
-  path.join(dir, model, `${caseId}${kind === 'judge' ? '.judge' : ''}.json`);
+const file = (dir: string, model: string, caseId: string, kind: Recording['kind']) => {
+  const suffix = kind === 'judge' ? '.judge' : kind === 'forecast' ? '.forecast' : '';
+  return path.join(dir, model, `${caseId}${suffix}.json`);
+};
 
 export function loadRecording(dir: string, model: string, caseId: string, kind: Recording['kind'], key: string): Recording {
   const p = file(dir, model, caseId, kind);

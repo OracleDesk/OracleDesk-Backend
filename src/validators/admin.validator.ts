@@ -4,12 +4,55 @@ const rawAmount = z.string().regex(/^\d+$/, 'must be an integer in 7-decimal bas
 const address = z.string().min(1);
 const u64 = z.string().regex(/^\d+$/, 'must be a decimal u64');
 
+const globalConfigSchema = z.object({
+  max_trade: rawAmount,
+  max_market: rawAmount,
+  max_daily: rawAmount,
+  collateral: address.optional(),
+  market_core: address.optional(),
+});
+
+const pricePolicySchema = z.object({
+  min_price_bps: z.number().int().min(0).max(10_000).optional(),
+  max_price_bps: z.number().int().min(0).max(10_000).optional(),
+  max_spread_bps: z.number().int().min(0).max(10_000).optional(),
+});
+
+const agentPolicySchema = z.object({
+  max_trade: rawAmount,
+  max_market: rawAmount,
+  max_daily: rawAmount,
+  active: z.boolean().optional(),
+});
+
+const creationPolicySchema = z.object({
+  min_liquidity: rawAmount.optional(),
+  max_markets_per_day: z.number().int().min(0).optional(),
+});
+
+const drawdownConfigSchema = z.object({
+  max_drawdown_bps: z.number().int().min(1).max(10_000),
+  pause_duration_seconds: z.number().int().min(60),
+});
+
 export const adminOpSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('treasury.set_paused'), paused: z.boolean() }),
   z.object({ kind: z.literal('treasury.withdraw'), to: address, amountRaw: rawAmount }),
   z.object({ kind: z.literal('treasury.deposit'), from: address, amountRaw: rawAmount }),
   z.object({ kind: z.literal('treasury.collect_market_fees'), onChainMarketId: u64 }),
   z.object({ kind: z.literal('market_core.set_paused'), paused: z.boolean() }),
+  z.object({ kind: z.literal('treasury.propose_config'), config: globalConfigSchema }),
+  z.object({ kind: z.literal('treasury.execute_config') }),
+  z.object({ kind: z.literal('treasury.cancel_config') }),
+  z.object({ kind: z.literal('treasury.set_price_policy'), policy: pricePolicySchema }),
+  z.object({ kind: z.literal('treasury.execute_price_policy') }),
+  z.object({ kind: z.literal('treasury.cancel_price_policy') }),
+  z.object({ kind: z.literal('treasury.set_agent'), agent: address, policy: agentPolicySchema }),
+  z.object({ kind: z.literal('treasury.execute_agent'), agent: address }),
+  z.object({ kind: z.literal('treasury.cancel_agent'), agent: address }),
+  z.object({ kind: z.literal('treasury.remove_agent'), agent: address }),
+  z.object({ kind: z.literal('treasury.set_creation_policy'), policy: creationPolicySchema }),
+  z.object({ kind: z.literal('treasury.set_drawdown_config'), config: drawdownConfigSchema }),
 ]);
 
 export const createOperationSchema = z.object({

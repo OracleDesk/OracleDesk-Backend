@@ -5,9 +5,12 @@ import { setupTestEnv } from './helpers/env';
 
 setupTestEnv();
 
+const TREASURY_ID = 'CTREASURY';
+const AGENT_ID = 'GAGENT';
+
 function market(overrides: any = {}) {
   return {
-    creator: 'GTREASURY',
+    creator: TREASURY_ID,
     status: { tag: 'Open', values: undefined },
     reserve_yes: 100n,
     reserve_no: 200n,
@@ -46,22 +49,22 @@ test('liquidation value equals collateralOutForShares for each side (#159)', asy
 test('void settlement uses settleValue, and final markets expose settlement/lp values (#159)', async () => {
   const { valueMarket } = await import('../src/services/transparency-report.service');
   const { settleValue } = await import('../src/generated/fpmm');
-  const voided = valueMarket(snapshot({ market: market({ status: { tag: 'Void', values: undefined } }) }), 'GTREASURY');
+  const voided = valueMarket(snapshot({ market: market({ status: { tag: 'Void', values: undefined } }) }), TREASURY_ID);
   assert.equal(voided.settlementValueRaw, settleValue('void', 10n, 5n).toString());
   assert.equal(voided.lpRemainderRaw, settleValue('void', 100n, 200n).toString());
-  const open = valueMarket(snapshot(), 'GTREASURY');
+  const open = valueMarket(snapshot(), TREASURY_ID);
   assert.equal(open.settlementValueRaw, null);
   assert.equal(open.createdByTreasury, true);
 });
 
 test('the report document is byte-identical across runs (#159)', async () => {
   const { buildReportDocument, valueMarket, totalsFor } = await import('../src/services/transparency-report.service');
-  const markets = [valueMarket(snapshot(), 'GTREASURY')];
+  const markets = [valueMarket(snapshot(), TREASURY_ID)];
   const inputs = {
     date: '2026-10-14',
     network: 'Test SDF Network ; September 2015',
-    contracts: { treasury: 'CT', marketCore: 'CM', usdc: 'CU', reasoningRegistry: 'CR' },
-    agent: 'GTREASURY',
+    contracts: { treasury: TREASURY_ID, marketCore: 'CM', usdc: 'CU', reasoningRegistry: 'CR' },
+    agent: AGENT_ID,
     anchor: { ledger: 100, closedAt: '2026-10-14T00:00:00.000Z' },
     consistency: 'exact' as const,
     treasury: {
@@ -84,27 +87,47 @@ test('the report document is byte-identical across runs (#159)', async () => {
   const b = buildReportDocument(inputs);
   assert.deepEqual(a, b);
   assert.equal(JSON.stringify(a), JSON.stringify(b));
+  assert.equal(a.schemaVersion, 2);
   assert.deepEqual(a.totals, totalsFor(markets, '1000'));
 });
 
-test('coverage is incomplete when the indexer cursor is behind the period (#159)', async () => {
+test('coverage is incomplete when the indexer cursor is behind the period and matches treasury contract identity (#159, #299)', async () => {
   const { buildReportForDate } = await import('../src/services/transparency-report.service');
   const report = await buildReportForDate('2026-10-14', {
+    treasuryContractId: TREASURY_ID,
     latestLedger: async () => 100,
+    openMarkets: async () => [],
     marketCount: async () => 0n,
-    treasuryConfig: async () => ({ agent: 'GTREASURY', max_daily: 1000n, max_market: 100n, max_trade: 10n }),
+    treasuryConfig: async () => ({ agent: AGENT_ID, max_daily: 1000n, max_market: 100n, max_trade: 10n }),
     dailyUsage: async () => ({ amount: 0n, day_start: 0n }),
     availableCapital: async () => 500n,
+    usdcBalance: async () => 500n,
+    accounting: async () => ({
+      ledger: 100,
+      navRaw: 500n,
+      liquidRaw: 500n,
+      yieldPrincipalRaw: 0n,
+      yieldValueShares: 0n,
+      queueReservedRaw: 0n,
+      dailyHeadroomRaw: 1000n,
+      netExposureRaw: 0n,
+      spendableRaw: 500n,
+      flags: [],
+    }),
     chainEvents: async () => [
-      { contractName: 'marketCore', eventName: 'Trade', ledger: 90, ledgerClosedAt: new Date(), params: { trader: 'GTREASURY', collateral: '100', fee: '1', is_buy: true } },
+      { contractName: 'marketCore', eventName: 'Trade', ledger: 90, ledgerClosedAt: new Date(), params: { trader: TREASURY_ID, collateral: '100', fee: '1', is_buy: true } },
+      // Trades by the agent G-address directly must not be confused with treasury contract flows.
+      { contractName: 'marketCore', eventName: 'Trade', ledger: 91, ledgerClosedAt: new Date(), params: { trader: AGENT_ID, collateral: '999', fee: '5', is_buy: true } },
     ],
     indexerCursor: async () => 50,
     traceCount: async () => 0n,
     previousReport: async () => null,
     methodDoc: 'doc',
   });
+  assert.equal(report.agent, AGENT_ID);
+  assert.equal(report.contracts.treasury, TREASURY_ID);
   assert.equal(report.period_flows.coverage.complete, false);
-  assert.deepEqual(report.period_flows.coverage.gaps, [[51, 90]]);
+  assert.deepEqual(report.period_flows.coverage.gaps, [[51, 91]]);
   assert.equal(report.period_flows.tradesBoughtRaw, '100');
   assert.equal(report.period_flows.tradeCount, 1);
 });
@@ -114,11 +137,26 @@ test('snapshot retries when the ledger moves and flags best_effort after 3 attem
   const sequence = [100, 101, 101, 102, 102, 103];
   let index = 0;
   const report = await buildReportForDate('2026-10-14', {
+    treasuryContractId: TREASURY_ID,
     latestLedger: async () => sequence[Math.min(index++, sequence.length - 1)],
+    openMarkets: async () => [],
     marketCount: async () => 0n,
-    treasuryConfig: async () => ({ agent: 'GTREASURY', max_daily: 1000n, max_market: 100n, max_trade: 10n }),
+    treasuryConfig: async () => ({ agent: AGENT_ID, max_daily: 1000n, max_market: 100n, max_trade: 10n }),
     dailyUsage: async () => ({ amount: 0n, day_start: 0n }),
     availableCapital: async () => 0n,
+    usdcBalance: async () => 0n,
+    accounting: async () => ({
+      ledger: 103,
+      navRaw: 0n,
+      liquidRaw: 0n,
+      yieldPrincipalRaw: 0n,
+      yieldValueShares: 0n,
+      queueReservedRaw: 0n,
+      dailyHeadroomRaw: 1000n,
+      netExposureRaw: 0n,
+      spendableRaw: 0n,
+      flags: [],
+    }),
     chainEvents: async () => [],
     indexerCursor: async () => 0,
     traceCount: async () => 0n,
@@ -147,11 +185,26 @@ test('publish uses REPORT_MARKET_ID and action report; dry-run rows are uncommit
 
   await runReportJob('2026-10-14', {
     now: () => new Date('2026-10-14T00:00:00.000Z'),
+    treasuryContractId: TREASURY_ID,
     latestLedger: async () => 100,
+    openMarkets: async () => [],
     marketCount: async () => 0n,
-    treasuryConfig: async () => ({ agent: 'GTREASURY', max_daily: 1000n, max_market: 100n, max_trade: 10n }),
+    treasuryConfig: async () => ({ agent: AGENT_ID, max_daily: 1000n, max_market: 100n, max_trade: 10n }),
     dailyUsage: async () => ({ amount: 0n, day_start: 0n }),
     availableCapital: async () => 0n,
+    usdcBalance: async () => 0n,
+    accounting: async () => ({
+      ledger: 100,
+      navRaw: 0n,
+      liquidRaw: 0n,
+      yieldPrincipalRaw: 0n,
+      yieldValueShares: 0n,
+      queueReservedRaw: 0n,
+      dailyHeadroomRaw: 1000n,
+      netExposureRaw: 0n,
+      spendableRaw: 0n,
+      flags: [],
+    }),
     chainEvents: async () => [],
     indexerCursor: async () => 100,
     traceCount: async () => 0n,
@@ -284,12 +337,27 @@ test('the report service never imports portfolio floats or unrelated Prisma mode
 test('lastModifiedLedgerSeq drift forces best_effort even with a stable latest ledger (#159)', async () => {
   const { buildReportForDate } = await import('../src/services/transparency-report.service');
   const report = await buildReportForDate('2026-10-14', {
+    treasuryContractId: TREASURY_ID,
     latestLedger: async () => 100,
     ledgerEntries: async () => [{ lastModifiedLedgerSeq: 150 }],
+    openMarkets: async () => [],
     marketCount: async () => 0n,
-    treasuryConfig: async () => ({ agent: 'GTREASURY', max_daily: 1000n, max_market: 100n, max_trade: 10n }),
+    treasuryConfig: async () => ({ agent: AGENT_ID, max_daily: 1000n, max_market: 100n, max_trade: 10n }),
     dailyUsage: async () => ({ amount: 0n, day_start: 0n }),
     availableCapital: async () => 0n,
+    usdcBalance: async () => 0n,
+    accounting: async () => ({
+      ledger: 100,
+      navRaw: 0n,
+      liquidRaw: 0n,
+      yieldPrincipalRaw: 0n,
+      yieldValueShares: 0n,
+      queueReservedRaw: 0n,
+      dailyHeadroomRaw: 1000n,
+      netExposureRaw: 0n,
+      spendableRaw: 0n,
+      flags: [],
+    }),
     chainEvents: async () => [],
     indexerCursor: async () => 100,
     traceCount: async () => 0n,
@@ -297,4 +365,73 @@ test('lastModifiedLedgerSeq drift forces best_effort even with a stable latest l
     methodDoc: 'doc',
   });
   assert.equal(report.consistency, 'best_effort');
+});
+
+test('report v2 uses open-market index, real SAC USDC balance, and flags NAV diffs above tolerance without hiding them (#299)', async () => {
+  const { buildReportForDate } = await import('../src/services/transparency-report.service');
+  let marketCountCalled = false;
+  const report = await buildReportForDate('2026-10-14', {
+    treasuryContractId: TREASURY_ID,
+    latestLedger: async () => 500,
+    openMarkets: async () => [7n],
+    marketCount: async () => {
+      marketCountCalled = true;
+      return 1000n;
+    },
+    getMarket: async () => market({ reserve_yes: 100n, reserve_no: 200n }),
+    getPosition: async (_id, holder) => {
+      assert.equal(holder, TREASURY_ID);
+      return { yes: 10n, no: 5n } as any;
+    },
+    marketValuation: async () => 120n,
+    treasuryConfig: async () => ({ agent: AGENT_ID, max_daily: 10_000n, max_market: 5_000n, max_trade: 1_000n }),
+    dailyUsage: async () => ({ amount: 0n, day_start: 0n }),
+    availableCapital: async () => 9999n, // mixes units, must not be used for usdcBalanceRaw
+    usdcBalance: async (holder) => {
+      assert.equal(holder, TREASURY_ID);
+      return 1000n;
+    },
+    accounting: async () => ({
+      ledger: 500,
+      navRaw: 1070n, // recomputed floor nav = 1000 + (5 + 100) - 50 = 1055 -> diff = +15
+      liquidRaw: 1000n,
+      yieldPrincipalRaw: 300n,
+      yieldValueShares: 295n,
+      queueReservedRaw: 50n,
+      dailyHeadroomRaw: 10_000n,
+      netExposureRaw: 200n,
+      spendableRaw: 950n,
+      flags: ['NAV_EXCLUDES_YIELD', 'YIELD_VALUE_IN_SHARES', 'AVAILABLE_MIXES_UNITS'],
+    }),
+    navToleranceRaw: 10n,
+    chainEvents: async () => [],
+    indexerCursor: async () => 500,
+    traceCount: async () => 0n,
+    previousReport: async () => null,
+    methodDoc: 'doc',
+  });
+
+  assert.equal(marketCountCalled, false, 'should iterate open-market index rather than 0..marketCount');
+  assert.equal(report.schemaVersion, 2);
+  assert.equal(report.treasury.usdcBalanceRaw, '1000');
+  assert.equal(report.chain.navRaw, '1070');
+  assert.equal(report.chain.yieldValueShares, '295');
+  assert.equal(report.reconciliation.perMarket.length, 1);
+  assert.equal(report.reconciliation.perMarket[0].recomputedFloorRaw, '105');
+  assert.equal(report.reconciliation.perMarket[0].chainFloorRaw, '120');
+  assert.equal(report.reconciliation.perMarket[0].diffRaw, '15');
+  assert.equal(report.reconciliation.navDiffRaw, '15');
+  assert.equal(report.consistency, 'best_effort');
+  assert.ok(report.reconciliation.flags.includes('NAV_DIFF_EXCEEDS_TOLERANCE'));
+  assert.ok(report.reconciliation.flags.includes('NAV_EXCLUDES_YIELD'));
+
+  // Verifier validates v2 chain + reconciliation blocks and recomputes navDiffRaw.
+  const verifyRes = await verifyFixture(report, {
+    agent: AGENT_ID,
+    action: 'report',
+    ipfs_cid: 'bafy-v2',
+    market_id: 18446744073709551615n,
+  });
+  assert.equal(verifyRes.ok, true, JSON.stringify(verifyRes.checks));
+  assert.ok(verifyRes.checks.some((c) => c.name === 'reconciliation_nav_diff' && c.ok));
 });

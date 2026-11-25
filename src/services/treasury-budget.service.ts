@@ -19,6 +19,12 @@ import { decimalToBigint } from '../lib/amounts';
 import { AppError } from '../middlewares/error.middleware';
 import { logger } from '../lib/logger';
 import { treasuryAvailableCapital, treasuryDailyUsage, treasuryRiskConfig } from './chain.service';
+import {
+  readTreasuryAccounting,
+  type AccountingFlag,
+  type TreasuryAccounting,
+} from './treasury-accounting.service';
+import { logger } from '../lib/logger';
 
 const DAY_SECONDS = 86_400n;
 
@@ -32,34 +38,82 @@ export interface TreasuryBudget {
   dailyWindowStart: Date;
   dailyResetsAt: Date;
   readAt: Date;
+  /** Liquid capital minus withdrawal-queue reservations (#299). */
+  spendableRaw?: bigint;
+  /** On-chain treasury NAV from nav() (#299). */
+  navRaw?: bigint;
+  /** Collateral reserved for queued withdrawals (#299). */
+  queueReservedRaw?: bigint;
+  /** Remaining daily cap from daily_headroom() (#299). */
+  dailyHeadroomRaw?: bigint;
+  /** Known contract accounting gap flags (#299). */
+  flags?: AccountingFlag[];
 }
 
-/** The three treasury views; injectable for tests and the backtester. */
+/** The treasury views; injectable for tests and the backtester. */
 export interface TreasuryReader {
   availableCapital(): Promise<bigint>;
   getConfig(): Promise<{ max_trade: bigint; max_market: bigint; max_daily: bigint }>;
   dailyUsage(): Promise<{ amount: bigint; day_start: bigint | number }>;
+  accounting?: () => Promise<TreasuryAccounting>;
 }
 
 export const chainTreasuryReader: TreasuryReader = {
   availableCapital: () => treasuryAvailableCapital(),
   getConfig: () => treasuryRiskConfig(),
   dailyUsage: () => treasuryDailyUsage(),
+  accounting: () => readTreasuryAccounting(),
 };
 
 const maxBig = (a: bigint, b: bigint) => (a > b ? a : b);
+const minBig = (a: bigint, b: bigint) => (a < b ? a : b);
 
 /**
- * Reads available_capital, get_config and daily_usage in parallel. The
- * daily_usage view already applies the contract's rollover (a window expired
- * at ledger time shows amount 0 starting now), so the remaining daily
- * capacity is simply max_daily − amount, and the window resets at
- * day_start + 86 400 s. It is a rolling window anchored at the first spend
- * after expiry, not UTC midnight.
+ * Reads the treasury's on-chain accounting views (when available), get_config
+ * and daily_usage in parallel (#76, #299). When `accounting()` is supported,
+ * `availableRaw` is `min(spendableRaw, dailyHeadroomRaw)` — sourced from liquid
+ * USDC net of withdrawal-queue reservations and never from share-denominated
+ * yield. Falls back to `available_capital` when the capability is absent.
  */
 export async function readTreasuryBudget(reader: TreasuryReader = chainTreasuryReader, now: Date = clockNow()): Promise<TreasuryBudget> {
-  const [availableRaw, cfg, usage] = await Promise.all([reader.availableCapital(), reader.getConfig(), reader.dailyUsage()]);
+  const [acct, cfg, usage] = await Promise.all([
+    reader.accounting
+      ? reader.accounting().catch((err) => {
+          logger.warn(
+            { err: err instanceof Error ? err.message : String(err) },
+            'treasury accounting read failed; falling back to available_capital',
+          );
+          return null;
+        })
+      : Promise.resolve(null),
+    reader.getConfig(),
+    reader.dailyUsage(),
+  ]);
+
   const dayStart = BigInt(usage.day_start);
+
+  if (acct) {
+    const spendableRaw = maxBig(0n, acct.spendableRaw);
+    const dailyHeadroomRaw = maxBig(0n, acct.dailyHeadroomRaw);
+    return {
+      availableRaw: minBig(spendableRaw, dailyHeadroomRaw),
+      maxTradeRaw: cfg.max_trade,
+      maxMarketRaw: cfg.max_market,
+      maxDailyRaw: cfg.max_daily,
+      dailyUsedRaw: usage.amount,
+      dailyRemainingRaw: dailyHeadroomRaw,
+      dailyWindowStart: new Date(Number(dayStart) * 1000),
+      dailyResetsAt: new Date(Number(dayStart + DAY_SECONDS) * 1000),
+      readAt: now,
+      spendableRaw,
+      navRaw: acct.navRaw,
+      queueReservedRaw: acct.queueReservedRaw,
+      dailyHeadroomRaw,
+      flags: acct.flags,
+    };
+  }
+
+  const availableRaw = await reader.availableCapital();
   return {
     availableRaw: maxBig(0n, availableRaw),
     maxTradeRaw: cfg.max_trade,
@@ -74,7 +128,7 @@ export async function readTreasuryBudget(reader: TreasuryReader = chainTreasuryR
 }
 
 /** The budget with bigints as decimal strings, for traces, logs and the API. */
-export function budgetSnapshot(b: TreasuryBudget): Record<string, string> {
+export function budgetSnapshot(b: TreasuryBudget): Record<string, string | string[]> {
   return {
     availableRaw: b.availableRaw.toString(),
     maxTradeRaw: b.maxTradeRaw.toString(),
@@ -85,6 +139,11 @@ export function budgetSnapshot(b: TreasuryBudget): Record<string, string> {
     dailyWindowStart: b.dailyWindowStart.toISOString(),
     dailyResetsAt: b.dailyResetsAt.toISOString(),
     readAt: b.readAt.toISOString(),
+    ...(b.spendableRaw !== undefined ? { spendableRaw: b.spendableRaw.toString() } : {}),
+    ...(b.navRaw !== undefined ? { navRaw: b.navRaw.toString() } : {}),
+    ...(b.queueReservedRaw !== undefined ? { queueReservedRaw: b.queueReservedRaw.toString() } : {}),
+    ...(b.dailyHeadroomRaw !== undefined ? { dailyHeadroomRaw: b.dailyHeadroomRaw.toString() } : {}),
+    ...(b.flags !== undefined ? { flags: [...b.flags] } : {}),
   };
 }
 
@@ -95,6 +154,8 @@ export function spend(b: TreasuryBudget, amountRaw: bigint): TreasuryBudget {
     availableRaw: maxBig(0n, b.availableRaw - amountRaw),
     dailyUsedRaw: b.dailyUsedRaw + amountRaw,
     dailyRemainingRaw: maxBig(0n, b.dailyRemainingRaw - amountRaw),
+    ...(b.spendableRaw !== undefined ? { spendableRaw: maxBig(0n, b.spendableRaw - amountRaw) } : {}),
+    ...(b.dailyHeadroomRaw !== undefined ? { dailyHeadroomRaw: maxBig(0n, b.dailyHeadroomRaw - amountRaw) } : {}),
   };
 }
 

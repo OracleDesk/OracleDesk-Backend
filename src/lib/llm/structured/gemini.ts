@@ -40,10 +40,12 @@ async function attempt<T>(spec: StructuredSpec<T>, model: ModelSpec, run: Run): 
     try {
       const checked = check(spec, JSON.parse(text));
       if (checked.ok) {
+        const modelVersion = (result.response as any).modelVersion;
         return {
           value: checked.value,
           provider: 'gemini',
           model: usage.model ?? model.model,
+          ...(typeof modelVersion === 'string' && modelVersion ? { servedModel: modelVersion } : {}),
           attempts: run.calls.n,
           outputSha256: sha256Hex(text),
           usage: reported,

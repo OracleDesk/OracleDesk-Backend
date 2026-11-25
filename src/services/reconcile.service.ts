@@ -193,7 +193,10 @@ export async function reconcile(
         const amount = scValToNative(event.value);
         const txHash = event.txHash;
         const existing = await prisma.paymentEvent.findUnique({ where: { txHash } });
-        if (!existing) {
+        const claimed = (prisma as any).paymentClaim?.findFirst
+          ? await (prisma as any).paymentClaim.findFirst({ where: { txHash: txHash.toLowerCase() }, select: { id: true } })
+          : null;
+        if (!existing && !claimed) {
           unclaimedTransfers.push({ txHash, from, amountRaw: String(amount), ledger: event.ledger });
         }
       }

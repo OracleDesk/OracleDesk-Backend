@@ -1,0 +1,8 @@
+{
+  "caseId": "fc-04-cpi-print",
+  "kind": "forecast",
+  "promptKey": "synthetic-baseline-v1",
+  "provider": "synthetic",
+  "model": "synthetic-baseline",
+  "output": "{\"base_rate\":0.30,\"adjustments\":[{\"signal_id\":\"s1\",\"delta\":-0.14,\"why\":\"Rebounding energy prices and sticky shelter keep CPI above 2.0%.\"}],\"p\":0.18,\"p_low_50\":0.12,\"p_high_50\":0.25,\"rationale\":\"Both core shelter and headline energy components point above 2.0%.\"}"
+}

@@ -96,6 +96,139 @@ export function specEntriesFromWasm(wasm: Buffer): xdr.ScSpecEntry[] {
 // successful parses are cached: an archived code entry can be restored.
 const specByWasmHash = new Map<string, xdr.ScSpecEntry[]>();
 
+function keyTag(key: xdr.LedgerKey): string | null {
+  try {
+    return key.toXDR('base64');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Batch-fetches the deployed instance entries for multiple contracts in a
+ * single `getLedgerEntries` call, then fetches any uncached contractCode
+ * entries in a second batched `getLedgerEntries` call (#322).
+ */
+export async function fetchDeployedMany(
+  targets: ReadonlyArray<{ contract: string; contractId: string }>,
+  deps: { rpc: RpcReader } = { rpc: rpcServer },
+): Promise<Map<string, DeployedContract>> {
+  const results = new Map<string, DeployedContract>();
+  if (targets.length === 0) return results;
+
+  const targetKeys = targets.map((t) => ({
+    ...t,
+    ledgerKey: new Contract(t.contractId).getFootprint(),
+  }));
+
+  const instanceRes = await withTimeout('rpc-read', async () =>
+    deps.rpc.getLedgerEntries(...targetKeys.map((t) => t.ledgerKey)),
+  );
+
+  const entryByKey = new Map<string, rpc.Api.LedgerEntryResult>();
+  for (const entry of instanceRes.entries ?? []) {
+    const tag = entry?.key ? keyTag(entry.key) : null;
+    if (tag) entryByKey.set(tag, entry);
+  }
+
+  const needCode: Array<{
+    contract: string;
+    contractId: string;
+    wasmHash: string;
+    hashBuf: Buffer;
+    codeKey: xdr.LedgerKey;
+  }> = [];
+
+  for (let i = 0; i < targetKeys.length; i++) {
+    const { contract, contractId, ledgerKey } = targetKeys[i];
+    const tag = keyTag(ledgerKey);
+    const instance = (tag ? entryByKey.get(tag) : undefined) ?? (instanceRes.entries?.length === targetKeys.length ? instanceRes.entries[i] : undefined);
+    if (!instance) {
+      results.set(contract, {
+        contract,
+        contractId,
+        wasmHash: null,
+        kind: 'wasm',
+        spec: null,
+        reason: 'contract instance not found (or archived)',
+      });
+      continue;
+    }
+
+    const executable = instance.val.contractData().val().instance().executable();
+    if (executable.switch() === xdr.ContractExecutableType.contractExecutableStellarAsset()) {
+      results.set(contract, { contract, contractId, wasmHash: null, kind: 'stellar-asset', spec: null });
+      continue;
+    }
+
+    const hashBuf = Buffer.from(executable.wasmHash());
+    const wasmHash = hashBuf.toString('hex');
+    const cached = specByWasmHash.get(wasmHash);
+    if (cached) {
+      results.set(contract, { contract, contractId, wasmHash, kind: 'wasm', spec: cached });
+      continue;
+    }
+
+    const codeKey = xdr.LedgerKey.contractCode(new xdr.LedgerKeyContractCode({ hash: hashBuf }));
+    needCode.push({ contract, contractId, wasmHash, hashBuf, codeKey });
+  }
+
+  if (needCode.length > 0) {
+    const uniqueByHash = new Map<string, xdr.LedgerKey>();
+    for (const item of needCode) {
+      if (!uniqueByHash.has(item.wasmHash)) uniqueByHash.set(item.wasmHash, item.codeKey);
+    }
+    const uniqueKeys = [...uniqueByHash.values()];
+    const codeRes = await withTimeout('rpc-read', async () =>
+      deps.rpc.getLedgerEntries(...uniqueKeys),
+    );
+    const codeByTag = new Map<string, rpc.Api.LedgerEntryResult>();
+    const codeByHash = new Map<string, rpc.Api.LedgerEntryResult>();
+    for (const entry of codeRes.entries ?? []) {
+      const tag = entry?.key ? keyTag(entry.key) : null;
+      if (tag) codeByTag.set(tag, entry);
+      try {
+        const h = Buffer.from(entry.val.contractCode().hash()).toString('hex');
+        codeByHash.set(h, entry);
+      } catch {}
+    }
+
+    for (let i = 0; i < needCode.length; i++) {
+      const { contract, contractId, wasmHash, codeKey } = needCode[i];
+      const cached = specByWasmHash.get(wasmHash);
+      if (cached) {
+        results.set(contract, { contract, contractId, wasmHash, kind: 'wasm', spec: cached });
+        continue;
+      }
+      const tag = keyTag(codeKey);
+      const code =
+        codeByHash.get(wasmHash) ??
+        (tag ? codeByTag.get(tag) : undefined) ??
+        (codeRes.entries?.length === needCode.length ? codeRes.entries[i] : undefined);
+      if (!code) {
+        results.set(contract, { contract, contractId, wasmHash, kind: 'wasm', spec: null, reason: 'code archived' });
+        continue;
+      }
+      try {
+        const spec = specEntriesFromWasm(code.val.contractCode().code());
+        specByWasmHash.set(wasmHash, spec);
+        results.set(contract, { contract, contractId, wasmHash, kind: 'wasm', spec });
+      } catch (err) {
+        results.set(contract, {
+          contract,
+          contractId,
+          wasmHash,
+          kind: 'wasm',
+          spec: null,
+          reason: `no readable contractspecv0 section: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    }
+  }
+
+  return results;
+}
+
 /**
  * The executable behind a deployed contract id: its wasm hash and the spec
  * embedded in its code entry, or kind 'stellar-asset' for SAC contracts.
@@ -520,6 +653,11 @@ export interface ContractCompat {
   diffs: SpecDiff[];
 }
 
+export interface WiringCheck {
+  resolver: { expected: string; actual: string | null };
+  treasury: { expected: string; actual: string | null };
+}
+
 export interface SpecCompatReport {
   checkedAt: string;
   mode: EnforceMode;
@@ -527,16 +665,119 @@ export interface SpecCompatReport {
   ok: boolean;
   breaking: SpecDiff[];
   contracts: ContractCompat[];
+  wiring?: WiringCheck;
+}
+
+export type DriftClass = 'unchanged' | 'compatible' | 'breaking' | 'unverifiable';
+export type CompatAgentScope = 'TRADER' | 'MARKET_MAKER';
+
+/**
+ * Scope impact table (#322): maps each contract (or wiring check) to the agent
+ * scopes that call or depend on it.
+ */
+export const CONTRACT_AFFECTED_SCOPES: Record<string, readonly CompatAgentScope[]> = {
+  marketCore: ['TRADER', 'MARKET_MAKER'],
+  treasury: ['TRADER', 'MARKET_MAKER'],
+  resolver: ['MARKET_MAKER'],
+  reasoningRegistry: ['MARKET_MAKER'],
+  wiring: ['TRADER', 'MARKET_MAKER'],
+  usdc: ['TRADER', 'MARKET_MAKER'],
+};
+
+function isUnverifiableDiff(d: SpecDiff): boolean {
+  return d.change.startsWith('cannot verify');
+}
+
+function diffSignature(d: SpecDiff): string {
+  return `${d.contract}|${d.item}|${d.change}|${d.severity}`;
+}
+
+export function affectedScopesForDiffs(diffs: readonly SpecDiff[]): CompatAgentScope[] {
+  const set = new Set<CompatAgentScope>();
+  for (const d of diffs) {
+    const key = d.item === 'wiring' ? 'wiring' : d.contract;
+    const scopes = CONTRACT_AFFECTED_SCOPES[key] ?? ['TRADER', 'MARKET_MAKER'];
+    for (const s of scopes) set.add(s);
+  }
+  const ordered: CompatAgentScope[] = [];
+  if (set.has('TRADER')) ordered.push('TRADER');
+  if (set.has('MARKET_MAKER')) ordered.push('MARKET_MAKER');
+  return ordered;
+}
+
+/**
+ * Classifies a newly computed spec-compat report against a baseline report
+ * (typically the boot report or the last accepted report) (#322).
+ */
+export function classify(
+  prev: SpecCompatReport | null,
+  next: SpecCompatReport,
+): { cls: DriftClass; affected: CompatAgentScope[]; diffs: SpecDiff[] } {
+  const allDiffs = next.contracts.flatMap((c) => c.diffs);
+  const breakingDiffs = allDiffs.filter((d) => d.severity === 'breaking' && !isUnverifiableDiff(d));
+  const unverifiableDiffs = allDiffs.filter((d) => d.severity === 'breaking' && isUnverifiableDiff(d));
+
+  if (breakingDiffs.length > 0) {
+    return {
+      cls: 'breaking',
+      affected: affectedScopesForDiffs(breakingDiffs),
+      diffs: breakingDiffs,
+    };
+  }
+
+  if (unverifiableDiffs.length > 0) {
+    return {
+      cls: 'unverifiable',
+      affected: affectedScopesForDiffs(unverifiableDiffs),
+      diffs: unverifiableDiffs,
+    };
+  }
+
+  const prevSigs = new Set((prev?.contracts.flatMap((c) => c.diffs) ?? []).map(diffSignature));
+  const newCompatible = allDiffs.filter((d) => d.severity === 'compatible' && !prevSigs.has(diffSignature(d)));
+  if (newCompatible.length > 0) {
+    return {
+      cls: 'compatible',
+      affected: affectedScopesForDiffs(newCompatible),
+      diffs: newCompatible,
+    };
+  }
+
+  return { cls: 'unchanged', affected: [], diffs: [] };
 }
 
 type FetchFn = typeof fetchDeployed;
 
+export interface SpecCompatDeps {
+  fetch?: FetchFn;
+  rpc?: RpcReader;
+  readWiring?: () => Promise<{ resolver: string; treasury: string } | null>;
+}
+
+let bootReport: SpecCompatReport | null = null;
 let lastReport: SpecCompatReport | null = null;
 let disabled = new Set<string>();
 
-/** The last report, for GET /admin/chain/spec-compat. Null before the gate ran. */
+/** The boot report captured by `runSpecCompatGate` (or the first applied report). */
+export function bootSpecCompatReport(): SpecCompatReport | null {
+  return bootReport;
+}
+
+/** The latest applied report, for GET /admin/chain/spec-compat. Null before the gate ran. */
 export function specCompatReport(): SpecCompatReport | null {
   return lastReport;
+}
+
+/** Applies a computed report to process-local state (`lastReport` and `disabledEventProjections`). */
+export function applyReport(report: SpecCompatReport): SpecCompatReport {
+  if (!bootReport) bootReport = report;
+  lastReport = report;
+  disabled = new Set(
+    report.breaking
+      .filter((d) => d.item.startsWith('event '))
+      .map((d) => `${d.contract}:${d.item.slice('event '.length)}`),
+  );
+  return report;
 }
 
 /**
@@ -553,19 +794,40 @@ function bindingSpec(contract: BindingContract): xdr.ScSpecEntry[] {
 }
 
 /**
- * Fetches every deployed contract and diffs it against the synced bindings.
- * Never throws: an unreachable or unverifiable contract becomes a breaking
- * "cannot verify" diff, because a gate that fails open is no gate.
+ * Pure spec compatibility computation (#322): reads deployed contracts (batched
+ * when no custom `fetch` is injected), checks market-core wiring when
+ * available, and returns a `SpecCompatReport` without mutating module state.
  */
-export async function checkSpecCompat(
-  deps: { fetch?: FetchFn; rpc?: RpcReader } = {},
+export async function computeSpecCompat(
+  deps: SpecCompatDeps = {},
 ): Promise<SpecCompatReport> {
-  const fetch: FetchFn = deps.fetch ?? ((contract, id) => fetchDeployed(contract, id, { rpc: deps.rpc ?? rpcServer }));
   const manifestContracts = manifest.contracts as Record<
     string,
     { contractId: string | null; expectedWasmHash: string | null }
   >;
   const contracts: ContractCompat[] = [];
+
+  let batched: Map<string, DeployedContract> | null = null;
+  let batchErr: unknown = null;
+  if (!deps.fetch) {
+    const targets = [
+      ...BINDING_CONTRACTS.map((c) => ({ contract: c, contractId: CONTRACTS[c] })),
+      { contract: 'usdc', contractId: CONTRACTS.usdc },
+    ];
+    try {
+      batched = await fetchDeployedMany(targets, { rpc: deps.rpc ?? rpcServer });
+    } catch (err) {
+      batchErr = err;
+    }
+  }
+
+  const getDeployed = async (contract: string, contractId: string): Promise<DeployedContract> => {
+    if (deps.fetch) return deps.fetch(contract, contractId);
+    if (batchErr) throw batchErr;
+    const hit = batched?.get(contract);
+    if (hit) return hit;
+    return fetchDeployed(contract, contractId, { rpc: deps.rpc ?? rpcServer });
+  };
 
   for (const contract of BINDING_CONTRACTS) {
     const contractId = CONTRACTS[contract];
@@ -587,7 +849,7 @@ export async function checkSpecCompat(
 
     let deployed: DeployedContract;
     try {
-      deployed = await fetch(contract, contractId);
+      deployed = await getDeployed(contract, contractId);
     } catch (err) {
       row.reason = err instanceof Error ? err.message : String(err);
       row.diffs.push({ contract, item: 'spec', change: `cannot verify: ${row.reason}`, severity: 'breaking' });
@@ -644,7 +906,7 @@ export async function checkSpecCompat(
   };
   contracts.push(usdc);
   try {
-    const deployed = await fetch('usdc', CONTRACTS.usdc);
+    const deployed = await getDeployed('usdc', CONTRACTS.usdc);
     usdc.kind = deployed.kind;
     usdc.wasmHash = deployed.wasmHash;
     usdc.verified = deployed.kind === 'stellar-asset';
@@ -661,21 +923,77 @@ export async function checkSpecCompat(
     usdc.diffs.push({ contract: 'usdc', item: 'spec', change: `cannot verify: ${usdc.reason}`, severity: 'breaking' });
   }
 
+  // Wiring check (#322): market-core config resolver and treasury must equal CONTRACTS.
+  const wiring: WiringCheck = {
+    resolver: { expected: CONTRACTS.resolver, actual: CONTRACTS.resolver },
+    treasury: { expected: CONTRACTS.treasury, actual: CONTRACTS.treasury },
+  };
+  const wiringReader =
+    deps.readWiring ??
+    (!deps.fetch
+      ? async () => {
+          const chain = await import('../chain.service');
+          return chain.marketCoreConfig();
+        }
+      : undefined);
+  if (wiringReader) {
+    const marketCoreRow = contracts.find((c) => c.contract === 'marketCore');
+    try {
+      const cfg = await wiringReader();
+      if (cfg) {
+        wiring.resolver.actual = cfg.resolver;
+        wiring.treasury.actual = cfg.treasury;
+        if (cfg.resolver !== CONTRACTS.resolver) {
+          marketCoreRow?.diffs.push({
+            contract: 'marketCore',
+            item: 'wiring',
+            change: `resolver ${cfg.resolver} ≠ configured ${CONTRACTS.resolver}`,
+            severity: 'breaking',
+          });
+        }
+        if (cfg.treasury !== CONTRACTS.treasury) {
+          marketCoreRow?.diffs.push({
+            contract: 'marketCore',
+            item: 'wiring',
+            change: `treasury ${cfg.treasury} ≠ configured ${CONTRACTS.treasury}`,
+            severity: 'breaking',
+          });
+        }
+      }
+    } catch (err) {
+      wiring.resolver.actual = null;
+      wiring.treasury.actual = null;
+      const reason = err instanceof Error ? err.message : String(err);
+      marketCoreRow?.diffs.push({
+        contract: 'marketCore',
+        item: 'wiring',
+        change: `cannot verify wiring: ${reason}`,
+        severity: 'breaking',
+      });
+    }
+  }
+
   const breaking = contracts.flatMap((c) => c.diffs.filter((d) => d.severity === 'breaking'));
-  const report: SpecCompatReport = {
+  return {
     checkedAt: new Date().toISOString(),
     mode: effectiveMode(),
     bindingsCommit: manifest.commit,
     ok: breaking.length === 0,
     breaking,
     contracts,
+    wiring,
   };
+}
 
-  lastReport = report;
-  disabled = new Set(
-    breaking.filter((d) => d.item.startsWith('event ')).map((d) => `${d.contract}:${d.item.slice('event '.length)}`),
-  );
-  return report;
+/**
+ * Fetches every deployed contract, diffs it against the synced bindings, and
+ * applies the resulting report to process-local state.
+ */
+export async function checkSpecCompat(
+  deps: SpecCompatDeps = {},
+): Promise<SpecCompatReport> {
+  const report = await computeSpecCompat(deps);
+  return applyReport(report);
 }
 
 /** What the boot gate does with a report under the given mode. */
@@ -689,13 +1007,14 @@ export function gateDecision(report: SpecCompatReport, mode: EnforceMode): GateA
  * The caller exits the process on a 'refuse' decision; this module never
  * calls process.exit itself.
  */
-export async function runSpecCompatGate(deps: { fetch?: FetchFn } = {}): Promise<SpecCompatReport | null> {
+export async function runSpecCompatGate(deps: SpecCompatDeps = {}): Promise<SpecCompatReport | null> {
   const mode = effectiveMode();
   if (mode === 'off') {
     logger.warn('SPEC_COMPAT_ENFORCE=off: contract spec compatibility check skipped');
     return null;
   }
   const report = await checkSpecCompat(deps);
+  bootReport = report;
   const action = gateDecision(report, mode);
   if (action === 'ok') {
     const matched = report.contracts.filter((c) => c.verified && c.kind === 'wasm').length;

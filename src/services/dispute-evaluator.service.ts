@@ -54,8 +54,13 @@ export interface EvaluationResult {
   evidence: EvidenceItem[];
 }
 
+export interface EvaluateOptions {
+  /** Dispute window end timestamp (epoch ms) for deadline-aware LLM budget waiting (#327). */
+  deadlineMs?: number;
+}
+
 export interface Evaluator {
-  evaluate(doc: QuestionDoc, closeTime: Date): Promise<EvaluationResult>;
+  evaluate(doc: QuestionDoc, closeTime: Date, opts?: EvaluateOptions): Promise<EvaluationResult>;
 }
 
 export interface EvidenceProvider {
@@ -164,13 +169,17 @@ export const EVALUATOR_SYSTEM_PROMPT = [
   'Primary data sources outweigh press coverage. Report your confidence honestly between 0 and 1.',
 ].join('\n');
 
-type Caller = (prompts: { system: string; user: string }) => Promise<Decision>;
+type Caller = (prompts: { system: string; user: string }, opts?: EvaluateOptions) => Promise<Decision>;
 
-const defaultCaller: Caller = async (prompts) =>
+const defaultCaller: Caller = async (prompts, evalOpts) =>
   (await callLLMStructured(decisionSpec, prompts, {
     maxTokens: 1024,
     task: 'dispute_review',
-    ctx: { purpose: 'dispute_review', priority: 'cron' },
+    ctx: {
+      purpose: 'dispute_review',
+      priority: 'cron',
+      ...(evalOpts?.deadlineMs !== undefined ? { deadlineMs: evalOpts.deadlineMs } : {}),
+    },
   })).value;
 
 export interface LlmEvaluatorOptions {
@@ -183,7 +192,7 @@ export function createLlmEvaluator(opts: LlmEvaluatorOptions = {}): Evaluator {
   const call = opts.call ?? defaultCaller;
 
   return {
-    async evaluate(doc, closeTime) {
+    async evaluate(doc, closeTime, evalOpts) {
       const settled = await Promise.allSettled(
         providers.filter((p) => p.applies(doc)).map(async (p) => (await p.gather(doc, closeTime)).map((item) => ({ provider: p, item }))),
       );
@@ -226,7 +235,7 @@ export function createLlmEvaluator(opts: LlmEvaluatorOptions = {}): Evaluator {
         renderUntrustedBlock(signals, 'untrusted_evidence'),
       ].join('\n');
 
-      const decision = await call({ system: EVALUATOR_SYSTEM_PROMPT, user });
+      const decision = await call({ system: EVALUATOR_SYSTEM_PROMPT, user }, evalOpts);
       const known = new Set(evidence.map((e) => e.id));
       const cited = decision.citations.filter((id) => known.has(id));
       for (const e of evidence) e.cited = cited.includes(e.id);

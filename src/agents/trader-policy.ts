@@ -100,7 +100,7 @@ export interface SizingRecord {
   finalRaw: string;
   binding: SizingBinding;
   safetyBps: number;
-  budget: Record<string, string>;
+  budget: Record<string, string | string[]>;
   /** Ledger view the decision was made against (#266). */
   priceAsOf: PriceAsOf;
   /** Fill cost at finalRaw (#225). */
@@ -183,6 +183,54 @@ export async function runTraderPolicy(
 
   for (const position of openPositions) {
     signal?.throwIfAborted();
+    let closedByPredicate = false;
+
+    if (env.evaluatePredicates) {
+      const triggered = await env.evaluatePredicates(position, now, cycleId);
+      for (const hit of triggered) {
+        if (hit.predicate.action === 'EXIT' && !closedByPredicate) {
+          const exit = await env.exit(position.id, 'HEDGE_PREDICATE', position.currentPrice ?? position.entryPrice);
+          closedByPredicate = exit.ok;
+          await recordDecision({
+            kind: 'HEDGE_PREDICATE',
+            marketId: position.marketId,
+            reasonCode: 'HEDGE_PREDICATE_EXIT',
+            positionId: position.id,
+            outcome: { exited: exit.ok, ...(exit.reason ? { exitReason: exit.reason } : {}) },
+            data: {
+              positionId: position.id,
+              predicateId: hit.predicate.id,
+              predicate: hit.predicate,
+              evaluation: hit.evaluation,
+              exited: exit.ok,
+            },
+          });
+          logger.info({ positionId: position.id, predicateId: hit.predicate.id, exited: exit.ok }, 'Hedge predicate EXIT triggered');
+        } else if (hit.predicate.action === 'REFORECAST') {
+          const reforecasted = env.reforecast
+            ? await env.reforecast(position, now)
+            : { ok: false, reason: 'REFORECAST_UNSUPPORTED' };
+          await recordDecision({
+            kind: 'HEDGE_PREDICATE',
+            marketId: position.marketId,
+            reasonCode: 'HEDGE_PREDICATE_REFORECAST',
+            positionId: position.id,
+            outcome: reforecasted,
+            data: {
+              positionId: position.id,
+              predicateId: hit.predicate.id,
+              predicate: hit.predicate,
+              evaluation: hit.evaluation,
+              reforecasted,
+            },
+          });
+          logger.info({ positionId: position.id, predicateId: hit.predicate.id, reforecasted }, 'Hedge predicate REFORECAST triggered');
+        }
+      }
+    }
+
+    if (closedByPredicate) continue;
+
     const { shouldClose, reason } = await env.stopLoss(position);
     if (shouldClose && reason) {
       const exit = await env.exit(position.id, 'STOP_LOSS', position.currentPrice ?? position.entryPrice);
@@ -194,6 +242,13 @@ export async function runTraderPolicy(
         data: { positionId: position.id, reason, exited: exit.ok, ...(exit.reason ? { exitReason: exit.reason } : {}) },
       });
       logger.info({ positionId: position.id, reason, exited: exit.ok }, 'Stop-loss triggered');
+    } else if (!shouldClose && reason) {
+      await recordDecision({
+        kind: 'SKIP', marketId: position.marketId,
+        reasonCode: 'PRICE_STALE',
+        positionId: position.id,
+        data: { reason: 'STOP_LOSS_DEFERRED', detail: reason },
+      });
     }
   }
 
@@ -475,6 +530,53 @@ async function analyzeAndTradeMarket(
         data: { reason: 'SIZE_BELOW_MIN', direction, edge, sizing },
       });
       return false;
+    }
+
+    // #292: pre-check market-core circuit breakers; resize to largest non-tripping size or skip.
+    if (env.wouldTrip && (await env.wouldTrip(market.id, direction, sized.collateralRaw))) {
+      let lo = MIN_TRADE_RAW;
+      let hi = sized.collateralRaw;
+      let best = 0n;
+      if (!(await env.wouldTrip(market.id, direction, lo))) {
+        best = lo;
+        for (let step = 0; step < 8 && lo <= hi; step++) {
+          const mid = (lo + hi) / 2n;
+          if (mid === best) break;
+          if (await env.wouldTrip(market.id, direction, mid)) {
+            hi = mid - 1n;
+          } else {
+            best = mid;
+            lo = mid + 1n;
+          }
+        }
+      }
+      if (best < MIN_TRADE_RAW) {
+        logger.info({ marketId: market.id, direction, proposedRaw: sized.collateralRaw.toString() }, 'Skipping buy: market-core circuit breaker would trip');
+        await recordDecision({
+          kind: 'SKIP',
+          reasonCode: 'SIZE_BELOW_MIN',
+          marketId: market.id,
+          forecastRef,
+          sizingRecord: sizing as unknown as Record<string, unknown>,
+          data: { reason: 'BREAKER_WOULD_TRIP', direction, edge, sizing },
+        });
+        return false;
+      }
+      const resized = sizeWithin(best);
+      if (resized.collateralRaw < MIN_TRADE_RAW || resized.reason === 'NO_EDGE_AT_MARGIN') {
+        await recordDecision({
+          kind: 'SKIP',
+          reasonCode: 'SIZE_BELOW_MIN',
+          marketId: market.id,
+          forecastRef,
+          sizingRecord: sizing as unknown as Record<string, unknown>,
+          data: { reason: 'BREAKER_WOULD_TRIP', direction, edge, sizing },
+        });
+        return false;
+      }
+      sized = resized;
+      sizing.finalRaw = sized.collateralRaw.toString();
+      sizing.impact = impactRecord(model, sized, reserves);
     }
 
     const amountRaw = sized.collateralRaw;

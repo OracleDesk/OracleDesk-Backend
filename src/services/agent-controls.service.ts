@@ -24,12 +24,27 @@ import { AppError } from '../middlewares/error.middleware';
 
 export type AgentScope = 'MARKET_MAKER' | 'TRADER';
 export type ControlScope = AgentScope | 'ALL';
-export type PauseSource = 'operator' | 'drawdown' | 'chain_paused' | 'failure_breaker';
+export type PauseSource = 'operator' | 'drawdown' | 'chain_paused' | 'failure_breaker' | 'spec_drift' | 'fee_budget';
+
+export interface ControlHoldRow {
+  scope: ControlScope;
+  source: string;
+  reason: string;
+  createdAt: Date;
+  ackRequired: boolean;
+  ackedBy: string | null;
+}
 
 export const CONTROL_SCOPES: readonly ControlScope[] = ['ALL', 'MARKET_MAKER', 'TRADER'];
 
-/** Risk-cap rejections are expected behaviour of the treasury, not failures. */
-const CAP_ERRORS = new Set(['TradeCapExceeded', 'MarketCapExceeded', 'DailyCapExceeded']);
+/** Risk-cap and market-core breaker rejections are expected behaviour, not infra failures (#292). */
+const CAP_ERRORS = new Set([
+  'TradeCapExceeded',
+  'MarketCapExceeded',
+  'DailyCapExceeded',
+  'PriceImpactTooHigh',
+  'PriceBandExceeded',
+]);
 
 export class AgentPausedError extends AppError {
   constructor(scope: AgentScope, details: { reason?: string; until?: Date; source?: string }) {
@@ -89,8 +104,16 @@ const isExpired = (row: ControlRow, now: Date) =>
 const isActivePause = (row: ControlRow | undefined, now: Date): row is ControlRow =>
   !!row && row.paused && !isExpired(row, now);
 
-/** Pure: merges the ALL row and the scope row. A missing row means "not paused". */
-export function effectiveFromRows(rows: ControlRow[], scope: AgentScope, now: Date): EffectiveControl {
+/**
+ * Pure: merges the ALL row, the scope row, and any active holds (#322).
+ * A missing row with no active holds means "not paused".
+ */
+export function effectiveFromRows(
+  rows: ControlRow[],
+  scope: AgentScope,
+  now: Date,
+  holds: ControlHoldRow[] = [],
+): EffectiveControl {
   const all = rows.find((r) => r.scope === 'ALL');
   const own = rows.find((r) => r.scope === scope);
   const version = (all?.version ?? 0) + (own?.version ?? 0);
@@ -106,7 +129,58 @@ export function effectiveFromRows(rows: ControlRow[], scope: AgentScope, now: Da
       };
     }
   }
+  for (const targetScope of ['ALL', scope] as const) {
+    const hold = holds.find((h) => h.scope === targetScope);
+    if (hold) {
+      return {
+        paused: true,
+        reason: hold.reason,
+        source: hold.source,
+        version,
+      };
+    }
+  }
   return { paused: false, version };
+}
+
+// In-memory hold mirror synced with agent_control_holds (also backs unit tests
+// whose Prisma test double only stubs agent_controls).
+const memoryHolds = new Map<string, ControlHoldRow>();
+
+function holdKey(scope: ControlScope, source: string): string {
+  return `${scope}:${source}`;
+}
+
+interface HoldPrismaDelegate {
+  findMany(args?: unknown): Promise<ControlHoldRow[]>;
+  upsert(args: unknown): Promise<ControlHoldRow>;
+  updateMany(args: unknown): Promise<{ count: number }>;
+  deleteMany(args: unknown): Promise<{ count: number }>;
+}
+
+function holdDelegate(client: unknown = prisma): HoldPrismaDelegate | null {
+  const d = (client as { agentControlHold?: HoldPrismaDelegate } | null)?.agentControlHold;
+  return d && typeof d.findMany === 'function' ? d : null;
+}
+
+export async function readHolds(scopes?: ControlScope[]): Promise<ControlHoldRow[]> {
+  const delegate = holdDelegate();
+  if (delegate) {
+    try {
+      const rows = await delegate.findMany(
+        scopes ? { where: { scope: { in: scopes as any } } } : undefined,
+      );
+      return rows;
+    } catch {
+      // Fall through to in-memory mirror when table is unmocked in unit tests.
+    }
+  }
+  const all = [...memoryHolds.values()];
+  return scopes ? all.filter((h) => scopes.includes(h.scope)) : all;
+}
+
+export function clearMemoryHoldsForTest(): void {
+  memoryHolds.clear();
 }
 
 const COLUMNS = '"scope"::text AS "scope", "paused", "reason", "source", "pausedUntil", "pausedBy", "version"';
@@ -118,7 +192,10 @@ async function readRows(scopes: ControlScope[]): Promise<ControlRow[]> {
 
 /** Effective state of an agent. Clears expired timed pauses on the way (best effort). */
 export async function getEffectiveControl(scope: AgentScope, now = new Date()): Promise<EffectiveControl> {
-  const rows = await readRows(['ALL', scope]);
+  const [rows, holds] = await Promise.all([
+    readRows(['ALL', scope]),
+    readHolds(['ALL', scope]),
+  ]);
   for (const row of rows) {
     if (isExpired(row, now)) {
       await expirePause(row.scope, now).catch((err) =>
@@ -126,7 +203,7 @@ export async function getEffectiveControl(scope: AgentScope, now = new Date()): 
       );
     }
   }
-  return effectiveFromRows(rows, scope, now);
+  return effectiveFromRows(rows, scope, now, holds);
 }
 
 function failClosed(err: unknown): never {
@@ -157,13 +234,16 @@ export async function assertAgentActiveLocked(scope: AgentScope, seenVersion?: n
   const now = new Date();
   let state: EffectiveControl;
   try {
-    const rows = await prisma.$transaction(async (tx) =>
-      tx.$queryRawUnsafe<ControlRow[]>(
-        `SELECT ${COLUMNS} FROM agent_controls WHERE "scope" IN ('ALL'::"AgentControlScope", $1::"AgentControlScope") FOR SHARE`,
-        scope,
+    const [rows, holds] = await Promise.all([
+      prisma.$transaction(async (tx) =>
+        tx.$queryRawUnsafe<ControlRow[]>(
+          `SELECT ${COLUMNS} FROM agent_controls WHERE "scope" IN ('ALL'::"AgentControlScope", $1::"AgentControlScope") FOR SHARE`,
+          scope,
+        ),
       ),
-    );
-    state = effectiveFromRows(rows, scope, now);
+      readHolds(['ALL', scope]),
+    ]);
+    state = effectiveFromRows(rows, scope, now, holds);
   } catch (err) {
     return failClosed(err);
   }
@@ -284,9 +364,76 @@ function notifyPaused(scope: ControlScope, source: PauseSource): void {
 
 /** Resumes exactly the named row; resuming TRADER never clears an ALL pause. */
 export async function resumeAgent(scope: ControlScope, p: { actor: string; reason?: string }): Promise<void> {
+  // Check for active spec_drift holds (#322): operator resume is refused with
+  // 409 SPEC_DRIFT_UNACKED while a spec_drift hold exists without an ack or
+  // while the latest compatibility report is still breaking.
+  if (p.actor !== 'system') {
+    const holds = await readHolds(scope === 'ALL' ? ['ALL'] : [scope, 'ALL']);
+    const driftHolds = holds.filter((h) => h.source === 'spec_drift' && (h.scope === scope || h.scope === 'ALL'));
+    if (driftHolds.length > 0) {
+      const { specCompatReport } = await import('./stellar/spec-compat');
+      const currentReport = specCompatReport();
+      const unacked = driftHolds.some((h) => h.ackRequired && !h.ackedBy);
+      const stillBreaking = currentReport !== null && !currentReport.ok;
+      if (unacked || stillBreaking) {
+        throw new AppError(
+          409,
+          'SPEC_DRIFT_UNACKED',
+          'Cannot resume agent while breaking contract spec drift is unacknowledged or still failing',
+          {
+            scope,
+            unacked,
+            stillBreaking,
+            holds: driftHolds.map((h) => ({ scope: h.scope, reason: h.reason, ackedBy: h.ackedBy })),
+          },
+        );
+      }
+      // Acknowledged and latest check passed: clear the spec_drift hold(s) on this scope.
+      for (const h of driftHolds) {
+        if (h.scope === scope) {
+          await releaseControlHold(scope, 'spec_drift', p.actor, p.reason);
+        }
+      }
+    }
+  }
+
+  const remainingHolds = (await readHolds([scope])).filter((h) => !(p.actor !== 'system' && h.source === 'operator'));
+  if (p.actor !== 'system') {
+    memoryHolds.delete(holdKey(scope, 'operator'));
+    const del = holdDelegate();
+    if (del) await del.deleteMany({ where: { scope: scope as any, source: 'operator' } }).catch(() => undefined);
+  }
+
   const resumed = await prisma.$transaction(async (tx) => {
     const before = await lockRow(tx, scope);
     if (!before || !before.paused) return false;
+    const fallbackHold = remainingHolds[0];
+    if (fallbackHold) {
+      // Another hold (e.g. spec_drift) is still active: keep the summary row paused under that hold.
+      const nextData = {
+        paused: true,
+        reason: fallbackHold.reason,
+        source: fallbackHold.source,
+        pausedUntil: null,
+        pausedBy: 'system',
+      };
+      await tx.agentControl.update({
+        where: { scope: scope as any },
+        data: { ...nextData, version: { increment: 1 } },
+      });
+      await tx.agentControlEvent.create({
+        data: {
+          scope: scope as any,
+          action: 'RESUME',
+          reason: p.reason ?? null,
+          source: 'operator',
+          actor: p.actor,
+          before: snapshot(before),
+          after: snapshot({ ...before, ...nextData, version: before.version + 1 }),
+        },
+      });
+      return false;
+    }
     await tx.agentControl.update({
       where: { scope: scope as any },
       data: { paused: false, reason: null, source: null, pausedUntil: null, pausedBy: null, version: { increment: 1 } },
@@ -308,6 +455,182 @@ export async function resumeAgent(scope: ControlScope, p: { actor: string; reaso
     logger.info({ scope, actor: p.actor }, 'Agent resumed');
     emitChange(scope, { paused: false, reason: null, pausedUntil: null });
   }
+}
+
+// ─── Control holds (#322) ────────────────────────────────────────────────────
+
+/**
+ * Places or updates a hold for `(scope, source)` without overwriting an
+ * existing operator pause, and bumps `agent_controls.version` so in-flight
+ * writes re-check under `FOR SHARE`.
+ */
+export async function placeControlHold(
+  scope: ControlScope,
+  p: { source: PauseSource; reason: string; ackRequired?: boolean; actor?: string },
+): Promise<ControlHoldRow> {
+  const now = new Date();
+  const actor = p.actor ?? 'system';
+  const hold: ControlHoldRow = {
+    scope,
+    source: p.source,
+    reason: p.reason,
+    createdAt: now,
+    ackRequired: Boolean(p.ackRequired),
+    ackedBy: null,
+  };
+  memoryHolds.set(holdKey(scope, p.source), hold);
+
+  const del = holdDelegate();
+  if (del) {
+    await del
+      .upsert({
+        where: { scope_source: { scope: scope as any, source: p.source } },
+        create: {
+          scope: scope as any,
+          source: p.source,
+          reason: p.reason,
+          createdAt: now,
+          ackRequired: Boolean(p.ackRequired),
+          ackedBy: null,
+        },
+        update: {
+          reason: p.reason,
+          ackRequired: Boolean(p.ackRequired),
+          ackedBy: null,
+        },
+      })
+      .catch(() => undefined);
+  }
+
+  const changed = await prisma.$transaction(async (tx) => {
+    const before = await lockRow(tx, scope);
+    const keepExistingSummary =
+      isActivePause(before, now) && before.source === 'operator' && p.source !== 'operator';
+    const data = keepExistingSummary
+      ? {
+          paused: true,
+          reason: before!.reason,
+          source: before!.source,
+          pausedUntil: before!.pausedUntil,
+          pausedBy: before!.pausedBy,
+        }
+      : {
+          paused: true,
+          reason: p.reason,
+          source: p.source,
+          pausedUntil: null,
+          pausedBy: actor,
+        };
+    await tx.agentControl.update({
+      where: { scope: scope as any },
+      data: { ...data, version: { increment: 1 } },
+    });
+    await tx.agentControlEvent.create({
+      data: {
+        scope: scope as any,
+        action: 'PAUSE',
+        reason: p.reason,
+        source: p.source,
+        actor,
+        before: snapshot(before),
+        after: snapshot({ scope, ...data, version: (before?.version ?? 0) + 1 }),
+      },
+    });
+    return data;
+  });
+
+  if (changed) {
+    logger.warn({ scope, source: p.source, ackRequired: hold.ackRequired }, 'Agent control hold placed');
+    emitChange(scope, changed);
+  }
+  return hold;
+}
+
+/** Marks all holds for `source` acknowledged by `actor`. */
+export async function acknowledgeControlHolds(source: PauseSource, actor: string): Promise<ControlHoldRow[]> {
+  for (const [k, h] of memoryHolds) {
+    if (h.source === source) {
+      memoryHolds.set(k, { ...h, ackedBy: actor });
+    }
+  }
+  const del = holdDelegate();
+  if (del) {
+    await del
+      .updateMany({
+        where: { source },
+        data: { ackedBy: actor },
+      })
+      .catch(() => undefined);
+  }
+  const all = await readHolds();
+  return all.filter((h) => h.source === source);
+}
+
+/**
+ * Releases a `(scope, source)` hold and updates the summary `agent_controls`
+ * row (resuming it only if no other pause/hold remains on that scope).
+ */
+export async function releaseControlHold(
+  scope: ControlScope,
+  source: PauseSource,
+  actor = 'system',
+  reason?: string,
+): Promise<boolean> {
+  const existed = memoryHolds.delete(holdKey(scope, source));
+  const del = holdDelegate();
+  let dbDeleted = 0;
+  if (del) {
+    const res = await del.deleteMany({ where: { scope: scope as any, source } }).catch(() => ({ count: 0 }));
+    dbDeleted = res.count;
+  }
+  if (!existed && dbDeleted === 0) return false;
+
+  const remaining = await readHolds([scope]);
+  const resumed = await prisma.$transaction(async (tx) => {
+    const before = await lockRow(tx, scope);
+    if (!before || !before.paused) return false;
+    // Keep operator pause intact if the summary row is currently held by operator
+    if (before.source === 'operator' && source !== 'operator') {
+      return false;
+    }
+    const nextHold = remaining[0];
+    if (nextHold) {
+      const nextData = {
+        paused: true,
+        reason: nextHold.reason,
+        source: nextHold.source,
+        pausedUntil: null,
+        pausedBy: 'system',
+      };
+      await tx.agentControl.update({
+        where: { scope: scope as any },
+        data: { ...nextData, version: { increment: 1 } },
+      });
+      return false;
+    }
+    await tx.agentControl.update({
+      where: { scope: scope as any },
+      data: { paused: false, reason: null, source: null, pausedUntil: null, pausedBy: null, version: { increment: 1 } },
+    });
+    await tx.agentControlEvent.create({
+      data: {
+        scope: scope as any,
+        action: actor === 'system' ? 'AUTO_RESUMED' : 'RESUME',
+        reason: reason ?? `hold ${source} cleared`,
+        source,
+        actor,
+        before: snapshot(before),
+        after: snapshot({ ...before, paused: false, reason: null, source: null, pausedUntil: null, pausedBy: null, version: before.version + 1 }),
+      },
+    });
+    return true;
+  });
+
+  if (resumed) {
+    logger.info({ scope, source, actor }, 'Agent control hold released and scope resumed');
+    emitChange(scope, { paused: false, reason: null, pausedUntil: null });
+  }
+  return true;
 }
 
 // ─── Failure breaker ─────────────────────────────────────────────────────────
@@ -345,11 +668,18 @@ export async function recordChainWriteOutcome(
   scope: AgentScope,
   ok: boolean,
   contractError: string | null,
+  errorDetail?: string | null,
 ): Promise<void> {
   try {
     if (ok) {
       await failureCounter.reset(scope);
       return;
+    }
+    const signalText = `${contractError ?? ''} ${errorDetail ?? ''}`;
+    if (/MissingValue|WasmVm/i.test(signalText)) {
+      import('./stellar/spec-monitor')
+        .then((m) => m.requestSpecCheck(`simulation_failure:${scope}`))
+        .catch(() => undefined);
     }
     if (contractError && CAP_ERRORS.has(contractError)) return;
     if (contractError === 'Paused') {
@@ -407,21 +737,24 @@ export async function gateCycle(scope: AgentScope): Promise<number> {
   return assertAgentActive(scope);
 }
 
-/** Admin view: effective state per scope plus the latest audit events. */
+/** Admin view: effective state per scope plus active holds and the latest audit events. */
 export async function controlsOverview(now = new Date()) {
-  const [rows, events] = await Promise.all([
+  const [rows, events, holds] = await Promise.all([
     readRows([...CONTROL_SCOPES]),
     prisma.agentControlEvent.findMany({ orderBy: { createdAt: 'desc' }, take: 20 }),
+    readHolds([...CONTROL_SCOPES]),
   ]);
   const scopes = CONTROL_SCOPES.map((scope) => {
     const row = rows.find((r) => r.scope === scope);
+    const scopeHolds = holds.filter((h) => h.scope === scope);
     const effective = scope === 'ALL'
-      ? isActivePause(row, now)
-      : effectiveFromRows(rows, scope, now).paused;
+      ? isActivePause(row, now) || scopeHolds.length > 0
+      : effectiveFromRows(rows, scope, now, holds).paused;
     return {
       scope,
       paused: effective,
       own: snapshot(row),
+      holds: scopeHolds,
     };
   });
   return { scopes, events };
