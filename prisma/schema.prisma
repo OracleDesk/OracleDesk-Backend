@@ -321,6 +321,7 @@ model Market {
   positions      Position[]
   hedgePositions Position[]          @relation("MarketHedgePositions")
   reasoningTraces ReasoningTrace[]
+  attestationEvidence AttestationEvidence[]
   copyTrades     CopyTrade[]
   agentDecisions AgentDecision[]
   agentLogs      AgentLog[]
@@ -1840,12 +1841,42 @@ model SignerAttestation {
   txHash          String?
   ledger          Int?
   error           String?
+  evidenceId      String?
+  evidenceTraceId BigInt?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
+  evidence        AttestationEvidence? @relation(fields: [evidenceId], references: [id], onDelete: SetNull)
   @@unique([onChainMarketId, signer, outcome])
   @@index([marketId])
+  @@index([evidenceId])
   @@map("signer_attestations")
+}
+
+/// Canonical, pinned evidence cited by a signer attestation (#323).
+model AttestationEvidence {
+  id              String   @id @default(uuid())
+  marketId        String
+  onChainMarketId BigInt
+  signer          String
+  outcome         String
+  bundleCid       String
+  bundleHash      String   @db.Char(64)
+  bundle          Json
+  traceTxXdr      String?
+  traceTxHash     String?
+  onChainTraceId  BigInt?
+  status          String   @default("BUNDLED")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  market          Market   @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  attestations    SignerAttestation[]
+
+  @@unique([onChainMarketId, signer, outcome, bundleHash])
+  @@index([marketId])
+  @@index([onChainTraceId])
+  @@map("attestation_evidence")
 }
 
 /// Independent review of one ResolutionProposed event (#92).
