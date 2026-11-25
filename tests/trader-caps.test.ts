@@ -140,7 +140,8 @@ test('budget read failure skips the cycle and logs TREASURY_READ_FAILED', async 
   (prisma.agentLog.create as any) = async ({ data }: any) => { logs.push(data); return data; };
   (prisma.agentDecision.upsert as any) = async ({ create }: any) => { decisions.push(create); return create; };
   try {
-    await prodTraderEnv().recordDecision(env.decisions[0]);
+    const { DEFAULT_PARAMS } = await import('../src/agents/trader-policy');
+    await prodTraderEnv(DEFAULT_PARAMS).recordDecision(env.decisions[0]);
     assert.equal(logs[0].action, 'TREASURY_READ_FAILED');
     assert.equal(logs[0].agentType, 'TRADER');
     assert.equal(decisions[0].reasonCode, 'TREASURY_READ_FAILED');

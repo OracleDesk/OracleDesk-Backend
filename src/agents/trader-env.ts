@@ -19,7 +19,7 @@ import { latestReserves, markOpenPositions, type MarketReserves } from '../servi
 import { getOnChainMarketCached, Outcomes, wouldTripBreaker } from '../services/chain.service';
 import { indexerLag, latestLedgerView, type IndexerLag } from '../services/chain-freshness.service';
 import type { PoolState } from '../services/impact-kelly';
-import { checkCorrelation } from '../services/correlation.service';
+import { checkCorrelation, type CorrelationRiskParams } from '../services/correlation.service';
 import { evidenceFromSignals, generateReasoningTrace } from '../services/reasoning.service';
 import type { ProvenanceEntry } from '../lib/llm/provenance';
 import { detectHedgeOpportunities, autoHedge, enforceStopLoss } from '../services/hedging.service';
@@ -169,7 +169,13 @@ export interface TraderEnv {
   /** Re-runs the forecaster on a position's market when a REFORECAST predicate triggers (#302). */
   reforecast?(position: PositionView, asOf: Date): Promise<{ ok: boolean; probabilityEstimate?: number; reason?: string }>;
   /** `bankroll` is the cycle's free treasury cash in USDC; the correlated-exposure cap is a share of it. */
-  correlation(marketId: string, size: number, direction: TradeDirection, bankroll: number): Promise<CorrelationCheckResult>;
+  correlation(
+    marketId: string,
+    size: number,
+    direction: TradeDirection,
+    bankroll: number,
+    limits?: CorrelationRiskParams,
+  ): Promise<CorrelationCheckResult>;
   hedges(): Promise<HedgeRecommendation[]>;
   hedge(rec: HedgeRecommendation): Promise<void>;
   buy(order: BuyOrder): Promise<ExecResult>;
@@ -230,7 +236,13 @@ export async function poolFromChain(onChainMarketId: bigint, deps: PoolDeps = de
 }
 
 /** Production env: Prisma, the chain service, the reasoning service and the wall clock. */
-export function prodTraderEnv(): TraderEnv {
+export function prodTraderEnv(params: import('./trader-policy').TraderParams): TraderEnv {
+  const hedging = {
+    stopLossBps: params.stopLossBps,
+    hedgeLossBps: params.hedgeLossBps,
+    maxDailyDrawdownPct: params.maxDailyDrawdownPct,
+    drawdownPauseHours: params.drawdownPauseHours,
+  };
   // One env per cycle, so one forecast budget per cycle (#75).
   const forecastSession = new ForecastSession();
   return {
@@ -315,25 +327,12 @@ export function prodTraderEnv(): TraderEnv {
       await markOpenPositions();
     },
 
-    stopLoss: (position) => enforceStopLoss(position.id),
+    stopLoss: (position) => enforceStopLoss(position.id, hedging),
 
-    evaluatePredicates: (position, asOf, cycleId) =>
-      evaluatePositionPredicates(position.id, asOf, cycleId),
+    correlation: (marketId, size, direction, bankroll, limits) =>
+      checkCorrelation(marketId, size, bankroll, { direction, limits }),
 
-    async reforecast(position) {
-      const market = await prisma.market.findUnique({ where: { id: position.marketId } });
-      if (!market || !market.question) {
-        return { ok: false, reason: 'MARKET_NOT_FOUND' };
-      }
-      const sigs = await aggregateSignals();
-      const result = await forecastMarket(market as ForecastMarket, sigs, forecastSession);
-      if (!result) return { ok: false, reason: 'FORECAST_UNAVAILABLE' };
-      return { ok: true, probabilityEstimate: result.forecast.p };
-    },
-
-    correlation: (marketId, size, direction, bankroll) => checkCorrelation(marketId, size, bankroll, { direction }),
-
-    hedges: () => detectHedgeOpportunities(),
+    hedges: () => detectHedgeOpportunities(hedging),
 
     async hedge(rec) {
       await autoHedge(rec);
@@ -383,6 +382,9 @@ export function prodTraderEnv(): TraderEnv {
           method:     order.correlation.method ?? 'matrix',
           snapshotId: order.correlation.snapshotId ?? null,
         },
+        ...(params.paramsVersion
+          ? { riskParams: { scope: 'TRADER', version: params.paramsVersion.version, hash: params.paramsVersion.hash } }
+          : {}),
       }, undefined, { upstreamProvenance: forecastProvenance });
 
       // Execute trade (Never abort between chain write and DB update)

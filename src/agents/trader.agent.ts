@@ -6,7 +6,8 @@ import { config } from '../config';
 import { deadline } from '../lib/resilience';
 import { shutdownController } from '../lib/shutdown';
 import { prodTraderEnv } from './trader-env';
-import { DEFAULT_PARAMS, runTraderPolicy } from './trader-policy';
+import { runTraderPolicy } from './trader-policy';
+import { snapshotTrader, traderParamsFromSnapshot } from '../services/risk-params.service';
 
 /**
  * Trader Agent — main execution loop.
@@ -38,16 +39,15 @@ export async function runTraderCycle(opts?: { signal?: AbortSignal }): Promise<{
     const handle = deadline('rpc-write', parentSignal, config.CYCLE_DEADLINE_MS);
     const signal = handle.signal;
 
-    try {
-      signal.throwIfAborted();
-      await runTraderPolicy(prodTraderEnv(), DEFAULT_PARAMS, { signal });
-      return { outcome: 'SUCCESS' };
-    } catch (err) {
-      logger.error({ err }, 'Trader Agent: unhandled cycle error');
-      await writeAgentLog({ agentType: 'TRADER', level: 'ERROR', action: 'CYCLE_FAILED', error: String(err) }).catch(() => {});
-      throw err;
-    } finally {
-      handle.cleanup?.();
-    }
-  });
+  try {
+    signal.throwIfAborted();
+    const snap = await snapshotTrader();
+    const params = traderParamsFromSnapshot(snap);
+    await runTraderPolicy(prodTraderEnv(params), params, { signal });
+  } catch (err) {
+    logger.error({ err }, 'Trader Agent: unhandled cycle error');
+    await writeAgentLog({ agentType: 'TRADER', level: 'ERROR', action: 'CYCLE_FAILED', error: String(err) });
+  } finally {
+    handle.cleanup?.();
+  }
 }

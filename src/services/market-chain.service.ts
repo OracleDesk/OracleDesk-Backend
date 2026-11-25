@@ -156,14 +156,17 @@ export interface SeedPlanInput {
   llmSuggestedSeedUsdc: number;
 }
 
-export function seedPolicyConfig(feeBps: number): SeedPolicyConfig {
+export function seedPolicyConfig(feeBps: number, mm?: import('../lib/risk-params').MarketMakerParamsV1): SeedPolicyConfig {
+  const source = mm ?? null;
   return {
-    lpLossBudgetRaw: config.LP_LOSS_BUDGET_RAW,
-    mmDailyShareBps: config.MM_DAILY_SHARE_BPS,
-    maxSeedFractionBps: config.MAX_SEED_FRACTION_BPS,
-    maxUnresolvedSeededRaw: config.MAX_UNRESOLVED_SEEDED_RAW,
-    categoryBaseUsdc: config.SEED_CATEGORY_BASE_USDC,
+    lpLossBudgetRaw: source ? BigInt(source.lpLossBudgetRaw) : config.LP_LOSS_BUDGET_RAW,
+    mmDailyShareBps: source?.mmDailyShareBps ?? config.MM_DAILY_SHARE_BPS,
+    maxSeedFractionBps: source?.maxSeedFractionBps ?? config.MAX_SEED_FRACTION_BPS,
+    maxUnresolvedSeededRaw: source ? BigInt(source.maxUnresolvedSeededRaw) : config.MAX_UNRESOLVED_SEEDED_RAW,
+    categoryBaseUsdc: source?.categoryBaseUsdc ?? config.SEED_CATEGORY_BASE_USDC,
     feeBps,
+    ciWidthForFullShrink: source?.ciWidthForFullShrink,
+    shrinkMax: source?.shrinkMax,
   };
 }
 
@@ -225,7 +228,11 @@ export async function readSeedBudget(now: Date) {
  * Decides the seed and opening price for a proposal before anything is
  * pinned or written. A budget read failure fails closed: no seed, no market.
  */
-export async function planMarketCreation(input: SeedPlanInput, now: Date = clockNow()): Promise<SeedDecision> {
+export async function planMarketCreation(
+  input: SeedPlanInput,
+  now: Date = clockNow(),
+  mm?: import('../lib/risk-params').MarketMakerParamsV1,
+): Promise<SeedDecision> {
   let read;
   try {
     read = await readSeedBudget(now);
@@ -244,7 +251,7 @@ export async function planMarketCreation(input: SeedPlanInput, now: Date = clock
       budget: read.budget,
       unresolvedSeededRaw: read.unresolvedSeededRaw,
     },
-    seedPolicyConfig(read.feeBps),
+    seedPolicyConfig(read.feeBps, mm),
   );
 }
 
