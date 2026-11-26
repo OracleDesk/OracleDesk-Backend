@@ -259,10 +259,11 @@ model Market {
   positions      Position[]
   hedgePositions Position[]          @relation("MarketHedgePositions")
   reasoningTraces ReasoningTrace[]
+  attestationEvidence AttestationEvidence[]
   copyTrades     CopyTrade[]
   agentLogs      AgentLog[]
   creationAttempt MarketCreationAttempt?
-  resolutionSteps MarketResolutionStep[]
+  lpPosition      LpPosition?
 
   @@index([status])
   @@index([category])
@@ -274,32 +275,31 @@ model Market {
   @@map("markets")
 }
 
-/// Persisted per-market resolver step state for outbox-tracked writes (#297).
-model MarketResolutionStep {
-  id            String    @id @default(uuid())
-  marketId      String
-  /// PRICE_SPEC | RESOLVE_PRICE | SIGNER_SPEC | ATTEST | FINALIZE_SIGNERS
-  step          String
-  /// PENDING | IN_FLIGHT | LANDED | LANDED_EXTERNALLY | FAILED | ESCALATED
-  status        String    @default("PENDING")
-  attempts      Int       @default(0)
-  nextAttemptAt DateTime?
-  escalatedAt   DateTime?
-  txHash        String?
-  ledger        Int?
-  outcome       String?
-  failureCode   String?
-  /// AGENT | EXTERNAL
-  landedBy      String?
-  lastOutboxId  String?
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
+/// Treasury-owned liquidity seeded when the market maker creates a market.
+/// Fee and valuation fields remain nullable until the deployed market-core
+/// exposes the corresponding LP ledger entries.
+model LpPosition {
+  marketId          String   @id
+  onChainMarketId   BigInt   @unique
+  seedRaw           Decimal  @db.Decimal(39, 0)
+  openBps           Int
+  creatorYesRaw     Decimal  @db.Decimal(39, 0)
+  creatorNoRaw      Decimal  @db.Decimal(39, 0)
+  protocolShareBps  Int?
+  lpFeesAccruedRaw  Decimal  @default(0) @db.Decimal(39, 0)
+  lpFeesOnChainRaw  Decimal? @db.Decimal(39, 0)
+  lpFeesClaimedRaw  Decimal  @default(0) @db.Decimal(39, 0)
+  markValueRaw      Decimal? @db.Decimal(39, 0)
+  settledValueRaw   Decimal? @db.Decimal(39, 0)
+  expectedLpLossRaw Decimal? @db.Decimal(39, 0)
+  status            String   @default("OPEN")
+  lastEventLedger   Int?
+  updatedAt         DateTime @updatedAt @db.Timestamptz(3)
 
   market Market @relation(fields: [marketId], references: [id], onDelete: Cascade)
 
-  @@unique([marketId, step])
-  @@index([step, status, nextAttemptAt])
-  @@map("market_resolution_steps")
+  @@index([status])
+  @@map("lp_positions")
 }
 
 // Background job for market generation process, tracking status and errors
@@ -1370,6 +1370,28 @@ model ChainTransaction {
   @@map("chain_transactions")
 }
 
+/// Reservation ledger for rolling fee budgets. One reservation has one row per
+/// configured window so settlement/release is idempotent across workers.
+model FeeSpendEntry {
+  id            String    @id @default(uuid())
+  reservationId String
+  opClass       String
+  windowSeconds Int
+  windowStart   DateTime  @db.Timestamptz(3)
+  windowEnd     DateTime  @db.Timestamptz(3)
+  amount        BigInt
+  status        String    @default("RESERVED")
+  settledAmount BigInt?
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime  @updatedAt @db.Timestamptz(3)
+  settledAt     DateTime?
+
+  @@unique([reservationId, windowSeconds])
+  @@index([opClass, windowStart, windowEnd, status])
+  @@index([reservationId, status])
+  @@map("fee_spend_entries")
+}
+
 /// On-chain fees recorded per transaction (#39, #308).
 model ChainFee {
   txHash               String   @id @map("tx_hash")
@@ -1561,12 +1583,42 @@ model SignerAttestation {
   txHash          String?
   ledger          Int?
   error           String?
+  evidenceId      String?
+  evidenceTraceId BigInt?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
+  evidence        AttestationEvidence? @relation(fields: [evidenceId], references: [id], onDelete: SetNull)
   @@unique([onChainMarketId, signer, outcome])
   @@index([marketId])
+  @@index([evidenceId])
   @@map("signer_attestations")
+}
+
+/// Canonical, pinned evidence cited by a signer attestation (#323).
+model AttestationEvidence {
+  id              String   @id @default(uuid())
+  marketId        String
+  onChainMarketId BigInt
+  signer          String
+  outcome         String
+  bundleCid       String
+  bundleHash      String   @db.Char(64)
+  bundle          Json
+  traceTxXdr      String?
+  traceTxHash     String?
+  onChainTraceId  BigInt?
+  status          String   @default("BUNDLED")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  market          Market   @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  attestations    SignerAttestation[]
+
+  @@unique([onChainMarketId, signer, outcome, bundleHash])
+  @@index([marketId])
+  @@index([onChainTraceId])
+  @@map("attestation_evidence")
 }
 
 /// Independent review of one ResolutionProposed event (#92).

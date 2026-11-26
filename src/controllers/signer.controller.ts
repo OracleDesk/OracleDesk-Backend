@@ -6,6 +6,8 @@ import {
   prepareBodySchema,
   prepareQuerySchema,
   submitBodySchema,
+  evidenceBundleSchema,
+  evidenceIdSchema,
 } from '../validators/signer.validator';
 import {
   getEvidence,
@@ -13,6 +15,9 @@ import {
   listAwaiting,
   prepareAttestation,
   submitAttestation,
+  createEvidenceBundle,
+  prepareEvidenceTrace,
+  submitEvidenceTrace,
 } from '../services/signer-portal.service';
 
 function wallet(req: Request): string {
@@ -42,12 +47,31 @@ export async function signerEvidence(req: Request, res: Response): Promise<void>
   sendSuccess(res, await getEvidence(marketId(req), wallet(req)));
 }
 
+/** POST /signer/markets/:marketId/evidence/bundle */
+export async function createSignerEvidenceBundle(req: Request, res: Response): Promise<void> {
+  const input = parse(evidenceBundleSchema.safeParse(req.body), 'outcome and evidence sources are required');
+  sendSuccess(res, await createEvidenceBundle(marketId(req), wallet(req), input), 201);
+}
+
+/** POST /signer/markets/:marketId/evidence/:evidenceId/publish/prepare */
+export async function prepareSignerEvidenceTrace(req: Request, res: Response): Promise<void> {
+  const { evidenceId } = parse(evidenceIdSchema.safeParse(req.params), 'Invalid evidence id');
+  sendSuccess(res, await prepareEvidenceTrace(marketId(req), wallet(req), evidenceId));
+}
+
+/** POST /signer/markets/:marketId/evidence/:evidenceId/publish/submit */
+export async function submitSignerEvidenceTrace(req: Request, res: Response): Promise<void> {
+  const { evidenceId } = parse(evidenceIdSchema.safeParse(req.params), 'Invalid evidence id');
+  const { xdr, traceId } = parse(submitBodySchema.safeParse(req.body), 'xdr is required');
+  sendSuccess(res, await submitEvidenceTrace(marketId(req), wallet(req), evidenceId, xdr, traceId));
+}
+
 /** POST /signer/markets/:marketId/attest/prepare */
 export async function prepareSignerAttestation(req: Request, res: Response): Promise<void> {
   const id = marketId(req);
-  const { outcome } = parse(prepareBodySchema.safeParse(req.body), 'outcome must be YES or NO');
+  const { outcome, evidenceId } = parse(prepareBodySchema.safeParse(req.body), 'outcome must be YES or NO');
   const { allowConflict } = parse(prepareQuerySchema.safeParse(req.query), 'allowConflict must be true or false');
-  sendSuccess(res, await prepareAttestation(id, wallet(req), outcome, { allowConflict }));
+  sendSuccess(res, await prepareAttestation(id, wallet(req), outcome, { allowConflict, evidenceId }));
 }
 
 /** POST /signer/markets/:marketId/attest/submit */

@@ -363,6 +363,10 @@ export const envObjectSchema = z
     // live: writes are signed with AGENT_SECRET_KEY and submitted (testnet only).
     CHAIN_EXECUTION_MODE: z.enum(['dry-run', 'live']).default('dry-run'),
     AGENT_SECRET_KEY: optionalString,
+    // Optional per-scope identities. When unset, the shared agent remains the
+    // safe backwards-compatible fallback.
+    AGENT_MAKER_SECRET_KEY: optionalString,
+    AGENT_TRADER_SECRET_KEY: optionalString,
 
     // ── Source-account sequencing (#36) ───────────────────────────────────
     // Live writes take a fenced per-account lock in Redis before allocating a
@@ -436,6 +440,9 @@ export const envObjectSchema = z
 
     // ── Fee policies (#39) ───────────────────────────────────────────────
     FEE_POLICY_JSON: optionalString,
+    // Shape: { "trade": [{ "windowSeconds": 3600, "budget": "25000000" }] }.
+    FEE_SPEND_BUDGETS_JSON: optionalString,
+    FEE_SPEND_ENFORCE: z.enum(['true', 'false']).default('false').transform((v) => v === 'true'),
     FEE_STATS_CACHE_MS: z.string().default('10000').transform(Number).pipe(z.number().int().positive()),
     FEE_STATS_MAX_AGE_MS: z.string().default('60000').transform(Number).pipe(z.number().int().positive()),
 
@@ -566,6 +573,7 @@ export const envObjectSchema = z
     TRUST_INBOUND_REQUEST_ID: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
     INDEXER_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
     INDEXER_POLL_MS: z.string().default('5000').transform(Number),
+    INDEXER_START_LEDGER: z.string().optional().transform((v) => (v !== undefined && v !== '' ? Number(v) : undefined)).pipe(z.number().int().positive().optional()),
 
 
     // ── Health probes (#111) ──────────────────────────────────────────────
@@ -1096,6 +1104,27 @@ export const envSchema = envObjectSchema
         });
       }
     }
+    const scopedKeys = [
+      ['AGENT_MAKER_SECRET_KEY', env.AGENT_MAKER_SECRET_KEY],
+      ['AGENT_TRADER_SECRET_KEY', env.AGENT_TRADER_SECRET_KEY],
+    ] as const;
+    const keyValues = new Map<string, string>();
+    for (const [name, value] of scopedKeys) {
+      if (!value) continue;
+      if (!StrKey.isValidEd25519SecretSeed(value)) {
+        ctx.addIssue({ code: 'custom', path: [name], message: 'must be a Stellar secret seed (S…)' });
+        continue;
+      }
+      if (value === env.AGENT_SECRET_KEY) {
+        ctx.addIssue({ code: 'custom', path: [name], message: 'must differ from AGENT_SECRET_KEY when configured' });
+      }
+      const previous = keyValues.get(value);
+      if (previous) {
+        ctx.addIssue({ code: 'custom', path: [name], message: `must differ from ${previous}` });
+      } else {
+        keyValues.set(value, name);
+      }
+    }
     if (env.FEE_BUMP_ENABLED) {
       if (!env.FEE_PAYER_SECRET) {
         ctx.addIssue({ code: 'custom', path: ['FEE_PAYER_SECRET'], message: 'is required when FEE_BUMP_ENABLED=true' });
@@ -1289,6 +1318,34 @@ export const envSchema = envObjectSchema
       } catch {
         ctx.addIssue({ code: 'custom', path: ['FEE_POLICY_JSON'], message: 'must be valid JSON' });
       }
+    }
+    if (env.FEE_SPEND_BUDGETS_JSON) {
+      try {
+        const parsed = JSON.parse(env.FEE_SPEND_BUDGETS_JSON);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          ctx.addIssue({ code: 'custom', path: ['FEE_SPEND_BUDGETS_JSON'], message: 'must be a JSON object' });
+        } else {
+          const validClasses = ['market_create', 'trade', 'trace_publish', 'maintenance'];
+          for (const [opClass, value] of Object.entries(parsed)) {
+            if (!validClasses.includes(opClass)) {
+              ctx.addIssue({ code: 'custom', path: ['FEE_SPEND_BUDGETS_JSON', opClass], message: `unknown operation class: ${opClass}` });
+              continue;
+            }
+            const windows = Array.isArray(value) ? value : [value];
+            for (const window of windows) {
+              const item = window as any;
+              if (!item || typeof item !== 'object' || !/^\d+$/.test(String(item.windowSeconds ?? '')) || Number(item.windowSeconds) < 1 || !/^\d+$/.test(String(item.budget ?? ''))) {
+                ctx.addIssue({ code: 'custom', path: ['FEE_SPEND_BUDGETS_JSON', opClass], message: 'each window needs positive integer windowSeconds and non-negative integer budget' });
+              }
+            }
+          }
+        }
+      } catch {
+        ctx.addIssue({ code: 'custom', path: ['FEE_SPEND_BUDGETS_JSON'], message: 'must be valid JSON' });
+      }
+    }
+    if (env.FEE_SPEND_ENFORCE && !env.FEE_SPEND_BUDGETS_JSON) {
+      ctx.addIssue({ code: 'custom', path: ['FEE_SPEND_BUDGETS_JSON'], message: 'is required when FEE_SPEND_ENFORCE=true' });
     }
   });
 

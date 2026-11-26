@@ -98,7 +98,22 @@ export const rpcServer = wrapRpcServer(
   'rpcServer',
 );
 
-type Signer = Pick<ClientOptions, 'publicKey' | 'signTransaction' | 'signAuthEntry'>;
+export type Signer = Pick<ClientOptions, 'publicKey' | 'signTransaction' | 'signAuthEntry'>;
+export type SignerRole = 'MARKET_MAKER' | 'TRADER' | 'OPS';
+
+function secretFor(role: SignerRole): string | undefined {
+  return role === 'MARKET_MAKER'
+    ? (config.AGENT_MAKER_SECRET_KEY || config.AGENT_SECRET_KEY)
+    : role === 'TRADER'
+      ? (config.AGENT_TRADER_SECRET_KEY || config.AGENT_SECRET_KEY)
+      : config.AGENT_SECRET_KEY;
+}
+
+export function agentKeypair(role: SignerRole): Keypair {
+  const secret = secretFor(role);
+  if (!secret) throw new Error(`${role} signer is not configured`);
+  return Keypair.fromSecret(secret);
+}
 
 export function baseOptions(contractId: string, signer: Signer = {}): ClientOptions {
   return {
@@ -123,21 +138,36 @@ export const readClients = {
 /**
  * The agent identity used for writes.
  *
- * live: the key in AGENT_SECRET_KEY signs.
+ * live: the ops key signs. Scoped writes use signerFor(role).
  * dry-run: transactions are simulated with the agent's public key as the
  * source (from AGENT_SECRET_KEY if set, otherwise the agent recorded in the
  * deployments file) and no signer is attached, so nothing can be signed.
  */
 export function agentSigner(): Signer {
+  return signerFor('OPS');
+}
+
+/** Resolve the identity for a write scope without breaking single-key installs. */
+export function signerFor(role: SignerRole): Signer {
+  const secret = secretFor(role);
   if (config.CHAIN_EXECUTION_MODE === 'live') {
-    const keypair = Keypair.fromSecret(config.AGENT_SECRET_KEY);
+    if (!secret) throw new Error(`${role} signer is not configured`);
+    const keypair = agentKeypair(role);
     const { signTransaction, signAuthEntry } = basicNodeSigner(keypair, config.STELLAR_NETWORK_PASSPHRASE);
     return { publicKey: keypair.publicKey(), signTransaction, signAuthEntry };
   }
-  const publicKey = config.AGENT_SECRET_KEY
-    ? Keypair.fromSecret(config.AGENT_SECRET_KEY).publicKey()
+  const publicKey = secret
+    ? agentKeypair(role).publicKey()
     : DEPLOYED_AGENT;
   return { publicKey };
+}
+
+export function agentAddresses(): Record<SignerRole, string> {
+  return {
+    MARKET_MAKER: signerFor('MARKET_MAKER').publicKey as string,
+    TRADER: signerFor('TRADER').publicKey as string,
+    OPS: signerFor('OPS').publicKey as string,
+  };
 }
 
 export const agentClients = {

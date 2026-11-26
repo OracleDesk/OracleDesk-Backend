@@ -352,6 +352,7 @@ or the contract rejected the authorization), `503 AUTH_UNAVAILABLE` /
   "resolutionSpec": { "kind": "signers", "threshold": 1, "disputeWindow": 3600, "signers": ["G…"] },
   "createdAt": "…",
   "marketUrl": null,
+  "indexerStale": false,
   "_count": { "trades": 0, "reasoningTraces": 1, "positions": 0 }
 }
 ```
@@ -359,7 +360,9 @@ or the contract rejected the authorization), `503 AUTH_UNAVAILABLE` /
 `onChainAddress` (Arc) is removed. Prices, reserves and on-chain status come
 from market-core; the frontend reads them directly with
 `get_market(onChainMarketId)`. `currentYesProb` and `totalLiquidity` are the
-backend's cached display values and can lag the chain.
+backend's cached display values and can lag the chain. `indexerStale` (#10) is a
+boolean indicating whether unresolved indexer ledger gaps exist behind RPC retention;
+when `true`, backend prices, trade volumes, and liquidity metrics may lag the chain.
 
 **Seed and opening price (#82).** `seedAmountRaw` is the treasury capital
 (7-decimal base units, decimal string) that `treasury.agent_create_market` put
@@ -1729,6 +1732,56 @@ Returns Reflector feed health for every open price-mode market (`ACTIVE` / `RESO
   ]
 }
 ```
+
+### Indexer ledger gaps (admin auth, #10)
+
+#### `GET /admin/indexer/gaps` (auth, `admin.read`)
+
+Lists recorded indexer ledger gaps (#10) with pagination.
+
+Query parameters:
+- `open`: optional boolean string (`"true"` for open/unresolved gaps where `resolvedAt` is null; `"false"` for resolved gaps). Omit to return all gaps.
+- `page`: page number (default 1).
+- `limit`: items per page (default 20, max 100).
+
+Response: `IndexerGap[]`, with pagination in `meta`:
+
+```json
+[
+  {
+    "id": "uuid",
+    "network": "testnet",
+    "fromLedger": 5000000,
+    "toLedger": 5001200,
+    "detectedAt": "2026-11-23T10:00:00.000Z",
+    "resolvedAt": null,
+    "resolvedBy": null,
+    "note": null
+  }
+]
+```
+
+#### `PATCH /admin/indexer/gaps/:id/resolve` (auth, `admin.manage`)
+
+Marks an open indexer ledger gap as resolved (#10) after manual backfill or verification.
+
+Request body:
+```json
+{
+  "resolvedBy": "operator-name",
+  "note": "Backfilled via offline archive script"
+}
+```
+
+- `resolvedBy`: required non-empty string identifying the operator or tool.
+- `note`: optional string explaining the resolution or backfill details.
+
+Response `200 OK`: the updated `IndexerGap` object.
+
+Errors:
+- `400 VALIDATION_ERROR`: `resolvedBy` is missing or empty.
+- `404 NOT_FOUND`: Gap ID not found.
+- `409 ALREADY_RESOLVED`: Gap was already marked resolved.
 
 ### Treasury admin console (auth, admin)
 

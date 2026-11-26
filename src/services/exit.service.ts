@@ -40,6 +40,7 @@ import type { Market as OnChainMarket } from '../generated/market-core';
 import {
   Outcomes,
   agentSell,
+  closeTrade,
   getBreakerConfig,
   getBreakerState,
   getOnChainMarket,

@@ -100,6 +100,8 @@ Stellar Soroban fees follow a two-part model:
 
 Overrides can be provided at boot via `FEE_POLICY_JSON`.
 
+Rolling fee spend budgets are disabled by default. Set `FEE_SPEND_ENFORCE=true` and configure `FEE_SPEND_BUDGETS_JSON` as an operation-class map of windows, for example `{"trade":[{"windowSeconds":3600,"budget":"25000000"}]}`. Reservations are held in the PostgreSQL fee-spend ledger while a transaction is in flight, settled with the charged fee, and released on failure or expiry. Advisory locks serialize reservations across API and worker instances; a budget trip pauses the affected agent with source `fee_budget`.
+
 **Budget Enforcement and Calibration**:
 Before any live transaction is signed, `minResourceFee` is checked against the class budget. If it exceeds the budget, execution halts immediately with `FEE_BUDGET_EXCEEDED` (carrying simulation details and no secrets). In dry-run mode, the breach is logged as a warning and simulation continues.
 To calibrate budgets for production:
@@ -153,22 +155,35 @@ All submissions are tracked in `chain_submissions` (`tx_hash`, `op_class`, `min_
 To allow concurrent writes by autonomous agent workers without sequence collisions, the backend maintains a pool of channel accounts (`src/services/stellar/channels.ts`):
 
 - **Lease Coordination**: Channel accounts are leased across processes using Redis exclusive keys (`channel:lease:<public_key>`, `SET NX PX` with a Lua compare-and-delete release). Round-robin acquisition with jittered backoff distributes load.
-- **Signer Composition**: A leased channel serves as the transaction source account (signing the outer transaction envelope with `basicNodeSigner(channelKeypair)`). Privileged contract invocations require invocation authentication signed by the agent key (`AGENT_SECRET_KEY`).
+- **Signer Composition**: A leased channel serves as the transaction source account (signing the outer transaction envelope with `basicNodeSigner(channelKeypair)`). Privileged contract invocations require invocation authentication signed by the scoped agent key. `AGENT_MAKER_SECRET_KEY` and `AGENT_TRADER_SECRET_KEY` are optional and fall back to `AGENT_SECRET_KEY`; resolver and registry maintenance remain on the ops key.
 - **Simulated Auth Verification**: Before signing, auth entries from simulation are decoded: `needsNonInvokerSigningBy()` must return strictly the agent's public key (or empty); credentials must be address credentials for the agent; and the root invocation must match the expected method without unexpected sub-invocations.
 - **Expiration and Re-simulation**: Auth entries are signed with an expiration ledger derived from the transaction deadline (`authExpirationLedger` from #42). The transaction is re-simulated after signing auth entries to account for signature verification footprint before the channel signs the envelope.
 - **Lease Retention**: The channel account remains leased until the transaction leaves `PENDING` (confirming `LANDED`, `FAILED`, `EXPIRED`, or `UNKNOWN`), preventing sequence skew from lagging RPC nodes.
 - **Balance Monitoring**: A periodic background monitor inspects on-chain XLM balances via RPC, automatically removing channels below `CHANNEL_MIN_BALANCE_XLM` (default: 5 XLM) from rotation and emitting warnings with public keys only.
 - **Dry-run and Fallback**: In `dry-run` or when no channels are configured (`CHANNEL_SECRET_KEYS` empty), `write()` uses the agent account as source and skips leasing completely.
 
-## Market creation (ADR 0001)
+## Market creation (ADR 0001, #217)
 
-`market-chain.service.ts` turns a generated proposal into an on-chain market:
+`market-chain.service.ts` splits market creation into two distinct exported phases:
 
-1. Build a signer-mode resolution spec (`RESOLUTION_SIGNERS`, default the agent).
-2. Hash it as `sha256(XDR(ResolutionSpec))` with the resolver binding's own spec (`lib/resolution-spec.ts`). Tests check this against the contracts repo's Rust `spec-hash` tool.
-3. Store the full spec and its hash next to the market, so anyone can later reveal it to `resolver.register_signer_spec`.
-4. Pin the canonical question JSON; `question_hash` is the sha256 of those exact bytes and `meta_uri` is `ipfs://<cid>`.
-5. Call `treasury.agent_create_market`. In live mode the returned id becomes `onChainMarketId` and the market goes `ACTIVE`; in dry-run it stays `PENDING`.
+1. **Phase 1: Commitment Preparation (`prepareMarketCommitment`)**:
+   - Computes the resolution spec hash `sha256(XDR(ResolutionSpec))` with the resolver binding's spec (`lib/resolution-spec.ts`). If the market already has a stored `resolutionHash`, creation verifies that it matches (`RESOLUTION_HASH_MISMATCH` if altered).
+   - Validates question integrity against canonical document bytes: if `market.questionHash` is set, verifies that the document's sha256 matches (`QUESTION_HASH_MISMATCH` if question text or metadata was modified after the initial pin).
+   - Enforces pin reuse: if `market.questionHash` and `market.metaUri` are already populated, reuses them (`reusedPin: true`) without invoking IPFS pinning or transport.
+   - If not yet pinned, pins the canonical JSON document to IPFS once (`ipfs://${cid}`) and persists `questionHash`, `metaUri`, `resolutionHash`, `resolutionSpec`, and `seedAmountRaw` using an atomic conditional update (`where: { id, questionHash: null }`). If a concurrent worker persisted first, the row is re-read and verified.
+   - Reuses any stored `seedAmountRaw` across retries so `readSeedBudget` accounting invariants are strictly preserved.
+   - Persistence occurs in both live and dry-run modes, ensuring dry-run markets commit to verifiable hashes.
+
+2. **Phase 2: Chain Submission (`submitMarketCreation`)**:
+   - Takes `PreparedMarketCommitment` from Phase 1.
+   - Acquires the atomic creation lease (60 s) in `market_creation_attempts`.
+   - Runs discovery first (`discoverLandedMarket`) to check if the market already landed on-chain across prior ambiguous outcomes.
+   - Records pre-submission `marketCount` and moves attempt status to `SUBMITTED`.
+   - Submits `treasury.agent_create_market` via the transactional outbox with reference `{ kind: 'market.create', refId: market.id }`.
+   - Classifies errors: preserves `SUBMITTED` state and records `txHash` on `ChainPendingError`; logs `SEED_CAP_RACE` on cap races; and runs immediate recovery discovery across other failures.
+   - In live mode, links the landed market and reveals price resolution specs for price-mode markets. In dry-run mode, releases the claim and returns simulated results while leaving the market `PENDING`.
+
+`createMarketOnChain` is a thin convenience wrapper that invokes `prepareMarketCommitment` followed by `submitMarketCreation`.
 
 ### Idempotent market creation across ambiguous outcomes (#41)
 
@@ -178,7 +193,7 @@ Because market creation locks treasury capital (`seed_amount`), duplicate creati
 2. **Atomic Claim & Fencing**: An attempt record is created in `market_creation_attempts` with `INSERT ... ON CONFLICT DO NOTHING` followed by `SELECT ... FOR UPDATE`. Stale or retried attempts increment the `attempts` counter with a fencing check, preventing split-brain execution across slow or resumed workers.
 3. **Discovery Before Submission**: Before calling the treasury, the backend checks if the market already exists on-chain:
    - Queries RPC `getTransaction` if a `txHash` is stored on the attempt.
-   - Searches indexed `MarketCreated` events in `chain_events` matching `question_hash` where `creator` is the treasury contract.
+   - Searches indexed `MarketCreated` events in `chain_events` where `contractName: 'marketCore'` and `creator === CONTRACTS.treasury` (event params contain `market_id`, `creator`, `close_time`, `seed_amount`, and `initial_yes_bps`, but not `question_hash`; confirmation is performed against the on-chain market).
    - Executes a bounded backwards scan of on-chain markets (`marketCount` downwards up to 50 markets).
    Every candidate is confirmed by reading `get_market` and validating that `question_hash`, `resolution_hash`, and `creator === treasury` match. If found, it links immediately without submitting.
 4. **Pre-Submission Count**: Before submitting, the current on-chain `market_count` is recorded with the attempt.
@@ -536,7 +551,9 @@ indexer ──publish──▶ Redis Stream (oracledesk:events) ──▶ one fa
 `indexer.service.ts` polls Stellar RPC `getEvents` for the four contract ids every `INDEXER_POLL_MS`:
 
 - Events are decoded with each binding's spec (`Spec.parseEvent`) and stored in `chain_events` keyed by the RPC event id, so re-reads are idempotent.
-- The ledger cursor lives in `indexer_cursors`. If it is older than RPC retention (about 7 days on testnet), the indexer warns and resumes from the oldest retained ledger; anything in between is lost to it.
+- The ledger cursor lives in `indexer_cursors`.
+- **Ledger Gap Recording (#10)**: Rather than silently skipping unindexed ledgers when the cursor or requested start falls behind RPC retention, pure planner `planStart` classifies the startup state (`resume`, `idle`, or `gap`). When a gap occurs (`RETENTION` if a previously running cursor fell behind, or `INITIAL` if cold-booting behind retention with `INDEXER_START_LEDGER`), `backfillEvents` atomically creates/upserts an `indexer_gaps` record (`network`, `fromLedger`, `toLedger`, `kind`) and advances the cursor to `health.oldestLedger - 1` in a single Postgres transaction.
+- **Taint Model & API Staleness**: `openGaps()` queries unresolved gaps for the current network. `isTainted()` checks whether any gap impacts a query range (or the whole indexer). Serialized markets surface `indexerStale: boolean` computed once per request. Operators inspect and resolve gaps through `GET /api/v1/admin/indexer/gaps` and `PATCH /api/v1/admin/indexer/gaps/:id/resolve`.
 - New `Trade` and `TracePublished` events are published to the event bus and delivered to clients over socket.io as `TRADE_EXECUTED` and `REASONING_PUBLISHED` (see [Event bus and socket fan-out](#event-bus-and-socket-fan-out-93)).
 - `ResolutionProposed` and `ResolutionFinalized` open and close dispute reviews (see [Disputes and guardian actions](#disputes-and-guardian-actions)). The independent evaluation never runs inside the poll.
 

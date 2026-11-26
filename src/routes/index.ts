@@ -13,6 +13,7 @@ import schemasRoutes   from './schemas.routes';
 import x402AllowanceRoutes from './x402-allowance.routes';
 import leaderboardRoutes from './leaderboard.routes';
 import { noStore } from '../middlewares/cache.middleware';
+import signerRoutes from './signer.routes';
 
 const router = Router();
 
@@ -35,6 +36,7 @@ router.use('/reports',   reportRoutes);
 router.use('/agents',    agentsRoutes);
 router.use('/account',   accountRoutes);
 router.use('/schemas',   schemasRoutes);
+router.use('/signer',    signerRoutes);
 router.use('/x402/allowance', x402AllowanceRoutes);
 router.use('/',          leaderboardRoutes);
 

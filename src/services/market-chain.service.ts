@@ -14,6 +14,7 @@ import { logger } from '../lib/logger';
 import { toContractCategory, toContractCategoryValue } from '../lib/categories';
 import { usdcFromNumber } from '../lib/amounts';
 import { resolutionHash, type ResolutionSpecJson } from '../lib/resolution-spec';
+import { canonicalBytes, sha256Hex } from '../utils/hash.util';
 import { writeAgentLog } from '../lib/agent-log';
 import {
   agentCreateMarket,
@@ -241,10 +242,22 @@ export async function planMarketCreation(input: SeedPlanInput, now: Date = clock
 
 const CAP_RACE_ERRORS = new Set(['TradeCapExceeded', 'MarketCapExceeded', 'DailyCapExceeded']);
 
+export interface PreparedMarketCommitment {
+  spec: ResolutionSpecJson;
+  resolutionHashBytes: Buffer;
+  resolutionHashHex: string;
+  questionHash: string; // sha256 hex of the pinned bytes
+  questionCid: string;
+  metaUri: string; // ipfs://<cid>
+  seedRaw: bigint;
+  initialYesBps: number;
+  reusedPin: boolean;
+}
+
 /**
- * Creates the market on-chain. With a `plan` (the normal path) the seed and
- * opening price come from the seed policy. Without one (admin tooling) the old
- * computation applies: the market's minimumLiquidity, floored at MIN_SEED.
+ * Resolves the seed amount and opening price for a market creation (#217).
+ * If a seedAmountRaw was already stored on the market row from a previous attempt,
+ * reuses that stored seed to preserve the readSeedBudget accounting invariant.
  */
 /** Everything a creation attempt commits to, computed locally and deterministically (#328). */
 export interface MarketCommitment {
@@ -270,6 +283,12 @@ export async function prepareMarketCommitment(
 ): Promise<MarketCommitment> {
   const resolutionHashBytes = resolutionHash(spec);
   const resolutionHashHex = resolutionHashBytes.toString('hex');
+
+  // Spec must not change between attempts because discovery matches on it (#217)
+  if (market.resolutionHash && market.resolutionHash.toLowerCase().replace(/^0x/, '') !== resolutionHashHex.toLowerCase().replace(/^0x/, '')) {
+    throw new AppError(409, 'RESOLUTION_HASH_MISMATCH', 'Market resolutionHash does not match computed resolution hash');
+  }
+
   const doc = questionDocument(market, resolutionHashHex, spec);
   const docName = `oracledesk-market-${market.id}`;
   const prepared = prepareDocument(doc, docName);
@@ -290,28 +309,78 @@ export async function submitMarketCreation(
   const { spec, resolutionHashBytes, resolutionHashHex, doc, docName } = commitment;
   const pinned = { hash: commitment.questionHash, cid: commitment.questionCid };
 
+  let finalQuestionHash = pinned.hash;
+  let finalMetaUri = `ipfs://${pinned.cid}`;
+  let finalCid = pinned.cid;
+  let finalSeedRaw = seedRaw;
+
+  const updated = await prisma.market.updateMany({
+    where: { id: market.id, questionHash: null },
+    data: {
+      resolutionSpec: spec as object,
+      resolutionHash: resolutionHashHex,
+      questionHash: pinned.hash,
+      metaUri: `ipfs://${pinned.cid}`,
+      seedAmountRaw: seedRaw.toString(),
+    },
+  });
+
+  if (updated.count === 0) {
+    // Another worker persisted first: re-read the row
+    const fresh = await prisma.market.findUnique({ where: { id: market.id } });
+    if (!fresh) {
+      throw new AppError(404, 'MARKET_NOT_FOUND', 'Market not found');
+    }
+    if (fresh.questionHash && fresh.questionHash.toLowerCase() !== pinned.hash.toLowerCase()) {
+      throw new AppError(409, 'QUESTION_HASH_MISMATCH', 'Re-pinned question document produced a hash different from stored questionHash');
+    }
+    finalQuestionHash = fresh.questionHash ?? pinned.hash;
+    finalMetaUri = fresh.metaUri ?? `ipfs://${pinned.cid}`;
+    finalCid = finalMetaUri.startsWith('ipfs://') ? finalMetaUri.slice(7) : pinned.cid;
+    if (fresh.seedAmountRaw != null) {
+      finalSeedRaw = BigInt(fresh.seedAmountRaw);
+    }
+  }
+
+  return {
+    spec,
+    resolutionHashBytes,
+    resolutionHashHex,
+    questionHash: finalQuestionHash,
+    questionCid: finalCid,
+    metaUri: finalMetaUri,
+    seedRaw: finalSeedRaw,
+    initialYesBps,
+    reusedPin: false,
+  };
+}
+
+/**
+ * Phase 2 of market creation (#217): claims the market, runs discovery first,
+ * submits to chain via agentCreateMarket with outbox ref, handles errors and recovery.
+ */
+export async function submitMarketCreation(
+  market: Market,
+  prep: PreparedMarketCommitment,
+): Promise<WriteResult<bigint>> {
   // ── Dry-run path: claim and discover, but never move attempt past CLAIMED (#41) ──
   if (config.CHAIN_EXECUTION_MODE === 'dry-run') {
     const { acquired } = await claimCreation(market.id);
     try {
       await discoverLandedMarket({
         marketId: market.id,
-        questionHashHex: pinned.hash,
-        resolutionHashHex,
+        questionHashHex: prep.questionHash,
+        resolutionHashHex: prep.resolutionHashHex,
       });
 
-      const requested = usdcFromNumber(market.minimumLiquidity);
-      const seed = plan ? plan.seedRaw : requested < MIN_SEED_RAW ? MIN_SEED_RAW : requested;
-      const openBps = plan ? plan.initialYesBps : initialYesBps(market.initialYesProb);
-
       const result = await agentCreateMarket({
-        question_hash: Buffer.from(pinned.hash, 'hex'),
-        resolution_hash: resolutionHashBytes,
-        meta_uri: `ipfs://${pinned.cid}`,
+        question_hash: Buffer.from(prep.questionHash, 'hex'),
+        resolution_hash: prep.resolutionHashBytes,
+        meta_uri: prep.metaUri,
         category: toContractCategoryValue(market.category),
         close_time: BigInt(Math.floor(market.expiryTimestamp.getTime() / 1000)),
-        seed_amount: seed,
-        initial_yes_bps: openBps,
+        seed_amount: prep.seedRaw,
+        initial_yes_bps: prep.initialYesBps,
       });
 
       logger.info(
@@ -336,8 +405,8 @@ export async function submitMarketCreation(
   // Always run discovery first before submitting
   const discoveredId = await discoverLandedMarket({
     marketId: market.id,
-    questionHashHex: pinned.hash,
-    resolutionHashHex,
+    questionHashHex: prep.questionHash,
+    resolutionHashHex: prep.resolutionHashHex,
     txHash: attempt?.tx_hash,
     preSubmissionCount: attempt?.pre_submission_market_count,
   });
@@ -381,12 +450,17 @@ export async function submitMarketCreation(
       where: { marketId: market.id },
       data: {
         preSubmissionMarketCount: preCount,
-        questionHash: pinned.hash,
-        resolutionHash: resolutionHashHex,
+        questionHash: prep.questionHash,
+        resolutionHash: prep.resolutionHashHex,
         status: 'SUBMITTED',
       },
     });
-  } catch {}
+  } catch (err: any) {
+    logger.warn(
+      { marketId: market.id, err: err instanceof Error ? err.message : String(err) },
+      'Failed to read pre-submission marketCount or update attempt to SUBMITTED',
+    );
+  }
 
   let result: WriteResult<bigint>;
   try {
@@ -397,8 +471,8 @@ export async function submitMarketCreation(
         meta_uri: metaUri,
         category: toContractCategoryValue(market.category),
         close_time: BigInt(Math.floor(market.expiryTimestamp.getTime() / 1000)),
-        seed_amount: seed,
-        initial_yes_bps: openBps,
+        seed_amount: prep.seedRaw,
+        initial_yes_bps: prep.initialYesBps,
       },
       undefined,
       { kind: 'market.create', refId: market.id },
@@ -434,8 +508,8 @@ export async function submitMarketCreation(
     try {
       const recoveredId = await discoverLandedMarket({
         marketId: market.id,
-        questionHashHex: pinned.hash,
-        resolutionHashHex,
+        questionHashHex: prep.questionHash,
+        resolutionHashHex: prep.resolutionHashHex,
         txHash,
         preSubmissionCount: preCount,
       });
@@ -453,7 +527,7 @@ export async function submitMarketCreation(
     if (err instanceof ChainError && err.contractError && CAP_RACE_ERRORS.has(err.contractError)) {
       await writeAgentLog({
         agentType: 'MARKET_MAKER', level: 'WARN', action: 'SEED_CAP_RACE', marketId: market.id,
-        data: { contractError: err.contractError, seedRaw: seed.toString() },
+        data: { contractError: err.contractError, seedRaw: prep.seedRaw.toString() },
       }).catch(() => undefined);
     }
     throw err;
@@ -473,8 +547,9 @@ export async function submitMarketCreation(
     // #90: a price market is unusable until its spec is revealed. Reveal right
     // after creation; on failure the periodic reveal pass retries, so the market
     // simply stays Unconfigured until then.
-    if (spec.kind === 'price') {
+    if (prep.spec.kind === 'price') {
       try {
+        await revealPriceSpec(result.value, prep.spec);
         await revealPriceSpec(result.value, spec, { marketId: market.id });
         logger.info({ marketId: market.id, onChainMarketId: result.value.toString() }, 'Price spec revealed');
       } catch (err) {

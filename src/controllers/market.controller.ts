@@ -23,13 +23,14 @@ import {
 import { AppError } from '../middlewares/error.middleware';
 import { assertAgentActive } from '../services/agent-controls.service';
 import { freshnessMeta } from '../lib/freshness';
+import { openGaps, isTainted } from '../services/indexer/gaps';
 
 
 const jobTracker: Map<string, JobRecord> = new Map();
 
-/** Adds the contract category. BigInts are stringified by the app's JSON replacer. */
-function serializeMarket<T extends { category: MarketCategory }>(market: T) {
-  return { ...market, contractCategory: toContractCategory(market.category) };
+/** Adds the contract category and indexer freshness status (#10). BigInts are stringified by the app's JSON replacer. */
+function serializeMarket<T extends { category: MarketCategory }>(market: T, indexerStale = false) {
+  return { ...market, contractCategory: toContractCategory(market.category), indexerStale };
 }
 
 const marketDetailInclude = {
@@ -137,9 +138,12 @@ export async function listMarkets(
     prisma.market.count({ where }),
   ]);
 
+  const gaps = await openGaps().catch(() => []);
+  const indexerStale = isTainted(gaps);
+
   sendSuccess(
     res,
-    markets.map(serializeMarket),
+    markets.map((m) => serializeMarket(m, indexerStale)),
     200,
     { ...(buildPaginationMeta(page, limit, total) as any), ...(await freshnessMeta(
       'indexed',
@@ -172,7 +176,10 @@ export async function getMarket(
     return;
   }
 
-  sendSuccess(res, serializeMarket(market), 200, await freshnessMeta('indexed', market.chainSyncedLedger));
+  const gaps = await openGaps().catch(() => []);
+  const indexerStale = isTainted(gaps);
+
+  sendSuccess(res, serializeMarket(market, indexerStale), 200, await freshnessMeta('indexed', market.chainSyncedLedger));
 }
 
 /**
@@ -191,7 +198,11 @@ export async function getMarketByOnChainId(req: Request, res: Response): Promise
     sendError(res, 404, 'MARKET_NOT_FOUND', `No backend market for on-chain id ${raw}`);
     return;
   }
-  sendSuccess(res, serializeMarket(market), 200, await freshnessMeta('indexed', market.chainSyncedLedger));
+
+  const gaps = await openGaps().catch(() => []);
+  const indexerStale = isTainted(gaps);
+
+  sendSuccess(res, serializeMarket(market, indexerStale), 200, await freshnessMeta('indexed', market.chainSyncedLedger));
 }
 
 /**

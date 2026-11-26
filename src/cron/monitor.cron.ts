@@ -186,7 +186,6 @@ async function sweepCopyTrades(): Promise<void> {
             continue;
           }
         }
-      }
 
         // Otherwise verify via RPC
         const outcome = (ct as any).outcome === 'YES' ? 'Yes' : 'No';
@@ -228,10 +227,9 @@ async function sweepCopyTrades(): Promise<void> {
         }
       }
     }
+  } catch (err) {
+    logger.error({ err }, 'Copy trade sweep failed');
+  } finally {
+    sweepRunning = false;
   }
-
-  return {
-    outcome: 'SUCCESS',
-    counters: { checked: confirming.length, confirmed, pending, failed },
-  };
 }

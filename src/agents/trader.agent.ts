@@ -17,15 +17,18 @@ import { DEFAULT_PARAMS, runTraderPolicy } from './trader-policy';
  * history. This function only adds the cycle deadline and failure logging.
  */
 export async function runTraderCycle(opts?: { signal?: AbortSignal }): Promise<{ outcome: 'SUCCESS' | 'SKIPPED_PAUSED' }> {
-  logger.info('Trader Agent: starting cycle');
+  return withCallerClass('agent', async () => {
+    logger.info('Trader Agent: starting cycle');
 
-  // Persistent kill switch / pause (#79): a paused agent is an expected state.
-  try {
-    await gateCycle('TRADER');
-  } catch (err) {
-    if (err instanceof AgentPausedError) {
-      logger.info({ ...err.details }, 'Trader Agent: paused — skipping cycle');
-      return { outcome: 'SKIPPED_PAUSED' };
+    // Persistent kill switch / pause (#79): a paused agent is an expected state.
+    try {
+      await gateCycle('TRADER');
+    } catch (err) {
+      if (err instanceof AgentPausedError) {
+        logger.info({ ...err.details }, 'Trader Agent: paused — skipping cycle');
+        return { outcome: 'SKIPPED_PAUSED' };
+      }
+      throw err;
     }
 
     const parentSignal = opts?.signal
@@ -35,15 +38,16 @@ export async function runTraderCycle(opts?: { signal?: AbortSignal }): Promise<{
     const handle = deadline('rpc-write', parentSignal, config.CYCLE_DEADLINE_MS);
     const signal = handle.signal;
 
-  try {
-    signal.throwIfAborted();
-    await runTraderPolicy(prodTraderEnv(), DEFAULT_PARAMS, { signal });
-    return { outcome: 'SUCCESS' };
-  } catch (err) {
-    logger.error({ err }, 'Trader Agent: unhandled cycle error');
-    await writeAgentLog({ agentType: 'TRADER', level: 'ERROR', action: 'CYCLE_FAILED', error: String(err) }).catch(() => {});
-    throw err;
-  } finally {
-    handle.cleanup?.();
-  }
+    try {
+      signal.throwIfAborted();
+      await runTraderPolicy(prodTraderEnv(), DEFAULT_PARAMS, { signal });
+      return { outcome: 'SUCCESS' };
+    } catch (err) {
+      logger.error({ err }, 'Trader Agent: unhandled cycle error');
+      await writeAgentLog({ agentType: 'TRADER', level: 'ERROR', action: 'CYCLE_FAILED', error: String(err) }).catch(() => {});
+      throw err;
+    } finally {
+      handle.cleanup?.();
+    }
+  });
 }
