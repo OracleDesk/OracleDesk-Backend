@@ -363,6 +363,10 @@ export const envObjectSchema = z
     // live: writes are signed with AGENT_SECRET_KEY and submitted (testnet only).
     CHAIN_EXECUTION_MODE: z.enum(['dry-run', 'live']).default('dry-run'),
     AGENT_SECRET_KEY: optionalString,
+    // Optional per-scope identities. When unset, the shared agent remains the
+    // safe backwards-compatible fallback.
+    AGENT_MAKER_SECRET_KEY: optionalString,
+    AGENT_TRADER_SECRET_KEY: optionalString,
 
     // ── Source-account sequencing (#36) ───────────────────────────────────
     // Live writes take a fenced per-account lock in Redis before allocating a
@@ -1092,6 +1096,27 @@ export const envSchema = envObjectSchema
           path: ['STELLAR_NETWORK_PASSPHRASE'],
           message: 'live mode is testnet-only; use the testnet passphrase',
         });
+      }
+    }
+    const scopedKeys = [
+      ['AGENT_MAKER_SECRET_KEY', env.AGENT_MAKER_SECRET_KEY],
+      ['AGENT_TRADER_SECRET_KEY', env.AGENT_TRADER_SECRET_KEY],
+    ] as const;
+    const keyValues = new Map<string, string>();
+    for (const [name, value] of scopedKeys) {
+      if (!value) continue;
+      if (!StrKey.isValidEd25519SecretSeed(value)) {
+        ctx.addIssue({ code: 'custom', path: [name], message: 'must be a Stellar secret seed (S…)' });
+        continue;
+      }
+      if (value === env.AGENT_SECRET_KEY) {
+        ctx.addIssue({ code: 'custom', path: [name], message: 'must differ from AGENT_SECRET_KEY when configured' });
+      }
+      const previous = keyValues.get(value);
+      if (previous) {
+        ctx.addIssue({ code: 'custom', path: [name], message: `must differ from ${previous}` });
+      } else {
+        keyValues.set(value, name);
       }
     }
     if (env.FEE_BUMP_ENABLED) {

@@ -1,7 +1,6 @@
 import { Router } from 'express';
 import { requireAuth, requirePermission, requireStepUp } from '../middlewares/auth.middleware';
 import {
-  ackAlert,
   ackDispute,
   ackSpecCompat,
   addOperationSignature,
@@ -12,13 +11,15 @@ import {
   getAdminRoles,
   getAdmins,
   getAgentControls,
-  getAlerts,
+  getAgentKeys,
+  getAgentDecisions,
+  getAgentDecisionCycles,
+  getAgentDecisionCycleFunnel,
   getReconciliationRun,
   getSpecCompat,
   getChainSigningKeys,
   registerChainSigningKey,
   retireChainSigningKey,
-  silenceAlert,
   getSystemStatus,
   getChainFeesReport,
   getExecutionQuality,
@@ -40,21 +41,6 @@ import {
   triggerReconciliationRun,
   triggerTraceAuditRun,
   voidDisputeTx,
-  listChainTransactions,
-  getChainTransaction,
-  recoverChainTransaction,
-  rerunChainTransactionHandler,
-  abandonChainTransaction,
-  getIndexerGaps,
-  resolveIndexerGap,
-  getAgentDecisions,
-  getAgentDecisionCycles,
-  getAgentDecisionCycleFunnel,
-  getCronRuns,
-  listMoneyAuditRuns,
-  listMoneyAuditFindings,
-  triggerMoneyAuditRun,
-  ackMoneyAuditFinding,
 } from '../controllers/admin.controller';
 
 const router = Router();
@@ -82,6 +68,7 @@ router.post('/treasury/operations/:id/submit', requirePermission('treasury.opera
 router.post('/treasury/operations/:id/record', requirePermission('treasury.operate'), requireStepUp, recordTreasuryOperation);
 router.post('/treasury/operations/:id/cancel', requirePermission('treasury.operate'), requireStepUp, cancelTreasuryOperation);
 router.get('/agents/controls', requirePermission('agents.manage'), getAgentControls);
+router.get('/agents/keys', requirePermission('agents.manage'), getAgentKeys);
 router.get('/agent-decisions', requirePermission('admin.read'), getAgentDecisions);
 router.get('/agent-decisions/cycles', requirePermission('admin.read'), getAgentDecisionCycles);
 router.get('/agent-decisions/cycles/:cycleId', requirePermission('admin.read'), getAgentDecisionCycleFunnel);
@@ -100,24 +87,12 @@ router.post('/trace-audit/run', requirePermission('trace_audit.run'), triggerTra
 router.get('/reconciliation/runs', requirePermission('reconciliation.run'), listReconciliationRuns);
 router.get('/reconciliation/runs/:id', requirePermission('reconciliation.run'), getReconciliationRun);
 router.post('/reconciliation/run', requirePermission('reconciliation.run'), triggerReconciliationRun);
-// Money audit (#222): guarded only; acknowledging needs step-up.
-router.get('/money-audit/runs', requirePermission('reconciliation.run'), listMoneyAuditRuns);
-router.get('/money-audit/runs/:id/findings', requirePermission('reconciliation.run'), listMoneyAuditFindings);
-router.post('/money-audit/run', requirePermission('reconciliation.run'), triggerMoneyAuditRun);
-router.post('/money-audit/findings/:id/ack', requirePermission('reconciliation.run'), requireStepUp, ackMoneyAuditFinding);
 // Spec compatibility report from the boot gate (#34): read-only diagnostics.
 router.get('/chain/spec-compat', requirePermission('admin.read'), getSpecCompat);
 // Agent trace signing keys (#273): permission- and step-up-guarded only.
 router.get('/chain/signing-keys', requirePermission('chain.signing_keys'), requireStepUp, getChainSigningKeys);
 router.post('/chain/signing-keys/register', requirePermission('chain.signing_keys'), requireStepUp, registerChainSigningKey);
 router.post('/chain/signing-keys/:publicKey/retire', requirePermission('chain.signing_keys'), requireStepUp, retireChainSigningKey);
-// Admin outbox console (#221). The actions write their own audit row (outbox
-// id, kind, from/to status, reason, hashes), so they opt out of the generic one.
-router.get('/chain/transactions', requirePermission('chain.outbox.read'), listChainTransactions);
-router.get('/chain/transactions/:id', requirePermission('chain.outbox.read'), getChainTransaction);
-router.post('/chain/transactions/:id/recover', requirePermission('chain.outbox.operate', { audit: false }), requireStepUp, recoverChainTransaction);
-router.post('/chain/transactions/:id/rerun-handler', requirePermission('chain.outbox.operate', { audit: false }), requireStepUp, rerunChainTransactionHandler);
-router.post('/chain/transactions/:id/abandon', requirePermission('chain.outbox.operate', { audit: false }), requireStepUp, abandonChainTransaction);
 router.get('/treasury', getTreasury);
 router.get('/treasury/operations', listTreasuryOperations);
 router.post('/treasury/operations', createOperation);
@@ -162,29 +137,5 @@ router.get('/generation-runs/:id', requirePermission('markets.generate'), getGen
 router.post('/generation-runs', requirePermission('markets.generate'), requireStepUp, startGenerationRun);
 router.post('/generation-runs/:id/cancel', requirePermission('markets.generate'), requireStepUp, cancelGenerationRun);
 router.post('/generation-runs/:id/retry', requirePermission('markets.generate'), requireStepUp, retryGenerationRun);
-
-// Learned source weight sets (#223). The service writes its own audit row in
-// the same transaction as each change, so these opt out of the request audit.
-import {
-  activateSourceWeightSet,
-  approveSourceWeightSet,
-  getSourceWeightSet,
-  listSourceWeightSets,
-  rollbackSourceWeightSet,
-  getLlmCanaryStatus,
-  overrideLlmDemotion,
-} from '../controllers/admin.controller';
-router.get('/source-weights', requirePermission('admin.read'), listSourceWeightSets);
-router.post('/source-weights/rollback', requirePermission('agents.weights.approve', { audit: false }), requireStepUp, rollbackSourceWeightSet);
-router.get('/source-weights/:id', requirePermission('admin.read'), getSourceWeightSet);
-router.post('/source-weights/:id/approve', requirePermission('agents.weights.approve', { audit: false }), requireStepUp, approveSourceWeightSet);
-router.post('/source-weights/:id/activate', requirePermission('agents.weights.approve', { audit: false }), requireStepUp, activateSourceWeightSet);
-
-// Indexer ledger gaps (#10)
-router.get('/indexer/gaps', requirePermission('admin.read'), getIndexerGaps);
-router.patch('/indexer/gaps/:id/resolve', requirePermission('admin.manage'), resolveIndexerGap);
-// LLM drift canary & model demotions (#296)
-router.get('/llm/canary', requirePermission('admin.read'), getLlmCanaryStatus);
-router.post('/llm/demotions', requirePermission('agents.manage'), requireStepUp, overrideLlmDemotion);
 
 export default router;

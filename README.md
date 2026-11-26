@@ -64,7 +64,7 @@ All variables are listed and explained in [.env.example](.env.example). Everythi
 
 Key switches:
 
-- `CHAIN_EXECUTION_MODE=dry-run` (default): every contract write is built and simulated, logged, and never signed. `live` signs with `AGENT_SECRET_KEY` and is refused on any network but testnet.
+- `CHAIN_EXECUTION_MODE=dry-run` (default): every contract write is built and simulated, logged, and never signed. `live` signs with `AGENT_SECRET_KEY` (or the optional `AGENT_MAKER_SECRET_KEY` / `AGENT_TRADER_SECRET_KEY` for scoped writes) and is refused on any network but testnet.
 - `PAYMENTS_RECIPIENT`: where daily-pass payments must go. Defaults to the treasury contract; see [docs/STATUS.md](docs/STATUS.md) before relying on that.
 - `ADMIN_ADDRESSES`: G-addresses allowed to trigger market generation.
 - `SECRETS_PROVIDER`: `env` (default), `file` (`<NAME>_FILE` mounts) or
