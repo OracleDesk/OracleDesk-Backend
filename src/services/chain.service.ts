@@ -366,8 +366,8 @@ async function submitWrite<T>(
     // A pause that landed while the transaction was being built stops here.
     await assertAgentActiveLocked(scope, seenVersion);
 
-    const minResourceFee = BigInt((tx.simulation as any)?.minResourceFee ?? '0');
-    const expectedTotal = inclusionFee + minResourceFee;
+    let minResourceFee = BigInt((tx.simulation as any)?.minResourceFee ?? '0');
+    let expectedTotal = inclusionFee + minResourceFee;
 
     if (minResourceFee > policy.budget) {
       if (config.CHAIN_EXECUTION_MODE === 'dry-run') {
@@ -433,6 +433,37 @@ async function submitWrite<T>(
       if (typeof (tx as any).simulate === 'function') {
         await withTimeout('rpc-read', () => (tx as any).simulate(), { signal });
       }
+
+      // Signing auth entries changes the footprint and therefore the fees and
+      // timebounds.  All live-write decisions must use this final simulation.
+      const finalSimulation = (tx as any).simulation ?? {};
+      minResourceFee = BigInt(finalSimulation.minResourceFee ?? '0');
+      expectedTotal = inclusionFee + minResourceFee;
+      if (minResourceFee > policy.budget && config.CHAIN_EXECUTION_MODE !== 'dry-run') {
+        throw new ChainError(
+          `Final resource fee ${minResourceFee.toString()} exceeds budget ${policy.budget.toString()} for ${opClass}`,
+          'FEE_BUDGET_EXCEEDED',
+          { opClass, minResourceFee: minResourceFee.toString(), budget: policy.budget.toString() },
+        );
+      }
+      const finalBuiltFee = (tx as any)?.built?.fee;
+      if (finalBuiltFee !== undefined && finalBuiltFee !== null && BigInt(finalBuiltFee) !== expectedTotal) {
+        throw new ChainError(`${method} final fee does not match its simulation`, 'FEE_SIMULATION_MISMATCH', {
+          expectedTotal: expectedTotal.toString(),
+          builtFee: String(finalBuiltFee),
+        });
+      }
+      const finalMaxTime = (tx as any)?.built?.timeBounds?.maxTime;
+      if (finalMaxTime === undefined || finalMaxTime === null || BigInt(finalMaxTime) === 0n) {
+        throw new ChainError(`${method} final simulation removed its timebounds`, 'TIMEBOUND_SIMULATION_MISMATCH', { method });
+      }
+      if (BigInt(finalMaxTime) !== maxTime) {
+        throw new ChainError(`${method} final simulation changed its timebounds`, 'TIMEBOUND_SIMULATION_MISMATCH', {
+          initialMaxTime: maxTime.toString(),
+          finalMaxTime: String(finalMaxTime),
+        });
+      }
+      verifyChannelAuthEntries(tx, agentPub, method);
     }
 
     const feeDetails: FeeDetails = {
@@ -1656,6 +1687,11 @@ const agentSellImpl = (
     agentClients.treasury(signer).agent_sell(args, opts as any), signal, ref,
   );
 
+const closeTradeImpl = (marketId: bigint, signal?: AbortSignal, ref?: WriteRef) =>
+  write<bigint>('TRADER', 'trade', 'treasury', 'close_trade', { market_id: marketId }, async (opts, signer) =>
+    agentClients.treasury(signer).close_trade({ market_id: marketId }, opts as any), signal, ref,
+  );
+
 const publishTraceImpl = (args: {
   agent: string;
   market_id: bigint;
@@ -1760,6 +1796,7 @@ const IMPLS = {
   agentCreateMarket: agentCreateMarketImpl,
   agentBuy: agentBuyImpl,
   agentSell: agentSellImpl,
+  closeTrade: closeTradeImpl,
   publishTrace: publishTraceImpl,
   registerSignerSpec: registerSignerSpecImpl,
   attest: attestImpl,
@@ -1807,6 +1844,7 @@ export const usdcBalance = overridable('usdcBalance');
 export const agentCreateMarket = overridable('agentCreateMarket');
 export const agentBuy = overridable('agentBuy');
 export const agentSell = overridable('agentSell');
+export const closeTrade = overridable('closeTrade');
 export const publishTrace = overridable('publishTrace');
 export const marketCoreConfig = overridable('marketCoreConfig');
 export const getPosition = overridable('getPosition');

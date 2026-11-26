@@ -15,6 +15,7 @@ export { checkETagMatch };
 
 export async function authClass(req: Request): Promise<string> {
   const user = (req as any).user;
+  if (req.headers['x-oracledesk-entitlement']) return 'entitlement';
   if (!user?.userId) {
     if (req.headers.authorization) return 'auth-header';
     return 'anon';
@@ -47,7 +48,7 @@ export function cachePolicy(
       const originalWriteHead = res.writeHead;
       res.writeHead = function (this: Response, statusCode: number, ...args: any[]) {
         const is2xx = statusCode >= 200 && statusCode < 300;
-        const hasAuth = Boolean(req.headers.authorization);
+        const hasAuth = Boolean(req.headers.authorization || req.headers['x-oracledesk-entitlement']);
 
         if (!is2xx) {
           res.setHeader('Cache-Control', 'private, no-store');
@@ -116,7 +117,7 @@ export function validator(compute: (req: Request) => Promise<string | null>): Re
       if (ifNoneMatch && checkETagMatch(ifNoneMatch, etag)) {
         res.setHeader('ETag', etag);
         const policy: CachePolicy = res.locals.cachePolicy ?? { kind: 'shared', maxAge: 5, swr: 30 };
-        const hasAuth = Boolean(req.headers.authorization);
+        const hasAuth = Boolean(req.headers.authorization || req.headers['x-oracledesk-entitlement']);
 
         if (policy.kind === 'no-store') {
           res.setHeader('Cache-Control', 'private, no-store');
@@ -128,6 +129,7 @@ export function validator(compute: (req: Request) => Promise<string | null>): Re
             res.setHeader('Cache-Control', `private, max-age=${maxAge}`);
           }
           res.append('Vary', 'Authorization');
+          if (req.headers['x-oracledesk-entitlement']) res.append('Vary', 'X-OracleDesk-Entitlement');
         } else if (policy.kind === 'immutable') {
           res.setHeader('Cache-Control', `public, max-age=${policy.maxAge}, immutable`);
         } else if (policy.kind === 'shared') {

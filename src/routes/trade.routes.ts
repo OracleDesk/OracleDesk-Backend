@@ -1,5 +1,13 @@
 import { Router } from 'express';
-import { initiateCopyTrade, confirmCopyTrade, quoteCopyTrade } from '../controllers/trade.controller';
+import {
+  initiateCopyTrade,
+  confirmCopyTrade,
+  getCopyTradeHistory,
+  getCopyTrade,
+  getCopyTradeSummary,
+  quoteCopyTrade,
+} from '../controllers/trade.controller';
+ 
 import { requireAuth } from '../middlewares/auth.middleware';
 import { idempotent } from '../middlewares/idempotency.middleware';
 
@@ -9,5 +17,8 @@ const router = Router();
 router.get('/copy/quote',         requireAuth, quoteCopyTrade);
 router.post('/copy',              requireAuth, idempotent({ required: true }), initiateCopyTrade);
 router.patch('/copy/:id/confirm', requireAuth, idempotent(), confirmCopyTrade);
+router.get('/copy/summary', requireAuth, getCopyTradeSummary);
+router.get('/copy', requireAuth, getCopyTradeHistory);
+router.get('/copy/:id', requireAuth, getCopyTrade);
 
 export default router;
