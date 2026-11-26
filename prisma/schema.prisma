@@ -1786,6 +1786,11 @@ model DisputeReview {
   confidence         Float?
   evidence           Json?
   evidenceHash       String?
+    /// Decision-independent digest of the ordered evidence shown to the evaluator.
+    manifestHash       String?
+    /// Hash of the evaluator prompt inputs used for this review.
+    promptHash         String?
+    evaluatedAt        DateTime?
   acknowledgedBy     String?
   acknowledgedAt     DateTime?
   /// FINALIZED | CANCELLED | null

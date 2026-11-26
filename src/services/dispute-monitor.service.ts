@@ -367,12 +367,18 @@ export async function reviewProposal(id: string, deps: MonitorDeps): Promise<Dis
   }
 
   const stored: ReviewNotes = { items, ...(reason ? { reason } : {}), attempts };
+  const manifestItems = items.map(({ cited: _cited, ...item }) => item);
+  const manifestHash = sha256Hex(canonicalJson({ items: manifestItems }));
+  const promptHash = sha256Hex(canonicalJson({ question: doc.question, closeTime: doc.closeTime, resolutionSource: doc.resolutionSource, evidence: manifestItems }));
   review = await save(id, {
     verdict,
     independentOutcome: result.outcome,
     confidence: result.confidence,
     evidence: stored as unknown as Prisma.InputJsonValue,
     evidenceHash: sha256Hex(canonicalJson(items)),
+    manifestHash,
+    promptHash,
+    evaluatedAt: new Date(),
   });
   await dispatchAlerts(review, deps);
   return review;
