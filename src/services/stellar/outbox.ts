@@ -33,6 +33,8 @@ import { RedisUnavailableError, getRedis, releaseLock, renewLock } from '../../l
 import { readClients, rpcServer } from './clients';
 import { contractErrorName } from './errors';
 import { FeeBumpCapExceeded, buildFeeBump, innerInclusionPerOp, planBump } from './fee-bump';
+import { FeeSpendBudgetExceeded, releaseSpend, reserveSpend, settleSpend } from './fee-spend';
+import type { OperationClass } from './fees';
 import { decideExpiry, type ExpiryDecision } from './timebounds';
 
 export type OutboxStatus = 'BUILT' | 'SIGNED' | 'SUBMITTED' | 'PENDING' | 'SUCCESS' | 'FAILED' | 'EXPIRED';
@@ -73,6 +75,18 @@ export interface ChainTransactionRow {
   error: string | null;
   handledAt: Date | null;
   updatedAt?: Date;
+}
+
+async function settleBumpReservations(row: ChainTransactionRow, amount: bigint): Promise<void> {
+  for (const envelope of Array.isArray(row.feeBumpEnvelopes) ? row.feeBumpEnvelopes as Array<{ reservationId?: string; reservedAmount?: string }> : []) {
+    if (envelope.reservationId) await settleSpend(envelope.reservationId, envelope.reservedAmount ? BigInt(envelope.reservedAmount) : amount).catch((err) => logger.warn({ err, reservationId: envelope.reservationId }, 'outbox: could not settle bump reservation'));
+  }
+}
+
+async function releaseBumpReservations(row: ChainTransactionRow): Promise<void> {
+  for (const envelope of Array.isArray(row.feeBumpEnvelopes) ? row.feeBumpEnvelopes as Array<{ reservationId?: string }> : []) {
+    if (envelope.reservationId) await releaseSpend(envelope.reservationId).catch((err) => logger.warn({ err, reservationId: envelope.reservationId }, 'outbox: could not release bump reservation'));
+  }
 }
 
 export interface OutboxStore {
@@ -185,6 +199,9 @@ export interface CompletionOutcome {
   txHash?: string | null;
   ledger?: number | null;
   error?: string | null;
+  /** Full GetTransactionResponse when available, so handlers can read events without re-fetching. */
+  confirmedTx?: unknown;
+  ledger?: number | null;
 }
 
 export interface CompletionContext {
@@ -203,7 +220,17 @@ export type CompletionHandler = (
 const handlers = new Map<string, CompletionHandler>();
 
 /** Kinds that must have a handler; resolving one without is an error, never a skip. */
-export const DOMAIN_KINDS: ReadonlySet<string> = new Set(['market.create', 'trade.buy', 'trade.sell', 'trace.publish']);
+export const DOMAIN_KINDS: ReadonlySet<string> = new Set([
+  'market.create',
+  'trade.buy',
+  'trade.sell',
+  'trace.publish',
+  'resolver.price_spec',
+  'resolver.resolve_price',
+  'resolver.signer_spec',
+  'resolver.attest',
+  'resolver.finalize_signers',
+]);
 
 /** Registers the idempotent completion handler for one kind (at module load). */
 export function registerHandler(kind: string, handler: CompletionHandler): void {
@@ -672,6 +699,7 @@ export async function recoverRow(
       { transition: { from: ['BUILT'], to: 'FAILED', patch: { error: 'abandoned before signing' } }, store: deps.store },
     );
     if (moved) {
+      await releaseSpend(moved.id).catch((err) => logger.warn({ err, outboxId: moved.id }, 'outbox: could not release abandoned fee reservation'));
       stats.resolved++;
       stats.handled++;
     }
@@ -715,6 +743,8 @@ export async function recoverRow(
         },
       );
       if (moved) {
+        await settleSpend(moved.id, BigInt((anyResp as any).feeCharged ?? (row.innerFee ?? '0'))).catch((err) => logger.warn({ err, outboxId: moved.id }, 'outbox: could not settle fee reservation'));
+        await settleBumpReservations(row, BigInt((anyResp as any).feeCharged ?? (row.innerFee ?? '0')));
         stats.resolved++;
         stats.handled++;
       }
@@ -729,6 +759,8 @@ export async function recoverRow(
         },
       );
       if (moved) {
+        await releaseSpend(moved.id).catch((err) => logger.warn({ err, outboxId: moved.id }, 'outbox: could not release failed fee reservation'));
+        await releaseBumpReservations(row);
         stats.resolved++;
         stats.handled++;
       }
@@ -753,6 +785,8 @@ export async function recoverRow(
       { transition: { from: [...IN_FLIGHT], to: 'EXPIRED', patch: { error: 'expired by timebounds' } }, store: deps.store },
     );
     if (moved) {
+      await releaseSpend(moved.id).catch((err) => logger.warn({ err, outboxId: moved.id }, 'outbox: could not release expired fee reservation'));
+      await releaseBumpReservations(row);
       stats.expired++;
       stats.handled++;
     }
@@ -783,6 +817,7 @@ export async function recoverRow(
           { transition: { from: ['SIGNED'], to: 'FAILED', patch: { error: 'rejected on resubmit' } }, store: deps.store },
         );
         if (moved) {
+          await releaseSpend(moved.id).catch((err) => logger.warn({ err, outboxId: moved.id }, 'outbox: could not release rejected fee reservation'));
           stats.handled++;
         }
       }
@@ -910,10 +945,29 @@ async function bumpRow(
   }
 
   const outerHash = outer.hash().toString('hex');
-  const envelope = { hash: outerHash, fee: String(outer.fee), xdr: outer.toEnvelope().toXDR('base64'), at: new Date().toISOString() };
+  const reservationId = `${row.id}:bump:${row.bumpAttempts + 1}`;
+  const originalTotal = BigInt(row.innerFee ?? '0') + BigInt(row.resourceFee ?? '0');
+  const additionalFee = BigInt(outer.fee) > originalTotal ? BigInt(outer.fee) - originalTotal : 0n;
+  if (row.opClass && additionalFee > 0n) {
+    try {
+      await reserveSpend(row.opClass as OperationClass, additionalFee, reservationId);
+    } catch (err) {
+      if (err instanceof FeeSpendBudgetExceeded) {
+        logger.warn({ hash: row.hash, opClass: row.opClass }, 'fee bump: rolling budget exceeded');
+        await store.recordError(row.id, 'FEE_SPEND_BUDGET_EXCEEDED');
+      } else {
+        logger.warn({ err, hash: row.hash }, 'fee bump: could not reserve rolling budget');
+      }
+      return false;
+    }
+  }
+  const envelope = { hash: outerHash, fee: String(outer.fee), xdr: outer.toEnvelope().toXDR('base64'), reservationId, reservedAmount: additionalFee.toString(), at: new Date().toISOString() };
 
   // Compare-and-set on bumpAttempts so two workers produce one bump per attempt.
-  if (!(await store.recordBump(row, outerHash, envelope))) return false;
+  if (!(await store.recordBump(row, outerHash, envelope))) {
+    await releaseSpend(reservationId).catch(() => undefined);
+    return false;
+  }
 
   // Persisted before sending, as for every submission.
   try {
@@ -926,6 +980,8 @@ async function bumpRow(
         withTimeout('rpc-confirm', () => server.getTransaction(row.hash!)),
       );
       if (recheck.status === 'SUCCESS' || recheck.status === 'FAILED') {
+        if (recheck.status === 'SUCCESS') await settleBumpReservations(row, BigInt((recheck as any).feeCharged ?? outer.fee));
+        else await releaseBumpReservations(row);
         const value = recheck.status === 'SUCCESS' ? parseReturnValue(row, (recheck as { returnValue?: unknown }).returnValue) : undefined;
         await completeOutboxRow(
           row,

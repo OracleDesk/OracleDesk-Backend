@@ -62,7 +62,9 @@ export interface ContractEventParsed {
 }
 
 /**
- * Extracts and decodes Soroban events from a transaction response's resultMetaXdr.
+ * Extracts and decodes Soroban events from a transaction response's
+ * `events.contractEventsXdr` or `resultMetaXdr` (supporting TransactionMeta v3
+ * and v4 per-operation events). Filters by `contractIdFilter` when provided.
  */
 export function readContractEvents(response: rpc.Api.GetTransactionResponse): ContractEventParsed[] {
   const input = response as any;

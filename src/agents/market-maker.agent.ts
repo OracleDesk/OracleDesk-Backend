@@ -54,7 +54,8 @@ export interface MarketCycleResult {
 export async function runMarketMakerCycle(
   opts?: { signal?: AbortSignal; priority?: Priority; onPaused?: () => void },
 ): Promise<MarketCycleResult | null> {
-  const cycleId = correlation().cycleId ?? newId('cyc');
+  return withCallerClass('agent', async () => {
+    const cycleId = correlation().cycleId ?? newId('cyc');
   const recordDecision = (decision: Omit<RecordAgentDecisionInput, 'cycleId' | 'agentType'>) =>
     recordAgentDecision({ ...decision, cycleId, agentType: 'MARKET_MAKER' });
   let createdMarketId: string | undefined;

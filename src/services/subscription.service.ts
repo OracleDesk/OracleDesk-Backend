@@ -789,7 +789,7 @@ export async function recordPayment(params: {
     throw new AppError(409, 'PAYMENT_CLAIM_IN_PROGRESS', 'This payment is being processed; retry shortly');
   }
 
-  const { subscription, transfer, replay } = claim.value;
+  const { subscription, replay } = claim.value;
   if (replay || !transfer) return subscription;
 
   logger.info(
@@ -824,6 +824,7 @@ export async function recordPayment(params: {
 export async function getTracWithAccessControl(
   traceId: string,
   userId?: string,
+  entitlementAccess = false,
 ): Promise<any> {
   const trace = await prisma.reasoningTrace.findUnique({
     where: { id: traceId },
@@ -834,7 +835,9 @@ export async function getTracWithAccessControl(
 
   // Determine access level
   let access: SubscriptionAccess = { hasAccess: false, accessType: 'FREE_PREVIEW' };
-  if (userId) {
+  if (entitlementAccess) {
+    access = { hasAccess: true, accessType: 'DAILY_PASS' };
+  } else if (userId) {
     const fullAccess = await checkAccess(userId, traceId);
     access = fullAccess;
   }

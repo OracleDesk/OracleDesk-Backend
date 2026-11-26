@@ -14,6 +14,7 @@ import { startReportCron } from './cron/report.cron';
 import { startReconcileCron } from './cron/reconcile.cron';
 import { startMoneyAuditCron } from './cron/money-audit.cron';
 import { startPriceResolutionCron } from './cron/price-resolution.cron';
+import { startLlmCanaryCron } from './cron/llm-canary.cron';
 import { bootstrapAdminRbac, isAdminToken } from './middlewares/auth.middleware';
 import { startTraceAuditCron } from './cron/trace-audit.cron';
 import { startTracePublicationCron } from './cron/trace-publication.cron';
@@ -336,6 +337,8 @@ async function bootstrap(): Promise<void> {
     startMoneyAuditCron();
     // Price-mode reveal + resolve loop (#90).
     startPriceResolutionCron();
+    // Daily LLM model-drift canary (#296).
+    startLlmCanaryCron();
     // Operational alerts (#226): one evaluator per tick via an advisory lock.
     stopOpsAlerts = startOpsAlertCron();
   }

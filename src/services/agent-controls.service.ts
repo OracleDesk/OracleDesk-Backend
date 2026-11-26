@@ -24,7 +24,7 @@ import { AppError } from '../middlewares/error.middleware';
 
 export type AgentScope = 'MARKET_MAKER' | 'TRADER';
 export type ControlScope = AgentScope | 'ALL';
-export type PauseSource = 'operator' | 'drawdown' | 'chain_paused' | 'failure_breaker' | 'spec_drift';
+export type PauseSource = 'operator' | 'drawdown' | 'chain_paused' | 'failure_breaker' | 'spec_drift' | 'fee_budget';
 
 export interface ControlHoldRow {
   scope: ControlScope;

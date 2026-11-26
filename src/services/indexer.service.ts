@@ -231,6 +231,17 @@ async function applySideEffects(event: DecodedEvent): Promise<void> {
     logger.warn({ err, eventId: event.id }, 'Indexer: chain cache invalidation failed');
   }
 
+  if (event.contractName === 'marketCore') {
+    if (['MarketCreated', 'Trade', 'Redeemed', 'MarketResolved'].includes(event.eventName)) {
+      try {
+        const { applyWalletEvent } = await import('./wallet-pnl.service');
+        await applyWalletEvent(event);
+      } catch (err) {
+        logger.error({ err, eventId: event.id }, 'Indexer: wallet PnL projection failed');
+      }
+    }
+  }
+
   if (event.contractName === 'marketCore' && event.eventName === 'Trade') {
     const onChainMarketId = BigInt(p.market_id);
     const yesBps = Number(priceYesBps(BigInt(p.reserve_yes), BigInt(p.reserve_no)));
@@ -417,6 +428,17 @@ export interface PublicEvent {
 export async function publicEventFor(event: DecodedEvent): Promise<PublicEvent | null> {
   const p = event.params;
 
+  if (event.contractName === 'marketCore') {
+    if (['MarketCreated', 'Trade', 'Redeemed', 'MarketResolved'].includes(event.eventName)) {
+      try {
+        const { applyWalletEvent } = await import('./wallet-pnl.service');
+        await applyWalletEvent(event);
+      } catch (err) {
+        logger.error({ err, eventId: event.id }, 'Indexer: wallet PnL projection failed');
+      }
+    }
+  }
+
   if (event.contractName === 'marketCore' && event.eventName === 'Trade') {
     const onChainMarketId = BigInt(p.market_id);
     const yesBps = Number(priceYesBps(BigInt(p.reserve_yes), BigInt(p.reserve_no)));
@@ -545,6 +567,66 @@ async function writeCursor(lastLedger: number): Promise<void> {
   });
 }
 
+export type StartPlan =
+  | { action: 'resume'; startLedger: number }
+  | { action: 'idle'; startLedger: number; lastLedger: number }
+  | {
+      action: 'gap';
+      startLedger: number;
+      gap: {
+        fromLedger: number;
+        toLedger: number;
+        kind: 'RETENTION' | 'INITIAL';
+      };
+    };
+
+/**
+ * Pure planner for indexer start ledger and gap detection (#10).
+ * Decides whether to resume normally, idle when caught up, or record a gap
+ * when the desired starting ledger is older than the oldest ledger RPC retains.
+ */
+export function planStart(
+  cursor: number | null,
+  fromLedger: number | undefined,
+  health: { oldestLedger: number; latestLedger: number },
+  deployLedger?: number,
+): StartPlan {
+  const intended =
+    fromLedger !== undefined
+      ? fromLedger
+      : cursor !== null
+        ? cursor + 1
+        : deployLedger !== undefined
+          ? deployLedger
+          : health.oldestLedger;
+
+  if (intended > health.latestLedger) {
+    return {
+      action: 'idle',
+      startLedger: intended,
+      lastLedger: cursor ?? health.latestLedger,
+    };
+  }
+
+  if (intended < health.oldestLedger) {
+    const kind: 'RETENTION' | 'INITIAL' = cursor !== null ? 'RETENTION' : 'INITIAL';
+    return {
+      action: 'gap',
+      startLedger: health.oldestLedger,
+      gap: {
+        fromLedger: intended,
+        toLedger: health.oldestLedger - 1,
+        kind,
+      },
+    };
+  }
+
+  return {
+    action: 'resume',
+    startLedger: intended,
+  };
+}
+
 /**
  * Indexes from `fromLedger` (default: the stored cursor + 1, or the oldest
  * ledger RPC retains) up to the latest ledger. Returns counts.
@@ -563,18 +645,51 @@ export async function backfillEvents(
     const health = await withTimeout('rpc-events', async () => deps.source.getHealth(), { signal: handle.signal });
     rpcLatestLedger = health.latestLedger;
     const cursor = await readCursor();
-    let startLedger = fromLedger ?? (cursor !== null ? cursor + 1 : health.oldestLedger);
+    const plan = planStart(cursor, fromLedger, health, config.INDEXER_START_LEDGER);
 
-    if (startLedger < health.oldestLedger) {
-      logger.warn(
-        { requested: startLedger, oldestAvailable: health.oldestLedger },
-        'Indexer cursor is older than RPC retention; resuming from the oldest available ledger. Events in between are not indexed.',
-      );
-      startLedger = health.oldestLedger;
+    if (plan.action === 'idle') {
+      return { startLedger: plan.startLedger, lastLedger: plan.lastLedger, seen: 0, stored: 0 };
     }
-    if (startLedger > health.latestLedger) {
-      return { startLedger, lastLedger: cursor ?? health.latestLedger, seen: 0, stored: 0 };
+
+    if (plan.action === 'gap') {
+      if (plan.gap.kind === 'RETENTION') {
+        logger.error(
+          { network: CURSOR_ID, fromLedger: plan.gap.fromLedger, toLedger: plan.gap.toLedger, kind: plan.gap.kind },
+          'Indexer cursor is older than RPC retention; gap recorded and advancing cursor to oldest available ledger',
+        );
+      } else {
+        logger.warn(
+          { network: CURSOR_ID, fromLedger: plan.gap.fromLedger, toLedger: plan.gap.toLedger, kind: plan.gap.kind },
+          'Indexer start ledger is older than RPC retention; gap recorded and starting from oldest available ledger',
+        );
+      }
+
+      await prisma.$transaction([
+        prisma.indexerGap.upsert({
+          where: {
+            network_fromLedger_toLedger: {
+              network: CURSOR_ID,
+              fromLedger: plan.gap.fromLedger,
+              toLedger: plan.gap.toLedger,
+            },
+          },
+          create: {
+            network: CURSOR_ID,
+            fromLedger: plan.gap.fromLedger,
+            toLedger: plan.gap.toLedger,
+            kind: plan.gap.kind,
+          },
+          update: {},
+        }),
+        prisma.indexerCursor.upsert({
+          where: { id: CURSOR_ID },
+          create: { id: CURSOR_ID, lastLedger: plan.gap.toLedger },
+          update: { lastLedger: plan.gap.toLedger },
+        }),
+      ]);
     }
+
+    let startLedger = plan.startLedger;
 
     // Catch-up runs as background; live tail runs as agent to protect freshness (#300).
     const isLiveTail =
@@ -641,6 +756,12 @@ export async function backfillEvents(
     }
 
     await writeCursor(latestLedger);
+    // Repair any markets marked dirty by out-of-order wallet PnL events (#298)
+    await import('./wallet-pnl.service')
+      .then((m) => m.processDirtyMarkets())
+      .catch((err) =>
+        logger.warn({ err: err instanceof Error ? err.message : err }, 'Indexer: dirty wallet PnL repair failed'),
+      );
     // Also covers rows left unpublished by an earlier outage, not just this run's.
     await publishPending(deps.emit).catch((err) =>
       logger.warn({ err: err instanceof Error ? err.message : err }, 'Indexer: publish pass failed'),

@@ -488,6 +488,19 @@ export async function withLease<T>(
   fn: (lease: Lease) => Promise<{ value: T; usage: Usage | null }>,
   opts: { signal?: AbortSignal; classify?: (err: unknown) => Classified } = {},
 ): Promise<T> {
+  if (ctx?.isolated) {
+    const syntheticLease: Lease = {
+      id: 'isolated',
+      provider,
+      ctx,
+      day: new Date().toISOString().slice(0, 10),
+      estimate: estimatedTokens,
+      probe: false,
+      local: true,
+    };
+    const res = await fn(syntheticLease);
+    return res.value;
+  }
   const lease = await acquire(provider, ctx ?? DEFAULT_CALL_CONTEXT, estimatedTokens, { signal: opts.signal });
   let result: { value: T; usage: Usage | null };
   try {

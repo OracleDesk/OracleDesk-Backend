@@ -219,7 +219,6 @@ async function sweepCopyTrades(): Promise<void> {
             maxCollateral: BigInt(ct.amountRaw ?? '0'),
           });
         }
-      }
 
         const matchedStoredEvent = verified.eventId
           ? storedEvents.find((event) => event.id === verified.eventId)
@@ -255,10 +254,9 @@ async function sweepCopyTrades(): Promise<void> {
         }
       }
     }
+  } catch (err) {
+    logger.error({ err }, 'Copy trade sweep failed');
+  } finally {
+    sweepRunning = false;
   }
-
-  return {
-    outcome: 'SUCCESS',
-    counters: { checked: confirming.length, confirmed, pending, failed },
-  };
 }

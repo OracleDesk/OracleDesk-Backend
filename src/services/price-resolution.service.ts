@@ -21,6 +21,7 @@ import {
 import { z } from 'zod';
 import { config } from '../config';
 import { feedFor, type ReflectorFeed, type ReflectorFeedAsset } from '../config/reflector-feeds';
+import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { writeAgentLog } from '../lib/agent-log';
 import {
@@ -29,8 +30,10 @@ import {
   type ResolutionSpecJson,
 } from '../lib/resolution-spec';
 import { registerPriceSpec, resolvePrice, resolverState, type WriteResult } from './chain.service';
-import { ChainError } from './stellar/errors';
+import { ChainError, ChainPendingError } from './stellar/errors';
 import { agentSigner, rpcServer } from './stellar/clients';
+import { registerHandler, type ChainTransactionRow, type CompletionOutcome } from './stellar/outbox';
+import { AlertService } from './alerts.service';
 import type { PriceConfig } from '../generated/resolver';
 
 export type OracleAsset = ReflectorFeedAsset;
@@ -437,15 +440,58 @@ export async function planPriceMarket(
 export async function revealPriceSpec(
   onChainMarketId: bigint,
   spec: Extract<ResolutionSpecJson, { kind: 'price' }>,
-  deps: { register?: typeof registerPriceSpec } = {},
+  deps: { register?: typeof registerPriceSpec; marketId?: string } = {},
 ): Promise<WriteResult<void>> {
   validateResolutionSpec(spec, { forReveal: true });
   const call = deps.register ?? registerPriceSpec;
+  const ref = deps.marketId ? { kind: 'resolver.price_spec', refId: deps.marketId } : { kind: 'resolver.price_spec' };
+
+  if (deps.marketId) {
+    await upsertStep(deps.marketId, 'PRICE_SPEC', {
+      status: 'IN_FLIGHT',
+      attemptsIncrement: 1,
+    });
+  }
+
   try {
-    return await call(onChainMarketId, toPriceConfig(spec));
+    const res = await call(onChainMarketId, toPriceConfig(spec), undefined, ref);
+    if (deps.marketId && res.mode === 'live') {
+      await upsertStep(deps.marketId, 'PRICE_SPEC', {
+        status: 'LANDED',
+        txHash: res.txHash ?? null,
+        landedBy: 'AGENT',
+        failureCode: null,
+        nextAttemptAt: null,
+      });
+    }
+    return res;
   } catch (err) {
     if (err instanceof ChainError && err.contractError === 'MarketAlreadyConfigured') {
+      if (deps.marketId) {
+        await upsertStep(deps.marketId, 'PRICE_SPEC', {
+          status: 'LANDED_EXTERNALLY',
+          landedBy: 'EXTERNAL',
+          failureCode: 'MarketAlreadyConfigured',
+          nextAttemptAt: null,
+        });
+      }
       return { mode: config.CHAIN_EXECUTION_MODE === 'live' ? 'live' : 'dry-run', method: 'register_price_spec', value: undefined, txHash: null };
+    }
+    if (deps.marketId) {
+      if (err instanceof ChainPendingError) {
+        await upsertStep(deps.marketId, 'PRICE_SPEC', {
+          status: 'IN_FLIGHT',
+          lastOutboxId: err.outboxId ?? null,
+          txHash: err.txHash ?? null,
+        });
+      } else {
+        const code = err instanceof ChainError ? err.contractError ?? 'FAILED' : 'FAILED';
+        await upsertStep(deps.marketId, 'PRICE_SPEC', {
+          status: 'FAILED',
+          failureCode: code,
+          nextAttemptAt: new Date(Date.now() + backoffMs(0)),
+        });
+      }
     }
     throw err;
   }
@@ -517,6 +563,120 @@ export interface ResolutionTickDeps {
   markets?: ResolutionTickMarket[];
 }
 
+const TERMINAL_STEP_STATUSES = new Set(['LANDED', 'LANDED_EXTERNALLY', 'ESCALATED']);
+
+function normalizeOutcomeValue(val: unknown): string | null {
+  if (!val) return null;
+  const tag = typeof val === 'object' && val !== null && 'tag' in val ? (val as { tag?: unknown }).tag : val;
+  if (tag === 'Yes' || tag === 'YES') return 'YES';
+  if (tag === 'No' || tag === 'NO') return 'NO';
+  if (tag === 'Void' || tag === 'VOID') return 'VOID';
+  return null;
+}
+
+async function safeGetStep(marketId: string, step: string) {
+  try {
+    return await prisma.marketResolutionStep.findUnique({
+      where: { marketId_step: { marketId, step } },
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function hasInFlightOutbox(kind: string, refId: string): Promise<boolean> {
+  try {
+    const row = await prisma.chainTransaction.findFirst({
+      where: { kind, refId, status: { in: ['PENDING', 'SIGNED', 'SUBMITTED'] } },
+      select: { id: true },
+    });
+    return row !== null;
+  } catch {
+    return false;
+  }
+}
+
+async function upsertStep(
+  marketId: string,
+  step: string,
+  data: {
+    status: string;
+    attemptsIncrement?: number;
+    nextAttemptAt?: Date | null;
+    escalatedAt?: Date | null;
+    txHash?: string | null;
+    ledger?: number | null;
+    outcome?: string | null;
+    failureCode?: string | null;
+    landedBy?: string | null;
+    lastOutboxId?: string | null;
+  },
+): Promise<void> {
+  try {
+    const { attemptsIncrement, ...fields } = data;
+    await prisma.marketResolutionStep.upsert({
+      where: { marketId_step: { marketId, step } },
+      create: {
+        marketId,
+        step,
+        attempts: attemptsIncrement ?? 0,
+        ...fields,
+      },
+      update: {
+        ...fields,
+        ...(attemptsIncrement ? { attempts: { increment: attemptsIncrement } } : {}),
+      },
+    });
+  } catch {
+    // Non-fatal in unit tests or transient DB unavailability
+  }
+}
+
+async function escalatePriceResolutionOnce(
+  marketId: string,
+  onChainMarketId: bigint,
+  code: string | undefined,
+  elapsedSecs: number,
+  now: Date,
+): Promise<boolean> {
+  const existing = await safeGetStep(marketId, 'RESOLVE_PRICE');
+  if (existing?.escalatedAt) return false;
+
+  await upsertStep(marketId, 'RESOLVE_PRICE', {
+    status: 'ESCALATED',
+    failureCode: code ?? 'ESCALATED',
+    nextAttemptAt: null,
+    escalatedAt: now,
+  });
+
+  await writeAgentLog({
+    agentType: 'MARKET_MAKER',
+    level: 'ERROR',
+    action: 'PRICE_RESOLUTION_STUCK',
+    marketId,
+    data: { onChainMarketId: onChainMarketId.toString(), contractError: code ?? null, elapsedSecs },
+  }).catch(() => undefined);
+
+  await new AlertService()
+    .sendOps({
+      kind: 'ops',
+      level: 'CRITICAL',
+      severity: 'CRITICAL',
+      subjectType: 'market_resolution',
+      subjectKey: marketId,
+      summary: `Price resolution stuck for market ${marketId} (on-chain #${onChainMarketId})`,
+      detail: { onChainMarketId: onChainMarketId.toString(), contractError: code ?? null, elapsedSecs },
+      state: 'OPEN',
+      incidentId: `price-res:${marketId}`,
+      episode: 1,
+      notification: 'open',
+      adminUrl: `/api/v1/markets/${marketId}`,
+    })
+    .catch(() => undefined);
+
+  return true;
+}
+
 /**
  * One pass of the 5-minute resolution cron. For each closed, price-mode market
  * that the resolver still has Unconfigured/pending, capture a close-time
@@ -534,8 +694,22 @@ export async function runPriceResolutionTick(deps: ResolutionTickDeps = {}): Pro
 
   for (const market of markets) {
     if (market.onChainMarketId === null) continue;
+
+    const step = await safeGetStep(market.id, 'RESOLVE_PRICE');
+    if (step && TERMINAL_STEP_STATUSES.has(step.status)) continue;
+    if (step?.status === 'IN_FLIGHT') continue;
+    if (step?.nextAttemptAt && step.nextAttemptAt > now) continue;
+    if (await hasInFlightOutbox('resolver.resolve_price', market.id)) continue;
+
     const current = await state(market.onChainMarketId);
-    if (current.tag === 'Finalized') continue;
+    if (current.tag === 'Finalized') {
+      await upsertStep(market.id, 'RESOLVE_PRICE', {
+        status: 'LANDED_EXTERNALLY',
+        landedBy: 'EXTERNAL',
+        nextAttemptAt: null,
+      });
+      continue;
+    }
 
     if (deps.captureSnapshot && now.getTime() >= market.expiryTimestamp.getTime()) {
       await deps.captureSnapshot(market).catch((err) => {
@@ -544,35 +718,244 @@ export async function runPriceResolutionTick(deps: ResolutionTickDeps = {}): Pro
     }
 
     const elapsedSecs = Math.floor((now.getTime() - market.expiryTimestamp.getTime()) / 1000);
-    let attempt = 0;
-    for (;;) {
-      try {
-        await resolve(market.onChainMarketId);
-        resolved.push(market.onChainMarketId);
-        break;
-      } catch (err) {
-        const code = err instanceof ChainError ? err.contractError ?? undefined : undefined;
-        if (code === 'AlreadyFinalized') break;
-        const action = nextResolutionAction(code ?? undefined, elapsedSecs, config.PRICE_RESOLUTION_MAX_WAIT_SECS, attempt);
-        if (!action.retry) {
-          if (action.escalate) {
-            escalated.push(market.onChainMarketId);
-            await writeAgentLog({
-              agentType: 'MARKET_MAKER',
-              level: 'ERROR',
-              action: 'PRICE_RESOLUTION_STUCK',
-              marketId: market.id,
-              data: { onChainMarketId: market.onChainMarketId.toString(), contractError: code ?? null, elapsedSecs },
-            }).catch(() => undefined);
-          }
-          logger.warn({ marketId: market.id, code }, 'price resolution stopped');
-          break;
-        }
-        if (attempt >= config.CHAIN_RETRY_MAX_ATTEMPTS) break;
-        await new Promise((r) => setTimeout(r, action.delayMs));
-        attempt++;
+    const attempt = step?.attempts ?? 0;
+
+    await upsertStep(market.id, 'RESOLVE_PRICE', {
+      status: 'IN_FLIGHT',
+      attemptsIncrement: 1,
+    });
+
+    try {
+      const res = await resolve(market.onChainMarketId, undefined, {
+        kind: 'resolver.resolve_price',
+        refId: market.id,
+      });
+      await upsertStep(market.id, 'RESOLVE_PRICE', {
+        status: 'LANDED',
+        txHash: res.txHash ?? null,
+        outcome: normalizeOutcomeValue(res.value),
+        landedBy: 'AGENT',
+        failureCode: null,
+        nextAttemptAt: null,
+      });
+      resolved.push(market.onChainMarketId);
+    } catch (err) {
+      if (err instanceof ChainPendingError) {
+        await upsertStep(market.id, 'RESOLVE_PRICE', {
+          status: 'IN_FLIGHT',
+          lastOutboxId: err.outboxId ?? null,
+          txHash: err.txHash ?? null,
+        });
+        continue;
+      }
+
+      const code = err instanceof ChainError ? err.contractError ?? undefined : undefined;
+      if (code === 'AlreadyFinalized') {
+        await upsertStep(market.id, 'RESOLVE_PRICE', {
+          status: 'LANDED_EXTERNALLY',
+          landedBy: 'EXTERNAL',
+          failureCode: 'AlreadyFinalized',
+          nextAttemptAt: null,
+        });
+        continue;
+      }
+
+      const action = nextResolutionAction(code ?? undefined, elapsedSecs, config.PRICE_RESOLUTION_MAX_WAIT_SECS, attempt);
+      if (action.escalate) {
+        const didEscalate = await escalatePriceResolutionOnce(market.id, market.onChainMarketId, code, elapsedSecs, now);
+        if (didEscalate) escalated.push(market.onChainMarketId);
+      } else if (action.retry) {
+        await upsertStep(market.id, 'RESOLVE_PRICE', {
+          status: 'FAILED',
+          failureCode: code ?? 'RETRYABLE_ERROR',
+          nextAttemptAt: new Date(now.getTime() + action.delayMs),
+        });
+      } else {
+        await upsertStep(market.id, 'RESOLVE_PRICE', {
+          status: 'FAILED',
+          failureCode: code ?? 'TERMINAL_ERROR',
+          nextAttemptAt: null,
+        });
+        logger.warn({ marketId: market.id, code }, 'price resolution stopped');
       }
     }
   }
   return { resolved, escalated };
 }
+
+// ─── Outbox completion handlers (#297) ───────────────────────────────────────
+
+async function reconcileResolverStepOnFailure(
+  marketId: string,
+  step: string,
+  row: ChainTransactionRow,
+  outcome: CompletionOutcome,
+  checkExternal: (stateTag: string) => boolean,
+  onStillPending?: (market: { onChainMarketId: bigint | null; expiryTimestamp: Date }) => Promise<void>,
+): Promise<void> {
+  const market = await prisma.market.findUnique({
+    where: { id: marketId },
+    select: { onChainMarketId: true, expiryTimestamp: true },
+  });
+  if (market?.onChainMarketId != null) {
+    try {
+      const state = await resolverState(market.onChainMarketId);
+      if (checkExternal(state.tag)) {
+        await upsertStep(marketId, step, {
+          status: 'LANDED_EXTERNALLY',
+          landedBy: 'EXTERNAL',
+          failureCode: outcome.error ?? null,
+          nextAttemptAt: null,
+          lastOutboxId: row.id,
+        });
+        return;
+      }
+    } catch (err) {
+      logger.warn({ err, marketId, step }, 'Failed to reconcile resolverState in outbox handler');
+    }
+  }
+
+  if (onStillPending && market) {
+    await onStillPending(market);
+    return;
+  }
+
+  await upsertStep(marketId, step, {
+    status: 'FAILED',
+    failureCode: outcome.error ?? (outcome.status === 'EXPIRED' ? 'EXPIRED' : 'FAILED'),
+    nextAttemptAt: new Date(Date.now() + backoffMs(0)),
+    lastOutboxId: row.id,
+  });
+}
+
+export async function handleResolverPriceSpecOutcome(
+  row: ChainTransactionRow,
+  outcome: CompletionOutcome,
+): Promise<void> {
+  const marketId = row.refId;
+  if (!marketId) return;
+
+  if (outcome.status === 'SUCCESS') {
+    await upsertStep(marketId, 'PRICE_SPEC', {
+      status: 'LANDED',
+      txHash: outcome.txHash ?? row.landedHash ?? row.hash ?? null,
+      ledger: outcome.ledger ?? row.ledger ?? null,
+      landedBy: 'AGENT',
+      failureCode: null,
+      nextAttemptAt: null,
+      lastOutboxId: row.id,
+    });
+    return;
+  }
+
+  if (outcome.error === 'MarketAlreadyConfigured') {
+    await upsertStep(marketId, 'PRICE_SPEC', {
+      status: 'LANDED_EXTERNALLY',
+      landedBy: 'EXTERNAL',
+      failureCode: 'MarketAlreadyConfigured',
+      nextAttemptAt: null,
+      lastOutboxId: row.id,
+    });
+    return;
+  }
+
+  await reconcileResolverStepOnFailure(
+    marketId,
+    'PRICE_SPEC',
+    row,
+    outcome,
+    (tag) => tag !== 'Unconfigured',
+  );
+}
+
+export async function handleResolverResolvePriceOutcome(
+  row: ChainTransactionRow,
+  outcome: CompletionOutcome,
+): Promise<void> {
+  const marketId = row.refId;
+  if (!marketId) return;
+
+  if (outcome.status === 'SUCCESS') {
+    await upsertStep(marketId, 'RESOLVE_PRICE', {
+      status: 'LANDED',
+      txHash: outcome.txHash ?? row.landedHash ?? row.hash ?? null,
+      ledger: outcome.ledger ?? row.ledger ?? null,
+      outcome: normalizeOutcomeValue(outcome.value),
+      landedBy: 'AGENT',
+      failureCode: null,
+      nextAttemptAt: null,
+      lastOutboxId: row.id,
+    });
+    return;
+  }
+
+  if (outcome.error === 'AlreadyFinalized') {
+    await upsertStep(marketId, 'RESOLVE_PRICE', {
+      status: 'LANDED_EXTERNALLY',
+      landedBy: 'EXTERNAL',
+      failureCode: 'AlreadyFinalized',
+      nextAttemptAt: null,
+      lastOutboxId: row.id,
+    });
+    return;
+  }
+
+  await reconcileResolverStepOnFailure(
+    marketId,
+    'RESOLVE_PRICE',
+    row,
+    outcome,
+    (tag) => tag === 'Finalized',
+    async (market) => {
+      const existing = await safeGetStep(marketId, 'RESOLVE_PRICE');
+      const now = new Date();
+      const elapsedSecs = Math.floor((now.getTime() - market.expiryTimestamp.getTime()) / 1000);
+      const code = outcome.error ?? undefined;
+      const action = nextResolutionAction(code, elapsedSecs, config.PRICE_RESOLUTION_MAX_WAIT_SECS, existing?.attempts ?? 0);
+      if (action.escalate && market.onChainMarketId != null) {
+        await escalatePriceResolutionOnce(marketId, market.onChainMarketId, code, elapsedSecs, now);
+      } else if (action.retry) {
+        await upsertStep(marketId, 'RESOLVE_PRICE', {
+          status: 'FAILED',
+          failureCode: code ?? (outcome.status === 'EXPIRED' ? 'EXPIRED' : 'FAILED'),
+          nextAttemptAt: new Date(now.getTime() + action.delayMs),
+          lastOutboxId: row.id,
+        });
+      } else {
+        await upsertStep(marketId, 'RESOLVE_PRICE', {
+          status: 'FAILED',
+          failureCode: code ?? (outcome.status === 'EXPIRED' ? 'EXPIRED' : 'FAILED'),
+          nextAttemptAt: null,
+          lastOutboxId: row.id,
+        });
+      }
+    },
+  );
+}
+
+function makeSimpleResolverHandler(step: string, externalCheck: (tag: string) => boolean) {
+  return async (row: ChainTransactionRow, outcome: CompletionOutcome): Promise<void> => {
+    const marketId = row.refId;
+    if (!marketId) return;
+    if (outcome.status === 'SUCCESS') {
+      await upsertStep(marketId, step, {
+        status: 'LANDED',
+        txHash: outcome.txHash ?? row.landedHash ?? row.hash ?? null,
+        ledger: outcome.ledger ?? row.ledger ?? null,
+        outcome: normalizeOutcomeValue(outcome.value),
+        landedBy: 'AGENT',
+        failureCode: null,
+        nextAttemptAt: null,
+        lastOutboxId: row.id,
+      });
+      return;
+    }
+    await reconcileResolverStepOnFailure(marketId, step, row, outcome, externalCheck);
+  };
+}
+
+registerHandler('resolver.price_spec', handleResolverPriceSpecOutcome);
+registerHandler('resolver.resolve_price', handleResolverResolvePriceOutcome);
+registerHandler('resolver.signer_spec', makeSimpleResolverHandler('SIGNER_SPEC', (t) => t !== 'Unconfigured'));
+registerHandler('resolver.attest', makeSimpleResolverHandler('ATTEST', (t) => t === 'Finalized'));
+registerHandler('resolver.finalize_signers', makeSimpleResolverHandler('FINALIZE_SIGNERS', (t) => t === 'Finalized'));

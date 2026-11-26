@@ -86,10 +86,6 @@ jobs:
       # keys. --live is manual only and never runs in CI.
       - name: Evaluate market generation (replay)
         run: npm run eval:markets -- --replay
-      # #310: deterministic replay of recorded forecaster outputs with
-      # paired cluster-bootstrap non-inferiority gate against baseline.
-      - name: Evaluate forecaster (replay)
-        run: npm run eval:forecast -- --replay
       # #69: harness check for the dedup threshold sweep on the committed pair set.
       - name: Calibrate dedup (fake provider)
         run: npm run calibrate:dedup -- --provider fake

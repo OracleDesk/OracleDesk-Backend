@@ -92,10 +92,12 @@ test('settlement Yes, No, and Void matches settle_value for combined position', 
   const resNo = applySettlement(yesLot, noLot, 'no');
   assert.equal(resNo.realized, (0n - 100n) + (80n - 80n)); // -100n
 
-  // 3. Void settlement: settle_value = (yes + no) / 2
+  // 3. Void settlement: settle_value = (yes + no) / 2, per-outcome = shares / 2
   const resVoid = applySettlement(yesLot, noLot, 'void');
   const expectedSettleVal = settleValue('void', 100n, 80n);
   assert.equal(expectedSettleVal, 90n); // (100 + 80) / 2
+  assert.equal(resVoid.yes.realized, 50n - 100n); // -50n
+  assert.equal(resVoid.no.realized, 40n - 80n); // -40n
   assert.equal(resVoid.realized, expectedSettleVal - (100n + 80n)); // 90 - 180 = -90
 });
 

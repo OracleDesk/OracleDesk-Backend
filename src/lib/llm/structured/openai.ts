@@ -99,6 +99,7 @@ async function attempt<T>(spec: StructuredSpec<T>, model: ModelSpec, run: Run): 
           value: checked.value,
           provider: 'openai',
           model: model.model,
+          ...(typeof completion.model === 'string' && completion.model ? { servedModel: completion.model } : {}),
           attempts: run.calls.n,
           outputSha256: sha256Hex(text),
           usage,

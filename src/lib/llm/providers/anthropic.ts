@@ -116,6 +116,7 @@ export const anthropicProvider: LlmProvider = {
     }
     return {
       text,
+      ...(typeof message.model === 'string' && message.model ? { servedModel: message.model } : {}),
       usage: {
         inputTokens: message.usage?.input_tokens,
         outputTokens: message.usage?.output_tokens,

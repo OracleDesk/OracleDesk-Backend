@@ -33,6 +33,8 @@ export interface ModelSpec {
   jsonMode?: 'native' | 'prompt';
   /** Additional attempts on the same spec after a short rate limit. Default 1. */
   retries?: number;
+  /** True when this entry pins a specific snapshot model id rather than a rolling alias (#296). */
+  pinned?: boolean;
 }
 
 export interface LlmRequest {
@@ -61,6 +63,7 @@ export interface LlmResult {
     task: LlmTask;
     provider: string;
     model: string;
+    servedModel?: string;
     attempts: Attempt[];
     latencyMs: number;
     usage?: { inputTokens?: number; outputTokens?: number };
@@ -69,6 +72,7 @@ export interface LlmResult {
 
 export interface ProviderCompletion {
   text: string;
+  servedModel?: string;
   usage?: { inputTokens?: number; outputTokens?: number };
 }
 

@@ -89,6 +89,7 @@ async function attempt<T>(spec: StructuredSpec<T>, model: ModelSpec, run: Run): 
           value: checked.value,
           provider: 'anthropic',
           model: model.model,
+          ...(typeof message.model === 'string' && message.model ? { servedModel: message.model } : {}),
           attempts: run.calls.n,
           outputSha256: sha256Hex(canonicalJson(block.input)),
           usage,

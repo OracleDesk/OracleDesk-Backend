@@ -29,6 +29,7 @@ import { priceYesBps } from '../generated/fpmm';
 import { writeAgentLog } from '../lib/agent-log';
 import { AppError } from '../middlewares/error.middleware';
 import { CONTRACTS } from '../config/contracts';
+import { checkFillDiscrepancies, resolveAgentTradeFill } from './agent-fill.service';
 import {
   bigintToDecimalString,
   decimalToBigint,
@@ -40,6 +41,7 @@ import type { Market as OnChainMarket } from '../generated/market-core';
 import {
   Outcomes,
   agentSell,
+  closeTrade,
   getBreakerConfig,
   getBreakerState,
   getOnChainMarket,
@@ -308,7 +310,18 @@ async function applyConfirmedExitInTx(
 async function applyConfirmedExit(
   position: LoadedPosition,
   exitId: string,
-  p: { sold: bigint; collateralOut: bigint; txHash: string | null; reason: string; note?: string },
+  p: {
+    sold: bigint;
+    collateralOut: bigint;
+    txHash: string | null;
+    reason: string;
+    note?: string;
+    feeRaw?: bigint | null;
+    reserveYesRaw?: bigint | null;
+    reserveNoRaw?: bigint | null;
+    fillLedger?: number | null;
+    fillMismatch?: Record<string, unknown> | null;
+  },
 ): Promise<{ closed: boolean; applied: boolean }> {
   const result = await prisma.$transaction((tx) => applyConfirmedExitInTx(tx, position.id, exitId, p));
   if (!result) {
@@ -614,13 +627,13 @@ export async function exitPosition(
           positionId,
           exitId: row.id,
           reason: opts.reason,
-          sharesSoldRaw: sold.toString(),
-          collateralOutRaw: plan.collateralOut.toString(),
+          sharesSoldRaw: finalSold.toString(),
+          collateralOutRaw: finalCollateralOut.toString(),
           txHash: result.txHash,
         },
       }).catch(() => undefined);
       logger.info({ positionId, exitId: row.id, closed }, 'Position exit confirmed');
-      return { exitId: row.id, status: 'CONFIRMED', sharesSoldRaw: sold, collateralOutRaw: plan.collateralOut, closed };
+      return { exitId: row.id, status: 'CONFIRMED', sharesSoldRaw: finalSold, collateralOutRaw: finalCollateralOut, closed };
     } catch (err) {
       const kind = classify(err);
 
@@ -704,6 +717,11 @@ export async function handleTradeSellOutcome(
     collateralOut,
     txHash: outcome.txHash ?? null,
     reason: exit.reason,
+    feeRaw: eventFill?.fee ?? null,
+    reserveYesRaw: eventFill?.reserveYes ?? null,
+    reserveNoRaw: eventFill?.reserveNo ?? null,
+    fillLedger: eventFill?.ledger ?? outcome.ledger ?? null,
+    fillMismatch,
   });
   if (applied) {
     ctx.afterCommit(() =>

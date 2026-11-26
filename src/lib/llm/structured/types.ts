@@ -13,6 +13,8 @@ export type StructuredProvider = ModelSpec['provider'];
 export interface Served {
   provider: StructuredProvider;
   model: string;
+  /** Provider-reported model version/snapshot served for this call (#296). */
+  servedModel?: string;
   /** Provider requests made so far, repairs and 429 retries included. */
   attempts: number;
   outputSha256: string;
