@@ -12,6 +12,8 @@
  * and v4 as well as the RPC `events.contractEventsXdr` field.
  */
 import { Address, scValToNative, xdr } from '@stellar/stellar-sdk';
+import { AppError } from '../../lib/app-error';
+import { extractContractEvents, type ExtractedEvent, type TxEventsInput } from './tx-events';
 
 export interface SacTransfer {
   /** C… contract that emitted the event. */
@@ -25,74 +27,16 @@ export interface SacTransfer {
   toMuxedId: string | null;
   /** Operation index the event came from, when known. */
   opIndex: number | null;
-  /** Index of the event within its operation (or transaction meta events list). */
-  eventIndex: number;
   /** Asset string topic (`CODE:ISSUER`) when the event carried one. */
   asset: string | null;
 }
 
-export interface SacMetaInput {
-  resultMetaXdr?: xdr.TransactionMeta | string | null;
-  contractEventsXdr?: xdr.ContractEvent[][] | string[][] | null;
-}
-
-/** Accepts a parsed ContractEvent or its base64 form. */
-function asContractEvent(ev: unknown): xdr.ContractEvent | null {
-  if (!ev) return null;
-  if (typeof ev === 'string') {
-    try {
-      return xdr.ContractEvent.fromXDR(ev, 'base64');
-    } catch {
-      return null;
-    }
-  }
-  return ev as xdr.ContractEvent;
-}
-
-function normalizeMeta(meta: SacMetaInput['resultMetaXdr']): xdr.TransactionMeta | null {
-  if (!meta) return null;
-  if (typeof meta === 'string') {
-    try {
-      return xdr.TransactionMeta.fromXDR(meta, 'base64');
-    } catch {
-      return null;
-    }
-  }
-  return meta;
-}
-
-/** Reads the string name of a contract-event type, tolerating mocks. */
-function eventTypeName(ev: any): string | null {
-  try {
-    if (typeof ev?.type === 'function') {
-      const t = ev.type();
-      return typeof t === 'string' ? t : (t?.name ?? null);
-    }
-    if (typeof ev?.type === 'string') return ev.type;
-  } catch {
-    // fall through
-  }
-  return null;
-}
+export type SacMetaInput = TxEventsInput;
 
 /** Decodes one contract event into a transfer, or null when it is not one. */
-export function decodeSacTransferEvent(ev: unknown, opIndex: number | null, eventIndex = 0): SacTransfer | null {
-  const event = asContractEvent(ev);
-  if (!event) return null;
+export function decodeSacTransferEvent(event: ExtractedEvent): SacTransfer | null {
   try {
-    const typeName = eventTypeName(event);
-    if (typeName && typeName !== 'contract') return null;
-
-    let contractId = '';
-    const cid = typeof (event as any).contractId === 'function' ? (event as any).contractId() : null;
-    if (cid) contractId = Address.fromScAddress(cid).toString();
-
-    const body = typeof (event as any).body === 'function' ? (event as any).body() : null;
-    const v0 = body && typeof body.v0 === 'function' ? body.v0() : null;
-    const topics: xdr.ScVal[] | null =
-      v0 && typeof v0.topics === 'function' ? v0.topics() : ((event as any).topics ?? null);
-    const data: xdr.ScVal | null =
-      v0 && typeof v0.data === 'function' ? v0.data() : ((event as any).data ?? null);
+    const { topics, data } = event;
     if (!topics || topics.length < 3 || !data) return null;
 
     let name: unknown;
@@ -126,13 +70,12 @@ export function decodeSacTransferEvent(ev: unknown, opIndex: number | null, even
     if (decoded === null) return null;
 
     return {
-      contractId,
+      contractId: event.contractId,
       from,
       to,
       amount: decoded.amount,
       toMuxedId: decoded.toMuxedId,
-      opIndex,
-      eventIndex,
+      opIndex: event.opIndex,
       asset,
     };
   } catch {
@@ -179,65 +122,14 @@ function decodeAmount(data: xdr.ScVal): { amount: bigint; toMuxedId: string | nu
   return null;
 }
 
-/** Events declared directly on a v4 `OperationMetaV2`. */
-function decodeContractEvents(events: unknown[], opIndex: number | null): SacTransfer[] {
-  const out: SacTransfer[] = [];
-  events.forEach((ev, eventIndex) => {
-    const transfer = decodeSacTransferEvent(ev, opIndex, eventIndex);
-    if (transfer) out.push(transfer);
-  });
-  return out;
-}
-
 /**
  * Extracts SAC `transfer` events from a transaction response.
- *
- * `contractEventsXdr` (per operation, RPC ≥ 23) is preferred when it carries
- * events; otherwise the events are read from `resultMetaXdr` (v3
- * `sorobanMeta.events`, v4 per-operation `events`). Diagnostic events are
- * never considered.
  */
 export function sacTransfersFromMeta(input: SacMetaInput): SacTransfer[] {
-  const out: SacTransfer[] = [];
-
-  const contractEvents = input.contractEventsXdr;
-  if (Array.isArray(contractEvents) && contractEvents.some((ops) => Array.isArray(ops) && ops.length > 0)) {
-    contractEvents.forEach((ops, i) => {
-      if (!Array.isArray(ops)) return;
-      out.push(...decodeContractEvents(ops, i));
-    });
-    return out;
-  }
-
-  const meta = normalizeMeta(input.resultMetaXdr);
-  if (!meta) return out;
-
-  let switchValue: number | null = null;
-  try {
-    switchValue = typeof (meta as any).switch === 'function' ? (meta as any).switch() : null;
-  } catch {
-    switchValue = null;
-  }
-
-  if (switchValue === 3) {
-    try {
-      const sorobanMeta = (meta as any).v3().sorobanMeta();
-      const events = sorobanMeta && typeof sorobanMeta.events === 'function' ? sorobanMeta.events() : [];
-      out.push(...decodeContractEvents(events ?? [], null));
-    } catch {
-      // malformed meta: no transfers
-    }
-  } else if (switchValue === 4) {
-    try {
-      const operations = (meta as any).v4().operations() ?? [];
-      operations.forEach((op: any, i: number) => {
-        const events = op && typeof op.events === 'function' ? op.events() : [];
-        out.push(...decodeContractEvents(events ?? [], i));
-      });
-    } catch {
-      // malformed meta: no transfers
-    }
-  }
-
-  return out;
+  const extraction = extractContractEvents(input);
+  if (extraction.skipped) throw new AppError(502, 'CHAIN_EVENT_UNDECODABLE', 'Stellar RPC returned an undecodable contract event', { skipped: extraction.skipped });
+  return extraction.events.flatMap((event) => {
+    const transfer = decodeSacTransferEvent(event);
+    return transfer ? [transfer] : [];
+  });
 }

@@ -1,7 +1,8 @@
-import { Address, rpc, StrKey, xdr } from '@stellar/stellar-sdk';
-import { AppError } from '../../middlewares/error.middleware';
+import { rpc, xdr } from '@stellar/stellar-sdk';
+import { AppError } from '../../lib/app-error';
 import { readClients } from './clients';
 import { CONTRACTS } from '../../config/contracts';
+import { extractContractEvents } from './tx-events';
 
 /**
  * Unwraps fee-bump envelopes to get the inner Transaction.
@@ -55,9 +56,9 @@ export function setTransactionSender(next: TransactionSender): TransactionSender
 
 export interface ContractEventParsed {
   contractId: string;
-  name: string;
+  name: string | null;
   data: Record<string, any>;
-  rawEvent?: any;
+  opIndex: number;
 }
 
 /**
@@ -65,136 +66,29 @@ export interface ContractEventParsed {
  * `events.contractEventsXdr` or `resultMetaXdr` (supporting TransactionMeta v3
  * and v4 per-operation events). Filters by `contractIdFilter` when provided.
  */
-export function readContractEvents(
-  response: rpc.Api.GetTransactionResponse,
-  contractIdFilter?: string,
-): ContractEventParsed[] {
-  const results: ContractEventParsed[] = [];
-  const rawEvents: any[] = [];
+export function readContractEvents(response: rpc.Api.GetTransactionResponse): ContractEventParsed[] {
+  const input = response as any;
+  const extraction = extractContractEvents({
+    resultMetaXdr: input.resultMetaXdr,
+    contractEventsXdr: input.events?.contractEventsXdr,
+  });
+  if (extraction.skipped) throw new AppError(502, 'CHAIN_EVENT_UNDECODABLE', 'Stellar RPC returned an undecodable contract event', { skipped: extraction.skipped });
 
-  // Prefer RPC >= 23 per-operation contractEventsXdr when present and non-empty
-  const rpcContractEvents = (response as any)?.events?.contractEventsXdr;
-  if (Array.isArray(rpcContractEvents) && rpcContractEvents.some((ops: any) => Array.isArray(ops) && ops.length > 0)) {
-    for (const ops of rpcContractEvents) {
-      if (!Array.isArray(ops)) continue;
-      for (const ev of ops) {
-        if (typeof ev === 'string') {
-          try {
-            rawEvents.push(xdr.ContractEvent.fromXDR(ev, 'base64'));
-          } catch {}
-        } else if (ev) {
-          rawEvents.push(ev);
-        }
-      }
-    }
-  }
-
-  if (rawEvents.length === 0) {
-    let meta = (response as any).resultMetaXdr as any;
-    if (!meta) return results;
-
-    if (typeof meta === 'string') {
-      try {
-        meta = xdr.TransactionMeta.fromXDR(meta, 'base64');
-      } catch {
-        return results;
-      }
-    }
-
-    if (Array.isArray(meta.events)) {
-      rawEvents.push(...meta.events);
-    } else {
-      let switchVal: number | null = null;
-      try {
-        switchVal = typeof meta.switch === 'function' ? meta.switch() : null;
-      } catch {
-        switchVal = null;
-      }
-
-      if (switchVal === 3 || (switchVal === null && typeof meta.v3 === 'function')) {
-        try {
-          const sm = meta.v3().sorobanMeta?.();
-          const evs = sm && typeof sm.events === 'function' ? sm.events() : [];
-          if (Array.isArray(evs)) rawEvents.push(...evs);
-        } catch {}
-      }
-
-      if (rawEvents.length === 0 && (switchVal === 4 || (switchVal === null && typeof meta.v4 === 'function'))) {
-        try {
-          const v4 = meta.v4();
-          const operations = typeof v4?.operations === 'function' ? (v4.operations() ?? []) : [];
-          for (const op of operations) {
-            const evs = op && typeof op.events === 'function' ? op.events() : [];
-            if (Array.isArray(evs)) rawEvents.push(...evs);
-          }
-          if (rawEvents.length === 0) {
-            const sm = v4?.sorobanMeta?.();
-            const evs = sm && typeof sm.events === 'function' ? sm.events() : [];
-            if (Array.isArray(evs)) rawEvents.push(...evs);
-          }
-        } catch {}
-      }
-    }
-  }
-
-  const marketCoreSpec = readClients.marketCore().spec;
-
-  for (const ev of rawEvents) {
+  const specs = new Map([
+    [CONTRACTS.marketCore, readClients.marketCore().spec],
+    [CONTRACTS.treasury, readClients.treasury().spec],
+    [CONTRACTS.resolver, readClients.resolver().spec],
+    [CONTRACTS.reasoningRegistry, readClients.reasoningRegistry().spec],
+  ]);
+  return extraction.events.map((event) => {
+    const spec = specs.get(event.contractId);
+    if (!spec) return { contractId: event.contractId, name: null, data: {}, opIndex: event.opIndex };
     try {
-      let contractId = '';
-      if (ev.contractId) {
-        if (typeof ev.contractId === 'string') {
-          contractId = ev.contractId;
-        } else if (typeof ev.contractId.contractId === 'function') {
-          const cid = ev.contractId.contractId();
-          contractId = typeof cid === 'string' ? cid : StrKey.encodeContract(cid);
-        } else if (typeof ev.contractId === 'function') {
-          const scAddr = ev.contractId();
-          if (scAddr) {
-            contractId = Address.fromScAddress(scAddr).toString();
-          }
-        } else if (Buffer.isBuffer(ev.contractId)) {
-          contractId = StrKey.encodeContract(ev.contractId);
-        }
-      }
-
-      if (contractIdFilter && contractId && contractId !== contractIdFilter) {
-        continue;
-      }
-      if (contractId && contractId !== CONTRACTS.marketCore) {
-        continue;
-      }
-
-      let topics: xdr.ScVal[] = [];
-      let data: xdr.ScVal | undefined;
-
-      if (ev.body && typeof ev.body.v0 === 'function') {
-        const v0 = ev.body.v0();
-        topics = v0.topics?.() ?? [];
-        data = v0.data?.();
-      } else if (ev.body && ev.body.topics) {
-        topics = ev.body.topics;
-        data = ev.body.data;
-      } else if (ev.topic) {
-        topics = Array.isArray(ev.topic)
-          ? ev.topic.map((t: any) => (typeof t === 'string' ? xdr.ScVal.fromXDR(t, 'base64') : t))
-          : [];
-        data = typeof ev.value === 'string' ? xdr.ScVal.fromXDR(ev.value, 'base64') : ev.value;
-      }
-
-      if (topics.length > 0 && data) {
-        const parsed = marketCoreSpec.parseEvent(topics, data);
-        if (parsed) {
-          results.push({
-            contractId: contractId || CONTRACTS.marketCore,
-            name: parsed.name,
-            data: parsed.data,
-            rawEvent: ev,
-          });
-        }
-      }
-    } catch {}
-  }
-
-  return results;
+      const parsed = spec.parseEvent(event.topics, event.data);
+      if (!parsed) throw new Error('No matching event in contract spec');
+      return { contractId: event.contractId, name: parsed.name, data: parsed.data, opIndex: event.opIndex };
+    } catch {
+      throw new AppError(502, 'CHAIN_EVENT_UNDECODABLE', 'Contract event does not match its deployed spec', { contractId: event.contractId });
+    }
+  });
 }
