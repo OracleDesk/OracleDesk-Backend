@@ -24,7 +24,7 @@ export interface SocketUser {
   exp: number;
 }
 
-export const PRIVATE_EVENTS = ['PAYMENT_CONFIRMED', 'PASS_EXPIRING', 'COPY_TRADE_CONFIRMED', 'PREMIUM_DEVICE_EVICTED'] as const;
+export const PRIVATE_EVENTS = ['PAYMENT_CONFIRMED', 'PASS_EXPIRING', 'COPY_TRADE_CONFIRMED', 'POSITION_EXITED'] as const;
 export type PrivateEvent = (typeof PRIVATE_EVENTS)[number];
 
 export type SocketAuthCode = 'INVALID_TOKEN' | 'TOKEN_EXPIRED' | 'TOKEN_IN_QUERY';

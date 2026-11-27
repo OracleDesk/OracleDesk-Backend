@@ -30,7 +30,7 @@ import { ChainError, ChainPendingError } from './stellar/errors';
 import { registerHandler, type ChainTransactionRow, type CompletionContext, type CompletionOutcome } from './stellar/outbox';
 import { MIN_SEED_RAW, initialYesBps, decideSeed, type SeedDecision, type SeedPolicyConfig } from './seed-policy.service';
 import { agentSigner } from './stellar/clients';
-import { pinJson, cidForBytes } from './ipfs.service';
+import { pinJson, prepareDocument } from './ipfs.service';
 import { revealPriceSpec } from './price-resolution.service';
 import type { QuestionResolutionBlock } from './resolvability.service';
 import { AppError } from '../middlewares/error.middleware';
@@ -58,21 +58,13 @@ export async function handleMarketCreateOutcome(
   if (!marketId) return;
 
   if (outcome.status !== 'SUCCESS') {
-    const existing = await ctx.tx.agentLog.findFirst({
-      where: { action: 'MARKET_CREATION_FAILED', marketId, data: { path: ['outboxId'], equals: row.id } },
-      select: { id: true },
-    });
-    if (existing) return;
-    await writeAgentLog(
-      {
-        agentType: 'MARKET_MAKER',
-        level: 'ERROR',
-        action: 'MARKET_CREATION_FAILED',
-        marketId,
-        data: { outboxId: row.id, status: outcome.status, error: outcome.error ?? null, txHash: outcome.txHash ?? null },
-      },
-      ctx.tx,
-    );
+    await writeAgentLog({
+      agentType: 'MARKET_MAKER',
+      level: 'ERROR',
+      action: 'MARKET_CREATION_FAILED',
+      marketId,
+      data: { outboxId: row.id, status: outcome.status, error: outcome.error ?? null, txHash: outcome.txHash ?? null },
+    }).catch(() => undefined);
     return;
   }
 
@@ -267,37 +259,28 @@ export interface PreparedMarketCommitment {
  * If a seedAmountRaw was already stored on the market row from a previous attempt,
  * reuses that stored seed to preserve the readSeedBudget accounting invariant.
  */
-export function resolveSeed(
-  market: Market,
-  plan?: SeedPlan,
-): { seedRaw: bigint; initialYesBps: number } {
-  const requested = usdcFromNumber(market.minimumLiquidity);
-  const plannedSeed = plan ? plan.seedRaw : requested < MIN_SEED_RAW ? MIN_SEED_RAW : requested;
-  const initialBps = plan ? plan.initialYesBps : initialYesBps(market.initialYesProb);
-  let seedRaw = plannedSeed;
-  if (market.seedAmountRaw != null) {
-    const stored = BigInt(market.seedAmountRaw);
-    if (stored !== plannedSeed) {
-      logger.warn(
-        { marketId: market.id, stored: stored.toString(), planned: plannedSeed.toString() },
-        'Reusing stored seedAmountRaw which differs from plan',
-      );
-    }
-    seedRaw = stored;
-  }
-  return { seedRaw, initialYesBps: initialBps };
+/** Everything a creation attempt commits to, computed locally and deterministically (#328). */
+export interface MarketCommitment {
+  spec: ResolutionSpecJson;
+  resolutionHashBytes: Buffer;
+  resolutionHashHex: string;
+  doc: ReturnType<typeof questionDocument>;
+  docName: string;
+  /** sha256 of the canonical question document: the on-chain question_hash. */
+  questionHash: string;
+  /** CID the document has when pinned (computed locally; nothing is pinned here). */
+  questionCid: string;
 }
 
 /**
- * Phase 1 of market creation (#217): prepares the commitment, pins the question document
- * at most once per market, enforces the QUESTION_HASH_MISMATCH guard, and persists the
- * commitment fields to Postgres in both dry-run and live modes.
+ * Builds the question document and its hash and CID without pinning anything.
+ * Dry-run cycles and retries that never reach the chain must not leave
+ * documents pinned at the provider (#328).
  */
 export async function prepareMarketCommitment(
   market: Market,
   spec: ResolutionSpecJson = defaultResolutionSpec(),
-  plan?: SeedPlan,
-): Promise<PreparedMarketCommitment> {
+): Promise<MarketCommitment> {
   const resolutionHashBytes = resolutionHash(spec);
   const resolutionHashHex = resolutionHashBytes.toString('hex');
 
@@ -307,49 +290,24 @@ export async function prepareMarketCommitment(
   }
 
   const doc = questionDocument(market, resolutionHashHex, spec);
-  const docBytes = canonicalBytes(doc);
-  const docHash = sha256Hex(docBytes);
+  const docName = `oracledesk-market-${market.id}`;
+  const prepared = prepareDocument(doc, docName);
 
-  // If stored questionHash differs from canonical doc bytes, reject (admin edited question after pin)
-  if (market.questionHash && market.questionHash.toLowerCase() !== docHash.toLowerCase()) {
+  // Abort if a re-pinned question document produces a hash different from stored (#41)
+  if (market.questionHash && market.questionHash !== prepared.hash) {
     throw new AppError(409, 'QUESTION_HASH_MISMATCH', 'Re-pinned question document produced a hash different from stored questionHash');
   }
+  return { spec, resolutionHashBytes, resolutionHashHex, doc, docName, questionHash: prepared.hash, questionCid: prepared.cid };
+}
 
-  const { seedRaw, initialYesBps } = resolveSeed(market, plan);
-
-  if (market.questionHash && market.metaUri) {
-    // Pin reuse: do not call pinJson or IPFS transport (#217)
-    if (!market.resolutionHash || !market.resolutionSpec || market.seedAmountRaw == null) {
-      await prisma.market.update({
-        where: { id: market.id },
-        data: {
-          ...(market.resolutionSpec ? {} : { resolutionSpec: spec as object }),
-          ...(market.resolutionHash ? {} : { resolutionHash: resolutionHashHex }),
-          ...(market.seedAmountRaw != null ? {} : { seedAmountRaw: seedRaw.toString() }),
-        },
-      }).catch(() => undefined);
-    }
-
-    const questionCid = market.metaUri.startsWith('ipfs://') ? market.metaUri.slice(7) : cidForBytes(docBytes);
-    return {
-      spec,
-      resolutionHashBytes,
-      resolutionHashHex,
-      questionHash: market.questionHash,
-      questionCid,
-      metaUri: market.metaUri,
-      seedRaw,
-      initialYesBps,
-      reusedPin: true,
-    };
-  }
-
-  // Not yet pinned: pin once and persist in both modes (live and dry-run)
-  const pinned = await pinJson(doc, `oracledesk-market-${market.id}`);
-
-  if (market.questionHash && market.questionHash.toLowerCase() !== pinned.hash.toLowerCase()) {
-    throw new AppError(409, 'QUESTION_HASH_MISMATCH', 'Re-pinned question document produced a hash different from stored questionHash');
-  }
+export async function submitMarketCreation(
+  market: Market,
+  prep?: MarketCommitment,
+  plan?: SeedPlan,
+): Promise<WriteResult<bigint>> {
+  const commitment = prep ?? (await prepareMarketCommitment(market));
+  const { spec, resolutionHashBytes, resolutionHashHex, doc, docName } = commitment;
+  const pinned = { hash: commitment.questionHash, cid: commitment.questionCid };
 
   let finalQuestionHash = pinned.hash;
   let finalMetaUri = `ipfs://${pinned.cid}`;
@@ -463,6 +421,28 @@ export async function submitMarketCreation(
     };
   }
 
+  const requested = usdcFromNumber(market.minimumLiquidity);
+  const seed = plan ? plan.seedRaw : requested < MIN_SEED_RAW ? MIN_SEED_RAW : requested;
+  const openBps = plan ? plan.initialYesBps : initialYesBps(market.initialYesProb);
+
+  // Pin once per live creation attempt, only after the claim and discovery
+  // established that this process is going to submit (#328). A pin already in
+  // the ledger (a retry of the same bytes) is not sent to the provider again.
+  const remote = await pinJson(doc, docName, { owner: { kind: 'MARKET_QUESTION', id: market.id } });
+  const questionHash = remote.hash;
+  const metaUri = `ipfs://${remote.cid}`;
+
+  await prisma.market.update({
+    where: { id: market.id },
+    data: {
+      resolutionSpec: spec as object,
+      resolutionHash: resolutionHashHex,
+      questionHash,
+      metaUri,
+      seedAmountRaw: seed.toString(),
+    },
+  });
+
   let preCount: bigint | null = null;
   try {
     preCount = await marketCount();
@@ -486,9 +466,9 @@ export async function submitMarketCreation(
   try {
     result = await agentCreateMarket(
       {
-        question_hash: Buffer.from(prep.questionHash, 'hex'),
-        resolution_hash: prep.resolutionHashBytes,
-        meta_uri: prep.metaUri,
+        question_hash: Buffer.from(pinned.hash, 'hex'),
+        resolution_hash: resolutionHashBytes,
+        meta_uri: metaUri,
         category: toContractCategoryValue(market.category),
         close_time: BigInt(Math.floor(market.expiryTimestamp.getTime() / 1000)),
         seed_amount: prep.seedRaw,
@@ -588,16 +568,11 @@ export async function submitMarketCreation(
   return result;
 }
 
-/**
- * Creates the market on-chain by preparing the commitment and submitting it (#217).
- * Thin wrapper with the signature expected by the market maker agent and saga.
- */
 export async function createMarketOnChain(
   market: Market,
   spec: ResolutionSpecJson = defaultResolutionSpec(),
   plan?: SeedPlan,
 ): Promise<WriteResult<bigint>> {
-  const prep = await prepareMarketCommitment(market, spec, plan);
-  return submitMarketCreation(market, prep);
+  const prep = await prepareMarketCommitment(market, spec);
+  return submitMarketCreation(market, prep, plan);
 }
-

@@ -9,7 +9,7 @@ OracleDesk pins verifiable artefacts to IPFS:
 ## 1. Versioning Policy
 
 Every pinned document includes explicit metadata:
-- `schemaVersion`: an integer version number (e.g. `2` for TraceDocV2, `2` for QuestionDocV2).
+- `schemaVersion`: an integer version number (e.g. `1` for TraceDocV1, `2` for QuestionDocV2).
 - `kind`: document discriminator (e.g. `'oracledesk.trace'`, `'oracledesk.question'`, `'oracledesk.trace.enc'`).
 
 Any semantic change, added required field, or removed field bumps `schemaVersion`.
@@ -71,78 +71,6 @@ JSON Schema URL: `https://api.oracledesk.io/api/v1/schemas/trace/v1.json`
   "createdAt": "2026-10-17T00:00:00.000Z"
 }
 ```
-
----
-
-## 3b. Reasoning Trace Document (v2)
-
-JSON Schema URL: `https://api.oracledesk.io/api/v1/schemas/trace/v2.json` (committed as `src/schemas/trace-v2.schema.json`).
-
-Every trace generated since #227 is v2. It is v1 plus everything the agents compute for a decision. v1 is published with `additionalProperties: false`, so these fields bump the version instead of changing v1:
-
-| Field | Type | Notes |
-|---|---|---|
-| `sourcesUsed[]` | object | v1 keys plus `signalId`, `url`, `publisher`, `publishedAt` (#73). Each one is `null` when the signal does not carry it. |
-| `provenance` | object | `{ schema, llm: [...], generator }` (#66). `llm` has at least one entry, because the hedge-condition fallback records a `source: "default"` entry. `fallbackFrom` and `generator.commit` are omitted, not nulled, when they don't apply. |
-| `forecast` | object \| null | Ensemble members, weights and input digests (#75). Trader traces only. |
-| `sizing` | object \| null | Kelly/correlation/final sizes and budget snapshot (#76). Trader traces only. |
-| `seedPolicy` | object \| null | Seed-policy record (#82). Market-creation traces only. |
-| `correlation` | object \| null | `{ pairs, method: "snapshot"\|"matrix", snapshotId }` (#80). Trader traces only. |
-| `corroboration` | object \| null | `{ kind: "CORROBORATED"\|"AUTHORITATIVE"\|"UNCORROBORATED", units, domains }` (#228). Market-creation traces only; the corroborating signals are also in `sourcesUsed`. |
-
-`createdAt` comes from `lib/clock`, so cassette replays produce identical bytes. `forecast`, `sizing`, `seedPolicy` and `correlation.pairs` are normalised to plain JSON before validation: `Date` values become ISO strings, `bigint` values become decimal strings, and non-finite numbers become `null`.
-
-```json
-{
-  "schemaVersion": 2,
-  "kind": "oracledesk.trace",
-  "traceId": "11111111-1111-4111-8111-111111111111",
-  "agentType": "MARKET_MAKER",
-  "decisionType": "MARKET_CREATION",
-  "action": "market_creation",
-  "market": { "backendId": "22222222-2222-4222-8222-222222222222", "onChainId": null },
-  "probabilityEstimate": 0.65,
-  "marketProbability": 0.62,
-  "edge": 0.03,
-  "confidenceInterval": { "lower": 0.55, "upper": 0.75 },
-  "sourcesUsed": [
-    {
-      "source": "NEWS",
-      "weight": 0.8,
-      "signal": "Fed signals a pause",
-      "rawValue": null,
-      "signalId": "sig_01",
-      "url": "https://example.com/fed",
-      "publisher": "Example Wire",
-      "publishedAt": "2026-10-16T12:00:00.000Z"
-    }
-  ],
-  "betFraction": null,
-  "betSizeUsdc": null,
-  "hedgeConditions": ["Close if market probability rises above 0.75"],
-  "agentWallet": null,
-  "createdAt": "2026-10-17T00:00:00.000Z",
-  "provenance": {
-    "schema": "oracledesk.trace.provenance/1",
-    "llm": [
-      { "source": "default", "promptId": "hedge-conditions", "promptVersion": 1, "reason": "LLM_FAILED" }
-    ],
-    "generator": { "service": "oracledesk-backend", "version": "1.0.0" }
-  },
-  "forecast": null,
-  "sizing": null,
-  "seedPolicy": { "seedRaw": "100000000", "initialYesBps": 6200 },
-  "correlation": null,
-  "corroboration": { "kind": "CORROBORATED", "units": 2, "domains": ["example.com", "wire.example.org"] }
-}
-```
-
-### On-chain market id policy
-
-- `market.onChainId` records what was known **when the decision was made**. `generateReasoningTrace` reads it from `markets.onChainMarketId`. It is usually `null` for market-creation traces, because the trace is generated before the creation transaction is confirmed, and it is set for trader traces on live markets.
-- It is **never updated afterwards**. The payload is final when it is enqueued: no caller adds keys to it (the old top-level `onChainMarketId` spread is gone), and the pinned bytes define `traceHash`.
-- The **authoritative link** is the registry entry's `market_id`. The publication worker reads it from `markets.onChainMarketId` at publish time and passes it to `publish_trace`.
-- The worker validates the stored payload before pinning and again before publishing. A payload that declares `schemaVersion: 2` and fails the v2 schema, or whose `traceId` differs from the row's, fails with `TRACE_PAYLOAD_INVALID`. A v2 payload whose non-null `market.onChainId` differs from the market row's id fails with `TRACE_MARKET_MISMATCH`, so a trace is never registered under the wrong market. v1 and legacy payloads that were already enqueued keep pinning byte-for-byte as stored.
 
 ---
 
@@ -208,51 +136,26 @@ JSON Schema URL: `https://api.oracledesk.io/api/v1/schemas/question/v2.json`
 }
 ```
 
-## Recalibration fields (#244)
+## Pin lifecycle (#328)
 
-For TRADER traces, the `forecast` block (the ensemble) may carry:
+Every document pinned to the provider is recorded in `ipfs_pins`, and every use of it by a market question or a
+reasoning trace in `ipfs_pin_refs`.
 
-| Field | Type | Meaning |
-| ----- | ---- | ------- |
-| `forecast.raw.p` | number | Ensemble probability before recalibration |
-| `forecast.raw.ci` | `{ lower, upper }` | Ensemble 90% interval before recalibration |
-| `forecast.calibration` | object \| null | `{ mapId, version, category, applied }` of the map behind `probabilityEstimate`; `applied: false` when recalibration is disabled |
+| Reference state | Meaning |
+|---|---|
+| `CANDIDATE` | Pinned for an owner that is not on chain yet. |
+| `ANCHORED` | The owner is on chain (`onChainMarketId` / `onChainTraceId` set). The CID is never unpinned. |
+| `RELEASED` | The owner never reached the chain and is past the grace period. |
 
-`probabilityEstimate` and `confidenceInterval` are the values the trade was
-sized on (after recalibration when applied). The database also stores
-`rawProbabilityEstimate` per trace; it is not part of the pinned document.
-Readers must treat all three fields as optional: traces written before #244
-do not have them.
-
-## Impact-aware sizing fields (#225)
-
-TRADER traces size orders against the market's FPMM curve. The `sizing`
-block carries an `impact` object describing the fill at `sizing.finalRaw`,
-priced for the side bought. Every value is a string or an integer, so the
-block is canonical-safe:
-
-| Field | Type | Meaning |
-| ----- | ---- | ------- |
-| `sizing.impact.model` | string | `impact` (sized on the curve) or `mid` (closed-form Kelly at the mid, backtest comparison) |
-| `sizing.impact.midBps` | integer | Price of the side bought before the trade |
-| `sizing.impact.avgPriceBps` | integer | `collateral × 10 000 / shares`, fee included |
-| `sizing.impact.postPriceBps` | integer | Price of the side bought after the trade |
-| `sizing.impact.impactBps` | integer | Curve impact only: `(collateral − fee) × 10 000 / shares − midBps` |
-| `sizing.impact.feeRaw` | string | Fee in collateral base units (the market's own `fee_bps`, rounded up) |
-| `sizing.impact.expectedSharesRaw` | string | Shares out from `calcBuy` at the sized collateral |
-| `sizing.impact.effectiveEdge` | string | Conservative probability minus average price, 6 decimals |
-| `sizing.impact.poolLedger` | integer | Ledger the reserves are valid at |
-| `sizing.impact.poolSource` | string | `indexed`, `rpc` or `sim` (backtest) |
-
-`sizing.binding` may now also be `IMPACT`: the curve's optimum, below every
-cap, set the size. `sizing.kellyRaw` is that optimum within the caps, before
-correlation. Traces written before #225 have no `impact` block.
-## Signer attestation evidence bundles (#323)
-
-The signer portal pins a canonical JSON bundle before preparing an attestation. Its
-`version` is `1`, `kind` is `oracledesk.attestation-evidence`, and the bundle
-contains the market, signer, outcome, committed question and resolution hashes,
-plus fetched source URL/hash/size metadata. The SHA-256 of the canonical bytes is
-the trace hash published to the reasoning registry; the subsequent resolver call
-uses `attest_with_evidence` with the returned trace id. Source URLs are HTTPS-only,
-size-capped and never followed across redirects.
+- `pinJson(doc, name, { owner })` computes the canonical bytes and CID, records the pin and a reference, and calls
+  the provider only if the CID is not already `PINNED`. Identical bytes pinned twice add a second reference.
+- Dry-run never pins: `prepareMarketCommitment` computes the CID locally (`cidForBytes`). A live creation pins once,
+  after the creation attempt has been claimed and discovery found nothing on chain.
+- References become `ANCHORED` in `linkLandedMarket`, `handleTracePublishOutcome`, the trace publication worker and
+  the indexer's `TracePublished` projection. The GC job repeats this for any owner already on chain, so a missed hook
+  cannot cause an unpin.
+- Published documents without a trace row (transparency reports) use the `DOCUMENT` owner kind: anchored when
+  published, never released automatically.
+- The GC job unpins a CID only when all of its references are `RELEASED` (or it has none and is older than the grace
+  period). A pin requested again while an unpin is in flight sets `repinRequested`; the GC restores it from the content
+  store after the unpin completes.

@@ -14,7 +14,6 @@
  * unknown stays SUBMITTED and blocks new exits for that position until the
  * next call reconciles it against the on-chain balance, so it never sells twice.
  */
-import type { Prisma } from '@prisma/client';
 import { nowMs } from '../lib/clock';
 import { config } from '../config';
 import { prisma } from '../lib/prisma';
@@ -33,8 +32,8 @@ import { checkFillDiscrepancies, resolveAgentTradeFill } from './agent-fill.serv
 import {
   bigintToDecimalString,
   decimalToBigint,
-  priceBpsFromRaw,
   toDisplayUsdc,
+  usdcFromNumber,
 } from '../lib/amounts';
 import { MathError, calcSell, collateralOutForShares, priceYesBps } from '../generated/fpmm';
 import type { Market as OnChainMarket } from '../generated/market-core';
@@ -51,6 +50,9 @@ import {
 import { ChainError, ChainPendingError } from './stellar/errors';
 import { registerHandler, type ChainTransactionRow, type CompletionContext, type CompletionOutcome } from './stellar/outbox';
 import { AgentPausedError } from './agent-controls.service';
+import crypto from 'node:crypto';
+import { ExitTraceDocV1 } from '../schemas/trace';
+import { exitTraceAction } from '../lib/trace-actions';
 
 /** Remaining shares at or below this are dust: the position counts as closed. */
 export const DUST_SHARES = 1_000n;
@@ -142,22 +144,24 @@ interface LoadedPosition {
   marketId: string;
   direction: Outcome;
   status: string;
+  size: number;
   sharesRaw: any;
   costBasisRaw: any;
   realisedCollateralRaw: any;
   realisedPnlRaw: any;
-  entryPriceBps: number | null;
-  trade: { amountRaw: any; collateralRaw: any } | null;
+  entryTraceId: string | null;
+  markPriceBps: number | null;
+  liquidationValueRaw: any;
+  valuationSource: string | null;
+  markedAt: Date | null;
+  trade: { amount: number } | null;
   market: { id: string; onChainMarketId: bigint | null; expiryTimestamp: Date };
 }
 
 const loadPosition = (id: string) =>
   prisma.position.findUnique({
     where: { id },
-    include: {
-      trade: { select: { amountRaw: true, collateralRaw: true } },
-      market: { select: { id: true, onChainMarketId: true, expiryTimestamp: true } },
-    },
+    include: { trade: { select: { amount: true } }, market: { select: { id: true, onChainMarketId: true, expiryTimestamp: true } } },
   }) as unknown as Promise<LoadedPosition | null>;
 
 const outcomeValue = (o: Outcome) => (o === 'YES' ? Outcomes.Yes : Outcomes.No);
@@ -233,11 +237,6 @@ async function recordFailure(
  * with the position update, so the trade.sell completion handler (inline or
  * crash recovery) and exitPosition's direct path can both call it safely —
  * whoever wins the CAS applies the position deltas, the loser reads back.
- *
- * The deltas are computed from the position as read inside that transaction
- * under FOR UPDATE, not from the caller's earlier read: two exits of one
- * position confirmed at once (two recoverers, #229) would otherwise both start
- * from the same sharesBefore and the second update would undo the first.
  */
 async function applyConfirmedExitInTx(
   tx: Prisma.TransactionClient,
@@ -310,53 +309,133 @@ async function applyConfirmedExitInTx(
 async function applyConfirmedExit(
   position: LoadedPosition,
   exitId: string,
-  p: {
-    sold: bigint;
-    collateralOut: bigint;
-    txHash: string | null;
-    reason: string;
-    note?: string;
-    feeRaw?: bigint | null;
-    reserveYesRaw?: bigint | null;
-    reserveNoRaw?: bigint | null;
-    fillLedger?: number | null;
-    fillMismatch?: Record<string, unknown> | null;
-  },
+  p: { sold: bigint; collateralOut: bigint; txHash: string | null; reason: string; note?: string; estimated?: boolean },
 ): Promise<{ closed: boolean; applied: boolean }> {
-  const result = await prisma.$transaction((tx) => applyConfirmedExitInTx(tx, position.id, exitId, p));
-  if (!result) {
+  const sharesBefore = decimalToBigint(position.sharesRaw);
+  const costBefore = position.costBasisRaw == null
+    ? usdcFromNumber(position.trade?.amount ?? position.size)
+    : decimalToBigint(position.costBasisRaw);
+  const sold = p.sold > sharesBefore ? sharesBefore : p.sold;
+  const remaining = sharesBefore - sold;
+  const closed = remaining <= DUST_SHARES;
+  const costSold = closed || sharesBefore === 0n ? costBefore : (costBefore * sold) / sharesBefore;
+  const realisedPnlRaw = decimalToBigint(position.realisedPnlRaw) + (p.collateralOut - costSold);
+  const effectivePrice = sold > 0n ? Math.min(1, Number(p.collateralOut) / Number(sold)) : null;
+  const traceId = crypto.randomUUID();
+  const action = exitTraceAction(position.direction);
+  const traceReason = p.reason.trim().slice(0, 64) || 'EXIT';
+  const entry = position.entryTraceId
+    ? await prisma.reasoningTrace.findUnique({ where: { id: position.entryTraceId }, select: { onChainTraceId: true } })
+    : null;
+  const markSource = position.valuationSource === 'indexed' || position.valuationSource === 'rpc'
+    ? position.valuationSource
+    : 'estimated';
+  const traceDoc = ExitTraceDocV1.parse({
+    schemaVersion: 1,
+    kind: 'oracledesk.trace.exit',
+    traceId,
+    agentType: 'TRADER',
+    action,
+    market: { backendId: position.marketId, onChainId: String(position.market.onChainMarketId) },
+    entry: { traceId: position.entryTraceId, onChainTraceId: entry?.onChainTraceId?.toString() ?? null },
+    reason: traceReason,
+    mark: {
+      source: markSource,
+      ledger: null,
+      priceBps: position.markPriceBps,
+      liquidationValueRaw: position.liquidationValueRaw == null ? null : decimalToBigint(position.liquidationValueRaw).toString(),
+    },
+    fill: {
+      sharesSoldRaw: sold.toString(),
+      collateralOutRaw: p.collateralOut.toString(),
+      txHash: p.txHash,
+      estimated: p.estimated ?? false,
+    },
+    realisedPnlRaw: (p.collateralOut - costSold).toString(),
+    positionClosed: closed,
+    narrative: null,
+    agentWallet: null,
+    createdAt: new Date().toISOString(),
+  });
+
+  const applied = await prisma.$transaction(async (tx) => {
+    const won = await tx.positionExit.updateMany({
+      where: { id: exitId, status: 'SUBMITTED' },
+      data: {
+        status: 'CONFIRMED',
+        sharesSoldRaw: bigintToDecimalString(sold),
+        collateralOutRaw: bigintToDecimalString(p.collateralOut),
+        effectivePrice,
+        txHash: p.txHash,
+        error: p.note ?? null,
+        traceId,
+      },
+    });
+    if (won.count === 0) return false;
+    await tx.position.update({
+      where: { id: position.id },
+      data: {
+        sharesRaw: bigintToDecimalString(remaining),
+        costBasisRaw: bigintToDecimalString(costBefore - costSold),
+        realisedCollateralRaw: bigintToDecimalString(decimalToBigint(position.realisedCollateralRaw) + p.collateralOut),
+        realisedPnlRaw: bigintToDecimalString(realisedPnlRaw),
+        pnl: toDisplayUsdc(realisedPnlRaw),
+        ...(closed
+          ? {
+              status: p.reason === 'STOP_LOSS' ? 'STOP_LOSS' : 'CLOSED',
+              closedAt: new Date(),
+              closeReason: p.reason,
+              markValueRaw: '0',
+              liquidationValueRaw: '0',
+              unrealisedPnlRaw: '0',
+              ...(effectivePrice !== null ? { currentPrice: effectivePrice } : {}),
+            }
+          : {}),
+      } as any,
+    });
+    const probability = (position.markPriceBps ?? Math.round((effectivePrice ?? 0.5) * 10_000)) / 10_000;
+    await tx.reasoningTrace.create({
+      data: {
+        id: traceId,
+        marketId: position.marketId,
+        agentType: 'TRADER',
+        decisionType: 'EXIT',
+        sourcesUsed: [{ source: 'position_exit', weight: 1, signal: traceReason }],
+        probabilityEstimate: probability,
+        marketProbability: probability,
+        edge: 0,
+        confidenceInterval: { lower: probability, upper: probability },
+        previewSources: [{ source: 'position_exit', signal: traceReason }],
+      },
+    });
+    await tx.tracePublication.create({ data: { traceId, action, payload: traceDoc as any } });
+    return true;
+  });
+  if (!applied) {
     const current = await prisma.position.findUnique({ where: { id: position.id }, select: { status: true } });
     return { closed: current != null && current.status !== 'OPEN', applied: false };
   }
-  if (result.closed) {
-    await cancelPositionPredicates(position.id).catch((err) => {
-      logger.warn({ err, positionId: position.id }, 'Failed to cancel predicates on closed position');
-    });
-  }
-  return { closed: result.closed, applied: true };
+  return { closed, applied: true };
 }
 
-/** Fills missing raw position accounting only from exact fills or chain balances. */
+/** Fills sharesRaw / costBasisRaw for a pre-#78 row from the on-chain balance. */
 async function backfillShares(position: LoadedPosition, held: bigint): Promise<LoadedPosition> {
-  const others = await prisma.position.findMany({
+  const others = (await prisma.position.findMany({
     where: { marketId: position.marketId, direction: position.direction, status: 'OPEN', id: { not: position.id } },
-    select: { sharesRaw: true },
-  });
-  const othersShares = others.reduce((sum, other) => {
-    if (other.sharesRaw == null) {
-      throw new AppError(409, 'POSITION_ACCOUNTING_RAW_MISSING', 'Cannot allocate on-chain shares without exact balances for peer positions');
-    }
-    return sum + decimalToBigint(other.sharesRaw);
-  }, 0n);
-  if (held < othersShares) {
-    throw new AppError(409, 'POSITION_ACCOUNTING_RAW_MISSING', 'On-chain balance is below recorded peer position shares');
+    select: { id: true, size: true },
+  })) as Array<{ id: string; size: number }>;
+  const totalSize = position.size + others.reduce((acc, o) => acc + o.size, 0);
+  // Several open positions share one on-chain balance: split it pro rata by size.
+  const sizeRaw = usdcFromNumber(position.size);
+  const totalRaw = usdcFromNumber(totalSize);
+  const shares = others.length === 0 || totalRaw === 0n ? held : (held * sizeRaw) / totalRaw;
+  const costBasisRaw = position.costBasisRaw == null ? usdcFromNumber(position.trade?.amount ?? position.size) : decimalToBigint(position.costBasisRaw);
+  if (others.length > 0) {
+    logger.warn(
+      { positionId: position.id, held: held.toString(), assigned: shares.toString(), openPositions: others.length + 1 },
+      'Several open positions share one on-chain balance; split pro rata by size',
+    );
   }
-  const shares = held - othersShares;
-  const cost = position.costBasisRaw ?? position.trade?.collateralRaw ?? position.trade?.amountRaw;
-  if (cost == null) {
-    throw new AppError(409, 'POSITION_ACCOUNTING_RAW_MISSING', 'Position has no exact collateral cost basis');
-  }
-  const costBasisRaw = decimalToBigint(cost);
   await prisma.position.update({
     where: { id: position.id },
     data: { sharesRaw: bigintToDecimalString(shares), costBasisRaw: bigintToDecimalString(costBasisRaw), valuationSource: 'estimated' } as any,
@@ -391,6 +470,7 @@ async function reconcileStuckExit(position: LoadedPosition, stuck: any): Promise
       txHash: stuck.txHash ?? null,
       reason: stuck.reason,
       note: 'Reconciled from the on-chain balance; collateral is the planned collateral_out',
+      estimated: true,
     });
     return true;
   } catch (err) {
@@ -544,6 +624,20 @@ export async function exitPosition(
         status: 'SUBMITTED',
         collateralOutRaw: bigintToDecimalString(plan.collateralOut),
         maxSharesInRaw: bigintToDecimalString(plan.maxSharesIn),
+        context: {
+          reason: opts.reason,
+          mark: {
+            source: position.valuationSource ?? 'estimated',
+            ledger: null,
+            priceBps: position.markPriceBps,
+            liquidationValueRaw: position.liquidationValueRaw == null ? null : decimalToBigint(position.liquidationValueRaw).toString(),
+          },
+          costBasisRaw: decimalToBigint(position.costBasisRaw).toString(),
+          sharesHeldRaw: recorded.toString(),
+          plannedCollateralOutRaw: plan.collateralOut.toString(),
+          entryTraceId: position.entryTraceId,
+          decidedAt: new Date().toISOString(),
+        },
       },
     });
 
@@ -590,14 +684,12 @@ export async function exitPosition(
       const sold = BigInt(result.value);
 
       if (result.mode === 'dry-run') {
-        const effectivePriceBps = priceBpsFromRaw(plan.collateralOut, sold);
         await prisma.positionExit.update({
           where: { id: row.id },
           data: {
             status: 'SIMULATED',
             sharesSoldRaw: bigintToDecimalString(sold),
-            effectivePrice: effectivePriceBps === null ? null : effectivePriceBps / 10_000,
-            effectivePriceBps,
+            effectivePrice: sold > 0n ? Math.min(1, Number(plan.collateralOut) / Number(sold)) : null,
           },
         });
         return { exitId: row.id, status: 'SIMULATED', sharesSoldRaw: sold, collateralOutRaw: plan.collateralOut, closed: false };

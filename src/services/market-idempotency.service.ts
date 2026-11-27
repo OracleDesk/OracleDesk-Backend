@@ -1,5 +1,5 @@
 import { prisma } from '../lib/prisma';
-import { seedReserves } from '../generated/fpmm';
+import { anchorRefs } from './pin-ledger.service';
 import { logger } from '../lib/logger';
 import { writeAgentLog } from '../lib/agent-log';
 import { CONTRACTS } from '../config/contracts';
@@ -291,6 +291,8 @@ export async function linkLandedMarket(
         });
       }
     });
+    // The question document is now referenced on chain: it must never be unpinned (#328).
+    await anchorRefs('MARKET_QUESTION', marketId, `market:${onChainMarketId.toString()}`);
     return true;
   } catch (err: any) {
     // Unique violation on onChainMarketId (P2002)

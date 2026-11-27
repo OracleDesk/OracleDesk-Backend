@@ -68,8 +68,7 @@ export { calculateKellySize } from './kelly';
  */
 export async function applyBuySuccess(
   tradeId: string,
-  fill: { sharesOut: bigint; collateralIn: bigint; feeRaw: bigint; txHash: string | null; innerTxHash: string | null },
-  db: Prisma.TransactionClient | typeof prisma = prisma,
+  fill: { sharesOut: bigint; collateralIn: bigint; feeRaw: bigint; txHash: string | null; innerTxHash: string | null; traceId?: string | null },
 ): Promise<void> {
   const trade = await db.trade.findUnique({ where: { id: tradeId }, select: { id: true, marketId: true, direction: true, amount: true } });
   if (!trade) return;
@@ -112,6 +111,7 @@ export async function applyBuySuccess(
         entryPriceBps: fillPriceBps,
         costBasisRaw: bigintToDecimalString(fill.collateralIn),
         feesPaidRaw: bigintToDecimalString(fill.feeRaw),
+        entryTraceId: fill.traceId ?? null,
       },
     });
     if (trade.traceId) {
@@ -121,6 +121,9 @@ export async function applyBuySuccess(
     }
   } catch (err) {
     if (!(err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002')) throw err;
+    if (fill.traceId) {
+      await prisma.position.updateMany({ where: { tradeId, entryTraceId: null }, data: { entryTraceId: fill.traceId } });
+    }
   }
 }
 
@@ -155,45 +158,14 @@ export async function handleTradeBuyOutcome(
     return;
   }
 
-  const args = (row.args ?? {}) as { collateral_in?: string; feeRaw?: string; min_shares_out?: string };
-  const trade = await prisma.trade.findUnique({
-    where: { id: tradeId },
-    select: { marketId: true, direction: true, market: { select: { onChainMarketId: true } } },
-  });
-
-  const eventFill = await resolveAgentTradeFill({
-    confirmedTx: outcome.confirmedTx,
-    txHashes: [outcome.txHash, row.landedHash, row.hash],
-    onChainMarketId: trade?.market?.onChainMarketId ?? undefined,
-    isBuy: true,
-    outcome: trade?.direction === 'NO' ? 'No' : 'Yes',
-  });
-
-  const simulatedShares = outcome.value !== undefined && outcome.value !== null ? BigInt(String(outcome.value)) : null;
-  const requestedCollateral = args.collateral_in ? BigInt(args.collateral_in) : null;
-  const minSharesOut = args.min_shares_out ? BigInt(args.min_shares_out) : null;
-
-  const fillMismatch = eventFill
-    ? await checkFillDiscrepancies(eventFill, {
-        simulatedShares,
-        minSharesOut,
-        requestedCollateral,
-        marketId: trade?.marketId ?? null,
-        refId: tradeId,
-        kind: 'buy',
-      })
-    : null;
-
+  const args = (row.args ?? {}) as { collateral_in?: string; feeRaw?: string; traceId?: string };
   await applyBuySuccess(tradeId, {
     sharesOut: eventFill ? eventFill.shares : (simulatedShares ?? 0n),
     collateralIn: eventFill ? eventFill.collateral : (requestedCollateral ?? 0n),
     feeRaw: eventFill ? eventFill.fee : BigInt(args.feeRaw ?? '0'),
     txHash: outcome.txHash ?? row.landedHash ?? null,
     innerTxHash: row.hash,
-    reserveYesRaw: eventFill?.reserveYes ?? null,
-    reserveNoRaw: eventFill?.reserveNo ?? null,
-    fillLedger: eventFill?.ledger ?? outcome.ledger ?? null,
-    fillMismatch,
+    traceId: args.traceId ?? null,
   });
 }
 
@@ -430,15 +402,13 @@ export async function executeTrade(payload: TradePayload): Promise<{
     return { trade: { ...trade, status: 'CANCELLED' }, position: null };
   }
 
-  // ── Step 4: Read back the confirmed buy (#290) ──
-  // The trade.buy outbox completion handler already committed Trade -> EXECUTED
-  // and Position inside the outbox transaction before agentBuy resolved.
-  // Only fall back to applyBuySuccess when an injected test override bypassed
-  // the outbox (no outboxId).
-  const { sharesOut, collateralIn, feeRaw, outboxId } = fill!;
-  if (!outboxId) {
-    await applyBuySuccess(trade.id, { sharesOut, collateralIn, feeRaw, txHash, innerTxHash: txHash });
-  }
+  // ── Step 4: Apply the confirmed buy (idempotent, shared with recovery) ──
+  // #35: the trade.buy completion handler normally applied this before
+  // agentBuy resolved; applyBuySuccess is guarded (PENDING CAS, unique
+  // tradeId), so this direct call is a no-op when it did and the single
+  // writer when it could not run (e.g. injected chain deps).
+  const { sharesOut, collateralIn, feeRaw } = fill!;
+  await applyBuySuccess(trade.id, { sharesOut, collateralIn, feeRaw, txHash, innerTxHash: txHash, traceId: payload.traceId });
   const updatedTrade = await prisma.trade.findUnique({ where: { id: trade.id } });
   const position = await prisma.position.findUnique({ where: { tradeId: trade.id } });
   if (!updatedTrade || updatedTrade.status !== 'EXECUTED' || !position) {
@@ -659,6 +629,7 @@ async function submitTradeTransaction(
       market_id: market.onChainMarketId!.toString(),
       collateral_in: collateralIn.toString(),
       feeRaw: feeRaw.toString(),
+      ...(payload.traceId ? { traceId: payload.traceId } : {}),
       ...(attemptId ? { attemptId } : {}),
       ...(rebuildCount ? { rebuildCount } : {}),
     },

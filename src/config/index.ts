@@ -711,6 +711,12 @@ export const envObjectSchema = z
       .pipe(z.number().int().positive()),
     IPFS_CACHE_BUDGET_BYTES: z.string().default('268435456').transform(Number)
       .pipe(z.number().int().positive()),
+    // Remote pin garbage collection (#328). Keep disabled until `npm run
+    // pins:reconcile` has imported the existing pins into the ledger.
+    PIN_GC_ENABLED: boolDefault('false'),
+    PIN_GC_GRACE_HOURS: z.string().default('72').transform(Number).pipe(z.number().positive()),
+    PIN_GC_BATCH: z.string().default('50').transform(Number).pipe(z.number().int().positive()),
+    PIN_GC_RATE_PER_MIN: z.string().default('30').transform(Number).pipe(z.number().int().positive()),
 
     // ── Transparency reports (#159) ───────────────────────────────────────
     REPORTS_ENABLED: z.enum(['true', 'false']).default('false').transform((v) => v === 'true'),

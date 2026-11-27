@@ -16,7 +16,8 @@ import { getOnChainTrace, printable } from './chain.service';
 import { registerHandler, type ChainTransactionRow, type CompletionContext, type CompletionOutcome } from './stellar/outbox';
 import { processPublication } from '../jobs/trace-publication.worker';
 import type { TraceAction } from '../lib/trace-actions';
-import { fetchVerifiedBytes, pinJson } from './ipfs.service';
+import { fetchVerifiedBytes, pinJson, prepareDocument } from './ipfs.service';
+import { anchorRefs } from './pin-ledger.service';
 import { publishTrace } from './chain.service';
 import type { AgentScope } from './agent-controls.service';
 import { agentSigner } from './stellar/clients';
@@ -59,6 +60,7 @@ export async function handleTracePublishOutcome(
     where: { traceId, status: { in: ['AWAITING_MARKET', 'READY', 'SUBMITTED'] } },
     data: { status: 'CONFIRMED', confirmedAt: new Date(), lastError: null },
   });
+  await anchorRefs('TRACE', traceId, `trace:${onChainTraceId.toString()}`);
 }
 
 registerHandler('trace.publish', handleTracePublishOutcome);
@@ -258,7 +260,10 @@ export async function pinAndPublishDocument(params: {
   /** Agent whose control state gates the write; defaults from `action`. */
   scope?: AgentScope;
 }, options: { dryRun?: boolean } = {}): Promise<{ cid: string; hash: string; onChainTraceId: bigint | null; publishTxHash: string | null; mode: 'dry-run' | 'live' }> {
-  const pinned = await pinJson(params.document, params.name);
+  // Dry-run documents are never published, so they are computed, not pinned (#328).
+  const pinned = options.dryRun
+    ? prepareDocument(params.document, params.name)
+    : await pinJson(params.document, params.name, { owner: { kind: 'DOCUMENT', id: params.name } });
   if (options.dryRun) {
     return { cid: pinned.cid, hash: pinned.hash, onChainTraceId: null, publishTxHash: null, mode: 'dry-run' };
   }
@@ -269,6 +274,9 @@ export async function pinAndPublishDocument(params: {
     marketId: params.marketId,
     scope: params.scope,
   });
+  if (published.mode === 'live' && published.onChainTraceId !== null) {
+    await anchorRefs('DOCUMENT', params.name, `trace:${published.onChainTraceId.toString()}`);
+  }
   return { cid: pinned.cid, hash: pinned.hash, ...published };
 }
 
